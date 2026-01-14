@@ -20,18 +20,33 @@ Insurance-Pricing (ins_pricing) is an enterprise-grade Python library designed f
 ### Quick Start
 
 ```python
-# Model training
-from ins_pricing.modelling import BayesOptModel
-model = BayesOptModel(config)
-model.fit(X_train, y_train)
+# Model training with Bayesian optimization
+from ins_pricing import bayesopt as ropt
 
-# Pricing and calibration
-from ins_pricing.pricing import build_factor_table, fit_calibration_factor
-factors = build_factor_table(df, 'age', 'claim_amount')
+model = ropt.BayesOptModel(
+    train_data, test_data,
+    model_name='my_model',
+    resp_nme='target',
+    weight_nme='weight',
+    factor_nmes=feature_list,
+    cate_list=categorical_features,
+)
+model.bayesopt_xgb(max_evals=100)      # Train XGBoost
+model.bayesopt_resnet(max_evals=50)    # Train ResNet
+model.bayesopt_ft(max_evals=50)        # Train FT-Transformer
 
-# Production scoring
+# Pricing: build factor table
+from ins_pricing.pricing import build_factor_table
+factors = build_factor_table(
+    df,
+    factor_col='age_band',
+    loss_col='claim_amount',
+    exposure_col='exposure',
+)
+
+# Production: batch scoring
 from ins_pricing.production import batch_score
-scores = batch_score(df, model)
+scores = batch_score(model.trainers['xgb'].predict, df)
 
 # Model governance
 from ins_pricing.governance import ModelRegistry
