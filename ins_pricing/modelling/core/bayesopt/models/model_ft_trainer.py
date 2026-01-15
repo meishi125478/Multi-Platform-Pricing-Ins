@@ -19,6 +19,118 @@ from ..utils import DistributedUtils, EPS, TorchTrainerMixin
 from .model_ft_components import FTTransformerCore, MaskedTabularDataset, TabularDataset
 
 
+# --- Helper functions for reconstruction loss computation ---
+
+
+def _compute_numeric_reconstruction_loss(
+    num_pred: Optional[torch.Tensor],
+    num_true: Optional[torch.Tensor],
+    num_mask: Optional[torch.Tensor],
+    loss_weight: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute MSE loss for numeric feature reconstruction.
+
+    Args:
+        num_pred: Predicted numeric values (N, num_features)
+        num_true: Ground truth numeric values (N, num_features)
+        num_mask: Boolean mask indicating which values were masked (N, num_features)
+        loss_weight: Weight to apply to the loss
+        device: Target device for computation
+
+    Returns:
+        Weighted MSE loss for masked numeric features
+    """
+    if num_pred is None or num_true is None or num_mask is None:
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    num_mask = num_mask.to(dtype=torch.bool)
+    if not num_mask.any():
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    diff = num_pred - num_true
+    mse = diff * diff
+    return float(loss_weight) * mse[num_mask].mean()
+
+
+def _compute_categorical_reconstruction_loss(
+    cat_logits: Optional[List[torch.Tensor]],
+    cat_true: Optional[torch.Tensor],
+    cat_mask: Optional[torch.Tensor],
+    loss_weight: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute cross-entropy loss for categorical feature reconstruction.
+
+    Args:
+        cat_logits: List of logits for each categorical feature
+        cat_true: Ground truth categorical indices (N, num_cat_features)
+        cat_mask: Boolean mask indicating which values were masked (N, num_cat_features)
+        loss_weight: Weight to apply to the loss
+        device: Target device for computation
+
+    Returns:
+        Weighted cross-entropy loss for masked categorical features
+    """
+    if not cat_logits or cat_true is None or cat_mask is None:
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    cat_mask = cat_mask.to(dtype=torch.bool)
+    cat_losses: List[torch.Tensor] = []
+
+    for j, logits in enumerate(cat_logits):
+        mask_j = cat_mask[:, j]
+        if not mask_j.any():
+            continue
+        targets = cat_true[:, j]
+        cat_losses.append(
+            F.cross_entropy(logits, targets, reduction='none')[mask_j].mean()
+        )
+
+    if not cat_losses:
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    return float(loss_weight) * torch.stack(cat_losses).mean()
+
+
+def _compute_reconstruction_loss(
+    num_pred: Optional[torch.Tensor],
+    cat_logits: Optional[List[torch.Tensor]],
+    num_true: Optional[torch.Tensor],
+    num_mask: Optional[torch.Tensor],
+    cat_true: Optional[torch.Tensor],
+    cat_mask: Optional[torch.Tensor],
+    num_loss_weight: float,
+    cat_loss_weight: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute combined reconstruction loss for masked tabular data.
+
+    This combines numeric (MSE) and categorical (cross-entropy) reconstruction losses.
+
+    Args:
+        num_pred: Predicted numeric values
+        cat_logits: List of logits for categorical features
+        num_true: Ground truth numeric values
+        num_mask: Mask for numeric features
+        cat_true: Ground truth categorical indices
+        cat_mask: Mask for categorical features
+        num_loss_weight: Weight for numeric loss
+        cat_loss_weight: Weight for categorical loss
+        device: Target device for computation
+
+    Returns:
+        Combined weighted reconstruction loss
+    """
+    num_loss = _compute_numeric_reconstruction_loss(
+        num_pred, num_true, num_mask, num_loss_weight, device
+    )
+    cat_loss = _compute_categorical_reconstruction_loss(
+        cat_logits, cat_true, cat_mask, cat_loss_weight, device
+    )
+    return num_loss + cat_loss
+
+
 # Scikit-Learn style wrapper for FTTransformer.
 
 
@@ -508,34 +620,6 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         )
         scaler = GradScaler(enabled=(device_type == 'cuda'))
 
-        def _batch_recon_loss(num_pred, cat_logits, num_true_b, num_mask_b, cat_true_b, cat_mask_b, device):
-            loss = torch.zeros((), device=device, dtype=torch.float32)
-
-            if num_pred is not None and num_true_b is not None and num_mask_b is not None:
-                num_mask_b = num_mask_b.to(dtype=torch.bool)
-                if num_mask_b.any():
-                    diff = num_pred - num_true_b
-                    mse = diff * diff
-                    loss = loss + float(num_loss_weight) * \
-                        mse[num_mask_b].mean()
-
-            if cat_logits and cat_true_b is not None and cat_mask_b is not None:
-                cat_mask_b = cat_mask_b.to(dtype=torch.bool)
-                cat_losses: List[torch.Tensor] = []
-                for j, logits in enumerate(cat_logits):
-                    mask_j = cat_mask_b[:, j]
-                    if not mask_j.any():
-                        continue
-                    targets = cat_true_b[:, j]
-                    cat_losses.append(
-                        F.cross_entropy(logits, targets, reduction='none')[
-                            mask_j].mean()
-                    )
-                if cat_losses:
-                    loss = loss + float(cat_loss_weight) * \
-                        torch.stack(cat_losses).mean()
-            return loss
-
         train_history: List[float] = []
         val_history: List[float] = []
         best_loss = float("inf")
@@ -579,8 +663,10 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
 
                         num_pred, cat_logits = self.ft(
                             X_num_b, X_cat_b, X_geo_b, return_reconstruction=True)
-                        batch_loss = _batch_recon_loss(
-                            num_pred, cat_logits, num_true_b, num_mask_b, cat_true_b, cat_mask_b, device=X_num_b.device)
+                        batch_loss = _compute_reconstruction_loss(
+                            num_pred, cat_logits, num_true_b, num_mask_b,
+                            cat_true_b, cat_mask_b, num_loss_weight, cat_loss_weight,
+                            device=X_num_b.device)
                         local_bad = 0 if bool(torch.isfinite(batch_loss)) else 1
                         global_bad = local_bad
                         if dist.is_initialized():
@@ -672,10 +758,11 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                                 self.device, non_blocking=True)
                             num_pred_v, cat_logits_v = self.ft(
                                 X_num_v, X_cat_v, X_geo_v, return_reconstruction=True)
-                            loss_v = _batch_recon_loss(
+                            loss_v = _compute_reconstruction_loss(
                                 num_pred_v, cat_logits_v,
                                 X_num_v_true if X_num_v_true.numel() else None, val_num_mask,
                                 X_cat_v_true if X_cat_v_true.numel() else None, val_cat_mask,
+                                num_loss_weight, cat_loss_weight,
                                 device=X_num_v.device
                             )
                             if not torch.isfinite(loss_v):

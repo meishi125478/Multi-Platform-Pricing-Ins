@@ -42,6 +42,252 @@ class _OrderSplitter:
         for tr_idx, val_idx in self._splitter.split(X_ord, y=y, groups=groups):
             yield order[tr_idx], order[val_idx]
 
+
+# =============================================================================
+# CV Strategy Resolution Helper
+# =============================================================================
+
+
+class CVStrategyResolver:
+    """Helper class to resolve cross-validation splitting strategies.
+
+    This encapsulates the logic for determining how to split data based on the
+    configured strategy (random, time, group). It provides methods to:
+    - Get time-ordered indices for a dataset
+    - Get group values for a dataset
+    - Create appropriate sklearn splitters
+    """
+
+    TIME_STRATEGIES = {"time", "timeseries", "temporal"}
+    GROUP_STRATEGIES = {"group", "grouped"}
+
+    def __init__(self, config, train_data: pd.DataFrame, rand_seed: Optional[int] = None):
+        """Initialize the resolver.
+
+        Args:
+            config: BayesOptConfig with cv_strategy, cv_time_col, cv_group_col, etc.
+            train_data: The training DataFrame (needed for column access)
+            rand_seed: Random seed for reproducible splits
+        """
+        self.config = config
+        self.train_data = train_data
+        self.rand_seed = rand_seed
+        self._strategy = self._normalize_strategy()
+
+    def _normalize_strategy(self) -> str:
+        """Normalize the strategy string to lowercase."""
+        raw = str(getattr(self.config, "cv_strategy", "random") or "random")
+        return raw.strip().lower()
+
+    @property
+    def strategy(self) -> str:
+        """Return the normalized CV strategy."""
+        return self._strategy
+
+    def is_time_strategy(self) -> bool:
+        """Check if using a time-based splitting strategy."""
+        return self._strategy in self.TIME_STRATEGIES
+
+    def is_group_strategy(self) -> bool:
+        """Check if using a group-based splitting strategy."""
+        return self._strategy in self.GROUP_STRATEGIES
+
+    def get_time_col(self) -> str:
+        """Get and validate the time column.
+
+        Raises:
+            ValueError: If time column is not configured
+            KeyError: If time column not found in train_data
+        """
+        time_col = getattr(self.config, "cv_time_col", None)
+        if not time_col:
+            raise ValueError("cv_time_col is required for time cv_strategy.")
+        if time_col not in self.train_data.columns:
+            raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
+        return time_col
+
+    def get_time_ascending(self) -> bool:
+        """Get the time ordering preference."""
+        return bool(getattr(self.config, "cv_time_ascending", True))
+
+    def get_group_col(self) -> str:
+        """Get and validate the group column.
+
+        Raises:
+            ValueError: If group column is not configured
+            KeyError: If group column not found in train_data
+        """
+        group_col = getattr(self.config, "cv_group_col", None)
+        if not group_col:
+            raise ValueError("cv_group_col is required for group cv_strategy.")
+        if group_col not in self.train_data.columns:
+            raise KeyError(f"cv_group_col '{group_col}' not in train_data.")
+        return group_col
+
+    def get_time_ordered_indices(self, X_all: pd.DataFrame) -> np.ndarray:
+        """Get indices ordered by time for the given dataset.
+
+        Args:
+            X_all: DataFrame to get indices for (must have index compatible with train_data)
+
+        Returns:
+            Array of positional indices into X_all, ordered by time
+        """
+        time_col = self.get_time_col()
+        ascending = self.get_time_ascending()
+        order_index = self.train_data[time_col].sort_values(ascending=ascending).index
+        index_set = set(X_all.index)
+        order_index = [idx for idx in order_index if idx in index_set]
+        order = X_all.index.get_indexer(order_index)
+        return order[order >= 0]
+
+    def get_groups(self, X_all: pd.DataFrame) -> pd.Series:
+        """Get group labels for the given dataset.
+
+        Args:
+            X_all: DataFrame to get groups for
+
+        Returns:
+            Series of group labels aligned with X_all
+        """
+        group_col = self.get_group_col()
+        return self.train_data.reindex(X_all.index)[group_col]
+
+    def create_train_val_splitter(
+        self,
+        X_all: pd.DataFrame,
+        val_ratio: float,
+    ) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], Optional[pd.Series]]:
+        """Create a single train/val split based on strategy.
+
+        Args:
+            X_all: DataFrame to split
+            val_ratio: Fraction of data for validation
+
+        Returns:
+            Tuple of ((train_idx, val_idx), groups) where groups is None for non-group strategies
+        """
+        if self.is_time_strategy():
+            order = self.get_time_ordered_indices(X_all)
+            cutoff = int(len(order) * (1.0 - val_ratio))
+            if cutoff <= 0 or cutoff >= len(order):
+                raise ValueError(f"val_ratio={val_ratio} leaves no data for train/val split.")
+            return (order[:cutoff], order[cutoff:]), None
+
+        if self.is_group_strategy():
+            groups = self.get_groups(X_all)
+            splitter = GroupShuffleSplit(
+                n_splits=1, test_size=val_ratio, random_state=self.rand_seed
+            )
+            train_idx, val_idx = next(splitter.split(X_all, groups=groups))
+            return (train_idx, val_idx), groups
+
+        # Random strategy
+        splitter = ShuffleSplit(
+            n_splits=1, test_size=val_ratio, random_state=self.rand_seed
+        )
+        train_idx, val_idx = next(splitter.split(X_all))
+        return (train_idx, val_idx), None
+
+    def create_cv_splitter(
+        self,
+        X_all: pd.DataFrame,
+        y_all: Optional[pd.Series],
+        n_splits: int,
+        val_ratio: float,
+    ) -> Tuple[Iterable[Tuple[np.ndarray, np.ndarray]], int]:
+        """Create a cross-validation splitter based on strategy.
+
+        Args:
+            X_all: DataFrame to split
+            y_all: Target series (used by some splitters)
+            n_splits: Number of CV folds
+            val_ratio: Validation ratio (for ShuffleSplit)
+
+        Returns:
+            Tuple of (split_iterator, actual_n_splits)
+        """
+        n_splits = max(2, int(n_splits))
+
+        if self.is_group_strategy():
+            groups = self.get_groups(X_all)
+            n_groups = int(groups.nunique(dropna=False))
+            if n_groups < 2:
+                return iter([]), 0
+            n_splits = min(n_splits, n_groups)
+            if n_splits < 2:
+                return iter([]), 0
+            splitter = GroupKFold(n_splits=n_splits)
+            return splitter.split(X_all, y_all, groups=groups), n_splits
+
+        if self.is_time_strategy():
+            order = self.get_time_ordered_indices(X_all)
+            if len(order) < 2:
+                return iter([]), 0
+            n_splits = min(n_splits, max(2, len(order) - 1))
+            if n_splits < 2:
+                return iter([]), 0
+            splitter = TimeSeriesSplit(n_splits=n_splits)
+            return _OrderSplitter(splitter, order).split(X_all), n_splits
+
+        # Random strategy
+        if len(X_all) < n_splits:
+            n_splits = len(X_all)
+        if n_splits < 2:
+            return iter([]), 0
+        splitter = ShuffleSplit(
+            n_splits=n_splits, test_size=val_ratio, random_state=self.rand_seed
+        )
+        return splitter.split(X_all), n_splits
+
+    def create_kfold_splitter(
+        self,
+        X_all: pd.DataFrame,
+        k: int,
+    ) -> Tuple[Optional[Iterable[Tuple[np.ndarray, np.ndarray]]], int]:
+        """Create a K-fold splitter for ensemble training.
+
+        Args:
+            X_all: DataFrame to split
+            k: Number of folds
+
+        Returns:
+            Tuple of (split_iterator, actual_k) or (None, 0) if not enough data
+        """
+        k = max(2, int(k))
+        n_samples = len(X_all)
+        if n_samples < 2:
+            return None, 0
+
+        if self.is_group_strategy():
+            groups = self.get_groups(X_all)
+            n_groups = int(groups.nunique(dropna=False))
+            if n_groups < 2:
+                return None, 0
+            k = min(k, n_groups)
+            if k < 2:
+                return None, 0
+            splitter = GroupKFold(n_splits=k)
+            return splitter.split(X_all, y=None, groups=groups), k
+
+        if self.is_time_strategy():
+            order = self.get_time_ordered_indices(X_all)
+            if len(order) < 2:
+                return None, 0
+            k = min(k, max(2, len(order) - 1))
+            if k < 2:
+                return None, 0
+            splitter = TimeSeriesSplit(n_splits=k)
+            return _OrderSplitter(splitter, order).split(X_all), k
+
+        # Random strategy with KFold
+        k = min(k, n_samples)
+        if k < 2:
+            return None, 0
+        splitter = KFold(n_splits=k, shuffle=True, random_state=self.rand_seed)
+        return splitter.split(X_all), k
+
+
 # =============================================================================
 # Trainer system
 # =============================================================================
@@ -692,6 +938,15 @@ class TrainerBase:
         *,
         allow_default: bool = False,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Resolve train/validation split indices based on configured CV strategy.
+
+        Args:
+            X_all: DataFrame to split
+            allow_default: If True, use default val_ratio when config is invalid
+
+        Returns:
+            Tuple of (train_indices, val_indices) or None if not enough data
+        """
         val_ratio = float(self.ctx.prop_test) if self.ctx.prop_test is not None else 0.25
         if not (0.0 < val_ratio < 1.0):
             if not allow_default:
@@ -700,46 +955,8 @@ class TrainerBase:
         if len(X_all) < 10:
             return None
 
-        strategy = str(getattr(self.ctx.config, "cv_strategy", "random") or "random").strip().lower()
-        if strategy in {"time", "timeseries", "temporal"}:
-            time_col = getattr(self.ctx.config, "cv_time_col", None)
-            if not time_col:
-                raise ValueError("cv_time_col is required for time cv_strategy.")
-            if time_col not in self.ctx.train_data.columns:
-                raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
-            ascending = bool(getattr(self.ctx.config, "cv_time_ascending", True))
-            order_index = self.ctx.train_data[time_col].sort_values(ascending=ascending).index
-            index_set = set(X_all.index)
-            order_index = [idx for idx in order_index if idx in index_set]
-            order = X_all.index.get_indexer(order_index)
-            order = order[order >= 0]
-            cutoff = int(len(order) * (1.0 - val_ratio))
-            if cutoff <= 0 or cutoff >= len(order):
-                raise ValueError(
-                    f"prop_test={val_ratio} leaves no data for train/val split.")
-            return order[:cutoff], order[cutoff:]
-
-        if strategy in {"group", "grouped"}:
-            group_col = getattr(self.ctx.config, "cv_group_col", None)
-            if not group_col:
-                raise ValueError("cv_group_col is required for group cv_strategy.")
-            if group_col not in self.ctx.train_data.columns:
-                raise KeyError(f"cv_group_col '{group_col}' not in train_data.")
-            groups = self.ctx.train_data.reindex(X_all.index)[group_col]
-            splitter = GroupShuffleSplit(
-                n_splits=1,
-                test_size=val_ratio,
-                random_state=self.ctx.rand_seed,
-            )
-            train_idx, val_idx = next(splitter.split(X_all, groups=groups))
-            return train_idx, val_idx
-
-        splitter = ShuffleSplit(
-            n_splits=1,
-            test_size=val_ratio,
-            random_state=self.ctx.rand_seed,
-        )
-        train_idx, val_idx = next(splitter.split(X_all))
+        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        (train_idx, val_idx), _ = resolver.create_train_val_splitter(X_all, val_ratio)
         return train_idx, val_idx
 
     def _resolve_time_sample_indices(
@@ -747,25 +964,34 @@ class TrainerBase:
         X_all: pd.DataFrame,
         sample_limit: int,
     ) -> Optional[pd.Index]:
+        """Get the most recent indices for time-based sampling.
+
+        For time-based CV strategies, returns the last `sample_limit` indices
+        ordered by time. For other strategies, returns None.
+
+        Args:
+            X_all: DataFrame to sample from
+            sample_limit: Maximum number of samples to return
+
+        Returns:
+            Index of sampled rows, or None if not using time-based strategy
+        """
         if sample_limit <= 0:
             return None
-        strategy = str(getattr(self.ctx.config, "cv_strategy", "random") or "random").strip().lower()
-        if strategy not in {"time", "timeseries", "temporal"}:
+
+        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        if not resolver.is_time_strategy():
             return None
-        time_col = getattr(self.ctx.config, "cv_time_col", None)
-        if not time_col:
-            raise ValueError("cv_time_col is required for time cv_strategy.")
-        if time_col not in self.ctx.train_data.columns:
-            raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
-        ascending = bool(getattr(self.ctx.config, "cv_time_ascending", True))
-        order_index = self.ctx.train_data[time_col].sort_values(ascending=ascending).index
-        index_set = set(X_all.index)
-        order_index = [idx for idx in order_index if idx in index_set]
-        if not order_index:
+
+        order = resolver.get_time_ordered_indices(X_all)
+        if len(order) == 0:
             return None
-        if len(order_index) > sample_limit:
-            order_index = order_index[-sample_limit:]
-        return pd.Index(order_index)
+
+        # Get the last sample_limit indices (most recent in time)
+        if len(order) > sample_limit:
+            order = order[-sample_limit:]
+
+        return X_all.index[order]
 
     def _resolve_ensemble_splits(
         self,
@@ -773,60 +999,17 @@ class TrainerBase:
         *,
         k: int,
     ) -> Tuple[Optional[Iterable[Tuple[np.ndarray, np.ndarray]]], int]:
-        k = max(2, int(k))
-        n_samples = len(X_all)
-        if n_samples < 2:
-            return None, 0
+        """Resolve K-fold splits for ensemble training based on configured CV strategy.
 
-        strategy = str(getattr(self.ctx.config, "cv_strategy", "random") or "random").strip().lower()
-        if strategy in {"group", "grouped"}:
-            group_col = getattr(self.ctx.config, "cv_group_col", None)
-            if not group_col:
-                raise ValueError("cv_group_col is required for group cv_strategy.")
-            if group_col not in self.ctx.train_data.columns:
-                raise KeyError(f"cv_group_col '{group_col}' not in train_data.")
-            groups = self.ctx.train_data.reindex(X_all.index)[group_col]
-            n_groups = int(groups.nunique(dropna=False))
-            if n_groups < 2:
-                return None, 0
-            if k > n_groups:
-                k = n_groups
-            if k < 2:
-                return None, 0
-            splitter = GroupKFold(n_splits=k)
-            return splitter.split(X_all, y=None, groups=groups), k
+        Args:
+            X_all: DataFrame to split
+            k: Number of folds requested
 
-        if strategy in {"time", "timeseries", "temporal"}:
-            time_col = getattr(self.ctx.config, "cv_time_col", None)
-            if not time_col:
-                raise ValueError("cv_time_col is required for time cv_strategy.")
-            if time_col not in self.ctx.train_data.columns:
-                raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
-            ascending = bool(getattr(self.ctx.config, "cv_time_ascending", True))
-            order_index = self.ctx.train_data[time_col].sort_values(ascending=ascending).index
-            index_set = set(X_all.index)
-            order_index = [idx for idx in order_index if idx in index_set]
-            order = X_all.index.get_indexer(order_index)
-            order = order[order >= 0]
-            if len(order) < 2:
-                return None, 0
-            if len(order) <= k:
-                k = max(2, len(order) - 1)
-            if k < 2:
-                return None, 0
-            splitter = TimeSeriesSplit(n_splits=k)
-            return _OrderSplitter(splitter, order).split(X_all), k
-
-        if n_samples < k:
-            k = n_samples
-        if k < 2:
-            return None, 0
-        splitter = KFold(
-            n_splits=k,
-            shuffle=True,
-            random_state=self.ctx.rand_seed,
-        )
-        return splitter.split(X_all), k
+        Returns:
+            Tuple of (split_iterator, actual_k) or (None, 0) if not enough data
+        """
+        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        return resolver.create_kfold_splitter(X_all, k)
 
     def cross_val_generic(
             self,
@@ -892,7 +1075,6 @@ class TrainerBase:
             w_all = w_all.loc[sampled_idx] if w_all is not None else None
 
         if splitter is None:
-            strategy = str(getattr(self.ctx.config, "cv_strategy", "random") or "random").strip().lower()
             val_ratio = float(self.ctx.prop_test) if self.ctx.prop_test is not None else 0.25
             if not (0.0 < val_ratio < 1.0):
                 val_ratio = 0.25
@@ -901,37 +1083,10 @@ class TrainerBase:
                 cv_splits = max(2, int(round(1 / val_ratio)))
             cv_splits = max(2, int(cv_splits))
 
-            if strategy in {"group", "grouped"}:
-                group_col = getattr(self.ctx.config, "cv_group_col", None)
-                if not group_col:
-                    raise ValueError("cv_group_col is required for group cv_strategy.")
-                if group_col not in self.ctx.train_data.columns:
-                    raise KeyError(f"cv_group_col '{group_col}' not in train_data.")
-                groups = self.ctx.train_data.reindex(X_all.index)[group_col]
-                split_iter = GroupKFold(n_splits=cv_splits).split(X_all, y_all, groups=groups)
-            elif strategy in {"time", "timeseries", "temporal"}:
-                time_col = getattr(self.ctx.config, "cv_time_col", None)
-                if not time_col:
-                    raise ValueError("cv_time_col is required for time cv_strategy.")
-                if time_col not in self.ctx.train_data.columns:
-                    raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
-                ascending = bool(getattr(self.ctx.config, "cv_time_ascending", True))
-                order_index = self.ctx.train_data[time_col].sort_values(ascending=ascending).index
-                index_set = set(X_all.index)
-                order_index = [idx for idx in order_index if idx in index_set]
-                order = X_all.index.get_indexer(order_index)
-                order = order[order >= 0]
-                if len(order) <= cv_splits:
-                    cv_splits = max(2, len(order) - 1)
-                if cv_splits < 2:
-                    raise ValueError("Not enough samples for time-series CV.")
-                split_iter = _OrderSplitter(TimeSeriesSplit(n_splits=cv_splits), order).split(X_all)
-            else:
-                split_iter = ShuffleSplit(
-                    n_splits=cv_splits,
-                    test_size=val_ratio,
-                    random_state=self.ctx.rand_seed
-                ).split(X_all)
+            resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+            split_iter, actual_splits = resolver.create_cv_splitter(X_all, y_all, cv_splits, val_ratio)
+            if actual_splits < 2:
+                raise ValueError("Not enough samples for cross-validation.")
         else:
             if hasattr(splitter, "split"):
                 split_iter = splitter.split(X_all, y_all, groups=None)

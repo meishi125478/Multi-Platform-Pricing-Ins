@@ -17,6 +17,43 @@ import torch
 import torch.distributed as dist
 
 
+def _select_ddp_backend() -> str:
+    """Select the appropriate DDP backend based on system capabilities.
+
+    Returns:
+        "nccl" if CUDA is available and NCCL is supported (non-Windows),
+        otherwise "gloo"
+    """
+    if not torch.cuda.is_available():
+        return "gloo"
+
+    if os.name == "nt":  # Windows doesn't support NCCL
+        return "gloo"
+
+    try:
+        nccl_available = getattr(dist, "is_nccl_available", lambda: False)()
+        return "nccl" if nccl_available else "gloo"
+    except Exception:
+        return "gloo"
+
+
+def _get_ddp_timeout() -> timedelta:
+    """Get the DDP timeout from environment variable.
+
+    Returns:
+        timedelta for DDP timeout (default: 1800 seconds)
+    """
+    timeout_seconds = int(os.environ.get("BAYESOPT_DDP_TIMEOUT_SECONDS", "1800"))
+    return timedelta(seconds=max(1, timeout_seconds))
+
+
+def _cache_ddp_state(local_rank: int, rank: int, world_size: int) -> tuple:
+    """Cache and return DDP state tuple."""
+    state = (True, local_rank, rank, world_size)
+    DistributedUtils._cached_state = state
+    return state
+
+
 class DistributedUtils:
     """Utilities for distributed data parallel training.
 
@@ -35,66 +72,52 @@ class DistributedUtils:
         Returns:
             Tuple of (success, local_rank, rank, world_size)
         """
+        # Return cached state if already initialized
         if dist.is_initialized():
             if DistributedUtils._cached_state is None:
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-                local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                DistributedUtils._cached_state = (
-                    True,
-                    local_rank,
-                    rank,
-                    world_size,
+                DistributedUtils._cached_state = _cache_ddp_state(
+                    int(os.environ.get("LOCAL_RANK", 0)),
+                    dist.get_rank(),
+                    dist.get_world_size(),
                 )
             return DistributedUtils._cached_state
 
-        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-            rank = int(os.environ["RANK"])
-            world_size = int(os.environ["WORLD_SIZE"])
-            local_rank = int(os.environ["LOCAL_RANK"])
-
-            if os.name == "nt" and torch.cuda.is_available() and world_size > 1:
-                print(
-                    ">>> DDP Setup Disabled: Windows CUDA DDP is not supported. "
-                    "Falling back to single process."
-                )
-                return False, 0, 0, 1
-
-            if torch.cuda.is_available():
-                torch.cuda.set_device(local_rank)
-
-            timeout_seconds = int(os.environ.get(
-                "BAYESOPT_DDP_TIMEOUT_SECONDS", "1800"))
-            timeout = timedelta(seconds=max(1, timeout_seconds))
-            backend = "gloo"
-            if torch.cuda.is_available() and os.name != "nt":
-                try:
-                    if getattr(dist, "is_nccl_available", lambda: False)():
-                        backend = "nccl"
-                except Exception:
-                    backend = "gloo"
-
-            dist.init_process_group(
-                backend=backend, init_method="env://", timeout=timeout)
+        # Check for required environment variables
+        if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
             print(
-                f">>> DDP Initialized ({backend}, timeout={timeout_seconds}s): "
-                f"Rank {rank}/{world_size}, Local Rank {local_rank}"
+                f">>> DDP Setup Failed: RANK or WORLD_SIZE not found in env. "
+                f"Keys found: {list(os.environ.keys())}"
             )
-            DistributedUtils._cached_state = (
-                True,
-                local_rank,
-                rank,
-                world_size,
-            )
-            return DistributedUtils._cached_state
-        else:
+            print(">>> Hint: launch with torchrun --nproc_per_node=<N> <script.py>")
+            return False, 0, 0, 1
+
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+
+        # Windows CUDA DDP is not supported
+        if os.name == "nt" and torch.cuda.is_available() and world_size > 1:
             print(
-                f">>> DDP Setup Failed: RANK or WORLD_SIZE not found in env. Keys found: {list(os.environ.keys())}"
+                ">>> DDP Setup Disabled: Windows CUDA DDP is not supported. "
+                "Falling back to single process."
             )
-            print(
-                ">>> Hint: launch with torchrun --nproc_per_node=<N> <script.py>"
-            )
-        return False, 0, 0, 1
+            return False, 0, 0, 1
+
+        # Set CUDA device for this process
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+        # Initialize process group
+        backend = _select_ddp_backend()
+        timeout = _get_ddp_timeout()
+
+        dist.init_process_group(backend=backend, init_method="env://", timeout=timeout)
+        print(
+            f">>> DDP Initialized ({backend}, timeout={timeout.total_seconds():.0f}s): "
+            f"Rank {rank}/{world_size}, Local Rank {local_rank}"
+        )
+
+        return _cache_ddp_state(local_rank, rank, world_size)
 
     @staticmethod
     def cleanup_ddp():
