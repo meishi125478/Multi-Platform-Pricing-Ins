@@ -37,6 +37,17 @@ class IOUtils:
             ]
 
     @staticmethod
+    def ensure_parent_dir(file_path: str) -> None:
+        """Create parent directories when missing.
+
+        Args:
+            file_path: Path to file whose parent directory should be created
+        """
+        directory = Path(file_path).parent
+        if directory and not directory.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
     def _sanitize_params_dict(params: Dict[str, Any]) -> Dict[str, Any]:
         """Filter index-like columns such as "Unnamed: 0" from pandas I/O.
 
@@ -108,3 +119,8 @@ def csv_to_dict(file_path: str) -> List[Dict[str, Any]]:
         List of dictionaries, one per row
     """
     return IOUtils.csv_to_dict(file_path)
+
+
+def ensure_parent_dir(file_path: str) -> None:
+    """Create parent directories when missing (legacy function)."""
+    IOUtils.ensure_parent_dir(file_path)

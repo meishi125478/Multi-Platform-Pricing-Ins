@@ -366,10 +366,9 @@ class DatasetPreprocessor:
     def __init__(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
                  config: BayesOptConfig) -> None:
         self.config = config
-        # Use shallow copy to avoid unnecessary memory overhead
-        # Deep copies only made when actually modifying data
-        self.train_data = train_df.copy(deep=False)
-        self.test_data = test_df.copy(deep=False)
+        # Copy inputs to avoid mutating caller-provided DataFrames.
+        self.train_data = train_df.copy()
+        self.test_data = test_df.copy()
         self.num_features: List[str] = []
         self.train_oht_data: Optional[pd.DataFrame] = None
         self.test_oht_data: Optional[pd.DataFrame] = None

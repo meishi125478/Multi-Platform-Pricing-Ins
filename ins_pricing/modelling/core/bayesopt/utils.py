@@ -23,6 +23,7 @@ warning but continues to function.
 
 from __future__ import annotations
 
+import os
 import warnings
 
 # Show deprecation warning
@@ -35,8 +36,42 @@ warnings.warn(
     stacklevel=2
 )
 
-# Re-export everything from utils package for backward compatibility
-from .utils import *  # noqa: F401, F403
+# Treat this module as a package so submodules resolve even if this file is loaded.
+__path__ = [os.path.join(os.path.dirname(__file__), "utils")]
+
+# Re-export from refactored utils package for backward compatibility
+from .utils.constants import (
+    EPS,
+    set_global_seed,
+    ensure_parent_dir,
+    compute_batch_size,
+    tweedie_loss,
+    infer_factor_and_cate_list,
+)
+from .utils.io_utils import (
+    IOUtils,
+    csv_to_dict,
+)
+from .utils.distributed_utils import (
+    DistributedUtils,
+    TrainingUtils,
+    free_cuda,
+)
+from .utils.torch_trainer_mixin import (
+    TorchTrainerMixin,
+)
+from .utils.metrics_and_devices import (
+    get_logger,
+    MetricFactory,
+    GPUMemoryManager,
+    DeviceManager,
+    CVStrategyResolver,
+    PlotUtils,
+    split_data,
+    plot_lift_list,
+    plot_dlift_list,
+    _OrderedSplitter,
+)
 
 # Explicitly list all exports to support IDE auto-completion
 __all__ = [
