@@ -52,6 +52,17 @@ between modelling, production, governance, and reporting.
   - Geo plotting on basemap: `contextily`.
   - Plotting: `matplotlib`.
 
+## Multi-platform & GPU installation notes
+
+- **Install PyTorch first**: Use the correct PyTorch build for your platform/GPU (CUDA/ROCm/MPS)
+  before installing the `bayesopt`, `explain`, or `gnn` extras. This avoids incompatible wheels.
+- **GNN dependencies**: `torch-geometric` and its companion packages are platform-specific. Follow
+  the official PyG install guide for your CUDA/ROCm/CPU environment, then install
+  `ins_pricing[gnn]`.
+- **Multi-GPU**: Training utilities will select CUDA/MPS/CPU automatically. Multi-GPU uses DDP or
+  DataParallel when supported; on Windows, CUDA DDP is disabled and will fall back to single-GPU or
+  DataParallel where available.
+
 ## Backward-compatible imports
 
 Legacy import paths continue to work:
