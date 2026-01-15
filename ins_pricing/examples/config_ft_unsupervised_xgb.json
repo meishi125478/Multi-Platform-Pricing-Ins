@@ -78,19 +78,16 @@
   "prop_test": 0.25,
   "rand_seed": 13,
   "epochs": 50,
-  "output_dir": "./ResultsFTUnsupervisedResN",
-  "plot_curves": true,
+  "output_dir": "./ResultsFTUnsupervisedXGB",
+  "plot_curves": false,
   "plot": {
-    "enable": true,
+    "enable": false,
     "n_bins": 10,
-    "oneway": true,
-    "oneway_pred": true,
-    "pre_oneway": true,
-    "lift_models": [
-      "xgb",
-      "resn"
-    ],
-    "double_lift": true,
+    "oneway": false,
+    "oneway_pred": false,
+    "pre_oneway": false,
+    "lift_models": [],
+    "double_lift": false,
     "double_lift_pairs": []
   },
   "env": {
@@ -112,13 +109,13 @@
   "ft_role": "unsupervised_embedding",
   "ft_feature_prefix": "ft_emb",
   "stack_model_keys": [
-    "resn"
+    "xgb"
   ],
   "infer_categorical_max_unique": 50,
   "infer_categorical_max_ratio": 0.05,
   "xgb_max_depth_max": 25,
   "xgb_n_estimators_max": 500,
-  "optuna_storage": "./ResultsFTUnsupervisedResN/optuna/bayesopt.sqlite3",
+  "optuna_storage": "./ResultsFTUnsupervisedXGB/optuna/bayesopt.sqlite3",
   "optuna_study_prefix": "pricing",
   "reuse_best_params": false,
   "best_params_files": {},
@@ -135,11 +132,11 @@
   "runner": {
     "mode": "entry",
     "model_keys": [
-      "resn"
+      "xgb"
     ],
     "nproc_per_node": 1,
     "max_evals": 50,
-    "plot_curves": true,
+    "plot_curves": false,
     "ft_role": null,
     "use_watchdog": false,
     "idle_seconds": 7200,

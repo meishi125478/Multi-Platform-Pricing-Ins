@@ -48,7 +48,10 @@ class _CVSplitter:
 # =============================================================================
 class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
     def __init__(self, train_data, test_data,
-                 model_nme, resp_nme, weight_nme, factor_nmes: Optional[List[str]] = None, task_type='regression',
+                 config: Optional[BayesOptConfig] = None,
+                 # Backward compatibility: individual parameters (DEPRECATED)
+                 model_nme=None, resp_nme=None, weight_nme=None,
+                 factor_nmes: Optional[List[str]] = None, task_type='regression',
                  binary_resp_nme=None,
                  cate_list=None, prop_test=0.25, rand_seed=None,
                  epochs=100, use_gpu=True,
@@ -108,6 +111,10 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         Args:
             train_data: Training DataFrame.
             test_data: Test DataFrame.
+            config: BayesOptConfig instance with all configuration (RECOMMENDED).
+                If provided, all other parameters are ignored.
+
+            # DEPRECATED: Individual parameters (use config instead)
             model_nme: Model name prefix used in outputs.
             resp_nme: Target column name.
             weight_nme: Sample weight column name.
@@ -136,101 +143,153 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             final_ensemble: Enable k-fold model averaging at the final stage.
             final_ensemble_k: Number of folds for averaging.
             final_refit: Refit on full data using best stopping point.
-        """
-        inferred_factors, inferred_cats = infer_factor_and_cate_list(
-            train_df=train_data,
-            test_df=test_data,
-            resp_nme=resp_nme,
-            weight_nme=weight_nme,
-            binary_resp_nme=binary_resp_nme,
-            factor_nmes=factor_nmes,
-            cate_list=cate_list,
-            infer_categorical_max_unique=int(infer_categorical_max_unique),
-            infer_categorical_max_ratio=float(infer_categorical_max_ratio),
-        )
 
-        cfg = BayesOptConfig(
-            model_nme=model_nme,
-            task_type=task_type,
-            resp_nme=resp_nme,
-            weight_nme=weight_nme,
-            factor_nmes=list(inferred_factors),
-            binary_resp_nme=binary_resp_nme,
-            cate_list=list(inferred_cats) if inferred_cats else None,
-            prop_test=prop_test,
-            rand_seed=rand_seed,
-            epochs=epochs,
-            use_gpu=use_gpu,
-            xgb_max_depth_max=int(xgb_max_depth_max),
-            xgb_n_estimators_max=int(xgb_n_estimators_max),
-            use_resn_data_parallel=use_resn_data_parallel,
-            use_ft_data_parallel=use_ft_data_parallel,
-            use_resn_ddp=use_resn_ddp,
-            use_gnn_data_parallel=use_gnn_data_parallel,
-            use_ft_ddp=use_ft_ddp,
-            use_gnn_ddp=use_gnn_ddp,
-            gnn_use_approx_knn=gnn_use_approx_knn,
-            gnn_approx_knn_threshold=gnn_approx_knn_threshold,
-            gnn_graph_cache=gnn_graph_cache,
-            gnn_max_gpu_knn_nodes=gnn_max_gpu_knn_nodes,
-            gnn_knn_gpu_mem_ratio=gnn_knn_gpu_mem_ratio,
-            gnn_knn_gpu_mem_overhead=gnn_knn_gpu_mem_overhead,
-            output_dir=output_dir,
-            optuna_storage=optuna_storage,
-            optuna_study_prefix=optuna_study_prefix,
-            best_params_files=best_params_files,
-            ft_role=str(ft_role or "model"),
-            ft_feature_prefix=str(ft_feature_prefix or "ft_emb"),
-            ft_num_numeric_tokens=ft_num_numeric_tokens,
-            reuse_best_params=bool(reuse_best_params),
-            resn_weight_decay=float(resn_weight_decay)
-            if resn_weight_decay is not None
-            else 1e-4,
-            final_ensemble=bool(final_ensemble),
-            final_ensemble_k=int(final_ensemble_k),
-            final_refit=bool(final_refit),
-            cv_strategy=str(cv_strategy or "random"),
-            cv_splits=cv_splits,
-            cv_group_col=cv_group_col,
-            cv_time_col=cv_time_col,
-            cv_time_ascending=bool(cv_time_ascending),
-            ft_oof_folds=ft_oof_folds,
-            ft_oof_strategy=ft_oof_strategy,
-            ft_oof_shuffle=bool(ft_oof_shuffle),
-            save_preprocess=bool(save_preprocess),
-            preprocess_artifact_path=preprocess_artifact_path,
-            plot_path_style=str(plot_path_style or "nested"),
-            bo_sample_limit=bo_sample_limit,
-            cache_predictions=bool(cache_predictions),
-            prediction_cache_dir=prediction_cache_dir,
-            prediction_cache_format=str(prediction_cache_format or "parquet"),
-            region_province_col=region_province_col,
-            region_city_col=region_city_col,
-            region_effect_alpha=float(region_effect_alpha)
-            if region_effect_alpha is not None
-            else 50.0,
-            geo_feature_nmes=list(geo_feature_nmes)
-            if geo_feature_nmes is not None
-            else None,
-            geo_token_hidden_dim=int(geo_token_hidden_dim)
-            if geo_token_hidden_dim is not None
-            else 32,
-            geo_token_layers=int(geo_token_layers)
-            if geo_token_layers is not None
-            else 2,
-            geo_token_dropout=float(geo_token_dropout)
-            if geo_token_dropout is not None
-            else 0.1,
-            geo_token_k_neighbors=int(geo_token_k_neighbors)
-            if geo_token_k_neighbors is not None
-            else 10,
-            geo_token_learning_rate=float(geo_token_learning_rate)
-            if geo_token_learning_rate is not None
-            else 1e-3,
-            geo_token_epochs=int(geo_token_epochs)
-            if geo_token_epochs is not None
-            else 50,
-        )
+        Examples:
+            # New style (recommended):
+            config = BayesOptConfig(
+                model_nme="my_model",
+                resp_nme="target",
+                weight_nme="weight",
+                factor_nmes=["feat1", "feat2"]
+            )
+            model = BayesOptModel(train_df, test_df, config=config)
+
+            # Old style (deprecated, for backward compatibility):
+            model = BayesOptModel(
+                train_df, test_df,
+                model_nme="my_model",
+                resp_nme="target",
+                weight_nme="weight",
+                factor_nmes=["feat1", "feat2"]
+            )
+        """
+        # Detect which API is being used
+        if config is not None:
+            # New API: config object provided
+            if isinstance(config, BayesOptConfig):
+                cfg = config
+            else:
+                raise TypeError(
+                    f"config must be a BayesOptConfig instance, got {type(config).__name__}"
+                )
+        else:
+            # Old API: individual parameters (backward compatibility)
+            # Show deprecation warning
+            import warnings
+            warnings.warn(
+                "Passing individual parameters to BayesOptModel.__init__ is deprecated. "
+                "Use the 'config' parameter with a BayesOptConfig instance instead:\n"
+                "  config = BayesOptConfig(model_nme=..., resp_nme=..., ...)\n"
+                "  model = BayesOptModel(train_data, test_data, config=config)\n"
+                "Individual parameters will be removed in v0.4.0.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+
+            # Validate required parameters
+            if model_nme is None:
+                raise ValueError("model_nme is required when not using config parameter")
+            if resp_nme is None:
+                raise ValueError("resp_nme is required when not using config parameter")
+            if weight_nme is None:
+                raise ValueError("weight_nme is required when not using config parameter")
+
+            # Infer categorical features if needed
+            inferred_factors, inferred_cats = infer_factor_and_cate_list(
+                train_df=train_data,
+                test_df=test_data,
+                resp_nme=resp_nme,
+                weight_nme=weight_nme,
+                binary_resp_nme=binary_resp_nme,
+                factor_nmes=factor_nmes,
+                cate_list=cate_list,
+                infer_categorical_max_unique=int(infer_categorical_max_unique),
+                infer_categorical_max_ratio=float(infer_categorical_max_ratio),
+            )
+
+            # Construct config from individual parameters
+            cfg = BayesOptConfig(
+                model_nme=model_nme,
+                task_type=task_type,
+                resp_nme=resp_nme,
+                weight_nme=weight_nme,
+                factor_nmes=list(inferred_factors),
+                binary_resp_nme=binary_resp_nme,
+                cate_list=list(inferred_cats) if inferred_cats else None,
+                prop_test=prop_test,
+                rand_seed=rand_seed,
+                epochs=epochs,
+                use_gpu=use_gpu,
+                xgb_max_depth_max=int(xgb_max_depth_max),
+                xgb_n_estimators_max=int(xgb_n_estimators_max),
+                use_resn_data_parallel=use_resn_data_parallel,
+                use_ft_data_parallel=use_ft_data_parallel,
+                use_resn_ddp=use_resn_ddp,
+                use_gnn_data_parallel=use_gnn_data_parallel,
+                use_ft_ddp=use_ft_ddp,
+                use_gnn_ddp=use_gnn_ddp,
+                gnn_use_approx_knn=gnn_use_approx_knn,
+                gnn_approx_knn_threshold=gnn_approx_knn_threshold,
+                gnn_graph_cache=gnn_graph_cache,
+                gnn_max_gpu_knn_nodes=gnn_max_gpu_knn_nodes,
+                gnn_knn_gpu_mem_ratio=gnn_knn_gpu_mem_ratio,
+                gnn_knn_gpu_mem_overhead=gnn_knn_gpu_mem_overhead,
+                output_dir=output_dir,
+                optuna_storage=optuna_storage,
+                optuna_study_prefix=optuna_study_prefix,
+                best_params_files=best_params_files,
+                ft_role=str(ft_role or "model"),
+                ft_feature_prefix=str(ft_feature_prefix or "ft_emb"),
+                ft_num_numeric_tokens=ft_num_numeric_tokens,
+                reuse_best_params=bool(reuse_best_params),
+                resn_weight_decay=float(resn_weight_decay)
+                if resn_weight_decay is not None
+                else 1e-4,
+                final_ensemble=bool(final_ensemble),
+                final_ensemble_k=int(final_ensemble_k),
+                final_refit=bool(final_refit),
+                cv_strategy=str(cv_strategy or "random"),
+                cv_splits=cv_splits,
+                cv_group_col=cv_group_col,
+                cv_time_col=cv_time_col,
+                cv_time_ascending=bool(cv_time_ascending),
+                ft_oof_folds=ft_oof_folds,
+                ft_oof_strategy=ft_oof_strategy,
+                ft_oof_shuffle=bool(ft_oof_shuffle),
+                save_preprocess=bool(save_preprocess),
+                preprocess_artifact_path=preprocess_artifact_path,
+                plot_path_style=str(plot_path_style or "nested"),
+                bo_sample_limit=bo_sample_limit,
+                cache_predictions=bool(cache_predictions),
+                prediction_cache_dir=prediction_cache_dir,
+                prediction_cache_format=str(prediction_cache_format or "parquet"),
+                region_province_col=region_province_col,
+                region_city_col=region_city_col,
+                region_effect_alpha=float(region_effect_alpha)
+                if region_effect_alpha is not None
+                else 50.0,
+                geo_feature_nmes=list(geo_feature_nmes)
+                if geo_feature_nmes is not None
+                else None,
+                geo_token_hidden_dim=int(geo_token_hidden_dim)
+                if geo_token_hidden_dim is not None
+                else 32,
+                geo_token_layers=int(geo_token_layers)
+                if geo_token_layers is not None
+                else 2,
+                geo_token_dropout=float(geo_token_dropout)
+                if geo_token_dropout is not None
+                else 0.1,
+                geo_token_k_neighbors=int(geo_token_k_neighbors)
+                if geo_token_k_neighbors is not None
+                else 10,
+                geo_token_learning_rate=float(geo_token_learning_rate)
+                if geo_token_learning_rate is not None
+                else 1e-3,
+                geo_token_epochs=int(geo_token_epochs)
+                if geo_token_epochs is not None
+                else 50,
+            )
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type

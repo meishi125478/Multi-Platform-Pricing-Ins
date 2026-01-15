@@ -1,4 +1,5 @@
 MANIFEST.in
+README.md
 pyproject.toml
 ins_pricing/CHANGELOG.md
 ins_pricing/README.md

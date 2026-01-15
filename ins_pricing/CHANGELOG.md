@@ -5,6 +5,99 @@ All notable changes to the ins_pricing project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.11] - 2026-01-15
+
+### Changed
+
+#### Refactoring Phase 3: Utils Module Consolidation
+- **Eliminated code duplication** - Consolidated duplicated utility classes:
+  - `DeviceManager` and `GPUMemoryManager` now imported from `ins_pricing.utils`
+  - Removed 181 lines of duplicate code from `bayesopt/utils/metrics_and_devices.py`
+  - File size reduced from 721 to 540 lines (25% reduction)
+  - **Benefit**: Single source of truth for device management utilities
+  - **Impact**: Bug fixes now propagate automatically, no risk of code drift
+  - **Compatibility**: 100% backward compatible - all import patterns continue working
+
+**Technical Details**:
+- Package-level `ins_pricing/utils/device.py` is now the canonical implementation
+- BayesOpt utils automatically re-export these classes for backward compatibility
+- No breaking changes required in existing code
+
+## [0.2.10] - 2026-01-15
+
+### Added
+
+#### Refactoring Phase 2: Simplified BayesOptModel API
+- **BayesOptModel config-based initialization** - New recommended API using configuration objects:
+  - Added `config` parameter accepting `BayesOptConfig` instances
+  - **Before**: 56 individual parameters required
+  - **After**: Single config object parameter
+  - **Benefits**: Improved code clarity, reusability, type safety, and testability
+
+### Changed
+
+#### API Improvements
+- **BayesOptModel initialization** - Enhanced parameter handling:
+  - New API: `BayesOptModel(train_df, test_df, config=BayesOptConfig(...))`
+  - Old API still supported with deprecation warning
+  - Made `model_nme`, `resp_nme`, `weight_nme` optional (validated when config=None)
+  - Added type validation for config parameter
+  - Added helpful error messages for missing required parameters
+
+### Deprecated
+
+- **BayesOptModel individual parameters** - Passing 56 individual parameters to `__init__`:
+  - Use `config=BayesOptConfig(...)` instead
+  - Old API will be removed in v0.4.0
+  - Migration guide: See `modelling/core/bayesopt/PHASE2_REFACTORING_SUMMARY.md`
+
+### Fixed
+
+- **Type hints** - Improved type safety in BayesOptModel initialization
+- **Documentation** - Added comprehensive examples of both old and new APIs
+
+## [0.2.9] - 2026-01-15
+
+### Added
+
+#### Refactoring Phase 1: Utils Module Split
+- **Modular utils package** - Split monolithic 1,503-line utils.py into focused modules:
+  - `utils/constants.py` (183 lines) - Core constants and simple helpers
+  - `utils/io_utils.py` (110 lines) - File I/O and parameter loading
+  - `utils/distributed_utils.py` (163 lines) - DDP and CUDA management
+  - `utils/torch_trainer_mixin.py` (587 lines) - PyTorch training infrastructure
+  - `utils/metrics_and_devices.py` (721 lines) - Metrics, GPU, device, CV, plotting
+  - `utils/__init__.py` (86 lines) - Backward compatibility re-exports
+
+- **Upload automation** - Cross-platform PyPI upload scripts:
+  - `upload_to_pypi.sh` - Shell script for Linux/macOS with auto-version extraction
+  - `upload_to_pypi.bat` - Updated Windows batch script with auto-version extraction
+  - `Makefile` - Cross-platform build automation (build, check, upload, clean)
+  - `README_UPLOAD.md` - Comprehensive upload documentation in English
+  - `UPLOAD_QUICK_START.md` - Quick start guide for package publishing
+
+### Changed
+
+#### Code Organization
+- **utils module structure** - Improved maintainability and testability:
+  - Average file size reduced from 1,503 to 351 lines per module
+  - Each module has single responsibility
+  - Independent testing now possible for each component
+  - **Impact**: 100% backward compatibility maintained via re-exports
+
+### Deprecated
+
+- **utils.py single file import** - Direct import from `bayesopt/utils.py`:
+  - Use `from .utils import ...` instead (package import)
+  - Old single-file import shows deprecation warning
+  - File will be removed in v0.4.0
+  - **Note**: All imports continue to work identically
+
+### Removed
+
+- **verify_core_decoupling.py** - Obsolete test script for unimplemented refactoring
+  - Cleanup logged in `.cleanup_log.md`
+
 ## [0.2.8] - 2026-01-14
 
 ### Added
