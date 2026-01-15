@@ -629,7 +629,9 @@ def _compute_bootstrap_ci(
     if not bootstrap_cfg or not bool(bootstrap_cfg.get("enable", False)) or bootstrap_ci is None:
         return {}
 
-    metric_names = bootstrap_cfg.get("metrics") or list(metrics.keys())
+    metric_names = bootstrap_cfg.get("metrics")
+    if not metric_names:
+        metric_names = [name for name in metrics.keys() if name != "threshold"]
     n_samples = int(bootstrap_cfg.get("n_samples", 200))
     ci = float(bootstrap_cfg.get("ci", 0.95))
     seed = bootstrap_cfg.get("seed")

@@ -93,7 +93,7 @@ class DistributedUtils:
 
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
         # Windows CUDA DDP is not supported
         if os.name == "nt" and torch.cuda.is_available() and world_size > 1:

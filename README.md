@@ -87,6 +87,19 @@ pip install ins_pricing[plotting]    # Visualization
 pip install ins_pricing[gnn]         # Graph neural networks
 ```
 
+#### Multi-platform & GPU installation notes
+
+- **PyTorch (CPU/GPU/MPS)**: Install the correct PyTorch build for your platform/GPU first (CUDA on
+  Linux/Windows, ROCm on supported AMD platforms, or MPS on Apple Silicon). Then install the
+  optional extras you need (e.g., `bayesopt`, `explain`, or `gnn`). This avoids pip pulling a
+  mismatched wheel.
+- **Torch Geometric (GNN)**: `torch-geometric` often requires platform-specific wheels (e.g.,
+  `torch-scatter`, `torch-sparse`). Follow the official PyG installation instructions for your
+  CUDA/ROCm/CPU environment, then install `ins_pricing[gnn]`.
+- **Multi-GPU**: Training code will use CUDA when available and can enable multi-GPU via
+  `torch.distributed`/`DataParallel` where supported. On Windows, CUDA DDP is not supported and will
+  fall back to single-GPU or DataParallel where possible.
+
 ### Requirements
 
 - Python >= 3.9
