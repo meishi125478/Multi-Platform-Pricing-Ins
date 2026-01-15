@@ -29,189 +29,66 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-try:
-    from .. import bayesopt as ropt  # type: ignore
-    from .utils.cli_common import (  # type: ignore
-        PLOT_MODEL_LABELS,
-        PYTORCH_TRAINERS,
-        build_model_names,
-        dedupe_preserve_order,
-        load_dataset,
-        parse_model_pairs,
-        resolve_data_path,
-        resolve_path,
-        fingerprint_file,
-        coerce_dataset_types,
-        split_train_test,
-    )
-    from .utils.cli_config import (  # type: ignore
-        add_config_json_arg,
-        add_output_dir_arg,
-        resolve_and_load_config,
-        resolve_data_config,
-        resolve_report_config,
-        resolve_split_config,
-        resolve_runtime_config,
-        resolve_output_dirs,
-    )
-except Exception:  # pragma: no cover
-    try:
-        import bayesopt as ropt  # type: ignore
-        from utils.cli_common import (  # type: ignore
-            PLOT_MODEL_LABELS,
-            PYTORCH_TRAINERS,
-            build_model_names,
-            dedupe_preserve_order,
-            load_dataset,
-            parse_model_pairs,
-            resolve_data_path,
-            resolve_path,
-            fingerprint_file,
-            coerce_dataset_types,
-            split_train_test,
-        )
-        from utils.cli_config import (  # type: ignore
-            add_config_json_arg,
-            add_output_dir_arg,
-            resolve_and_load_config,
-            resolve_data_config,
-            resolve_report_config,
-            resolve_split_config,
-            resolve_runtime_config,
-            resolve_output_dirs,
-        )
-    except Exception:
-        try:
-            import ins_pricing.modelling.core.bayesopt as ropt  # type: ignore
-            from ins_pricing.cli.utils.cli_common import (  # type: ignore
-                PLOT_MODEL_LABELS,
-                PYTORCH_TRAINERS,
-                build_model_names,
-                dedupe_preserve_order,
-                load_dataset,
-                parse_model_pairs,
-                resolve_data_path,
-                resolve_path,
-                fingerprint_file,
-                coerce_dataset_types,
-                split_train_test,
-            )
-            from ins_pricing.cli.utils.cli_config import (  # type: ignore
-                add_config_json_arg,
-                add_output_dir_arg,
-                resolve_and_load_config,
-                resolve_data_config,
-                resolve_report_config,
-                resolve_split_config,
-                resolve_runtime_config,
-                resolve_output_dirs,
-            )
-        except Exception:
-            import BayesOpt as ropt  # type: ignore
-            from utils.cli_common import (  # type: ignore
-                PLOT_MODEL_LABELS,
-                PYTORCH_TRAINERS,
-                build_model_names,
-                dedupe_preserve_order,
-                load_dataset,
-                parse_model_pairs,
-                resolve_data_path,
-                resolve_path,
-                fingerprint_file,
-                coerce_dataset_types,
-                split_train_test,
-            )
-            from utils.cli_config import (  # type: ignore
-                add_config_json_arg,
-                add_output_dir_arg,
-                resolve_and_load_config,
-                resolve_data_config,
-                resolve_report_config,
-                resolve_split_config,
-                resolve_runtime_config,
-                resolve_output_dirs,
-            )
+# Use unified import resolver to eliminate nested try/except chains
+from .utils.import_resolver import resolve_imports, setup_sys_path
+from .utils.evaluation_context import (
+    EvaluationContext,
+    TrainingContext,
+    ModelIdentity,
+    DataFingerprint,
+    CalibrationConfig,
+    ThresholdConfig,
+    BootstrapConfig,
+    ReportConfig,
+    RegistryConfig,
+)
+
+# Resolve all imports from a single location
+setup_sys_path()
+_imports = resolve_imports()
+
+ropt = _imports.bayesopt
+PLOT_MODEL_LABELS = _imports.PLOT_MODEL_LABELS
+PYTORCH_TRAINERS = _imports.PYTORCH_TRAINERS
+build_model_names = _imports.build_model_names
+dedupe_preserve_order = _imports.dedupe_preserve_order
+load_dataset = _imports.load_dataset
+parse_model_pairs = _imports.parse_model_pairs
+resolve_data_path = _imports.resolve_data_path
+resolve_path = _imports.resolve_path
+fingerprint_file = _imports.fingerprint_file
+coerce_dataset_types = _imports.coerce_dataset_types
+split_train_test = _imports.split_train_test
+
+add_config_json_arg = _imports.add_config_json_arg
+add_output_dir_arg = _imports.add_output_dir_arg
+resolve_and_load_config = _imports.resolve_and_load_config
+resolve_data_config = _imports.resolve_data_config
+resolve_report_config = _imports.resolve_report_config
+resolve_split_config = _imports.resolve_split_config
+resolve_runtime_config = _imports.resolve_runtime_config
+resolve_output_dirs = _imports.resolve_output_dirs
+
+bootstrap_ci = _imports.bootstrap_ci
+calibrate_predictions = _imports.calibrate_predictions
+eval_metrics_report = _imports.metrics_report
+select_threshold = _imports.select_threshold
+
+ModelArtifact = _imports.ModelArtifact
+ModelRegistry = _imports.ModelRegistry
+drift_psi_report = _imports.drift_psi_report
+group_metrics = _imports.group_metrics
+ReportPayload = _imports.ReportPayload
+write_report = _imports.write_report
+
+configure_run_logging = _imports.configure_run_logging
+plot_loss_curve_common = _imports.plot_loss_curve
 
 import matplotlib
 
 if os.name != "nt" and not os.environ.get("DISPLAY") and not os.environ.get("MPLBACKEND"):
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-try:
-    from .utils.run_logging import configure_run_logging  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from utils.run_logging import configure_run_logging  # type: ignore
-    except Exception:  # pragma: no cover
-        configure_run_logging = None  # type: ignore
-
-try:
-    from ..modelling.plotting.diagnostics import plot_loss_curve as plot_loss_curve_common
-except Exception:  # pragma: no cover
-    try:
-        from ins_pricing.plotting.diagnostics import plot_loss_curve as plot_loss_curve_common
-    except Exception:  # pragma: no cover
-        plot_loss_curve_common = None
-
-try:
-    from ..modelling.core.evaluation import (  # type: ignore
-        bootstrap_ci,
-        calibrate_predictions,
-        metrics_report as eval_metrics_report,
-        select_threshold,
-    )
-    from ..governance.registry import ModelArtifact, ModelRegistry  # type: ignore
-    from ..production import psi_report as drift_psi_report  # type: ignore
-    from ..production.monitoring import group_metrics  # type: ignore
-    from ..reporting.report_builder import ReportPayload, write_report  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from ins_pricing.modelling.core.evaluation import (  # type: ignore
-            bootstrap_ci,
-            calibrate_predictions,
-            metrics_report as eval_metrics_report,
-            select_threshold,
-        )
-        from ins_pricing.governance.registry import (  # type: ignore
-            ModelArtifact,
-            ModelRegistry,
-        )
-        from ins_pricing.production import psi_report as drift_psi_report  # type: ignore
-        from ins_pricing.production.monitoring import group_metrics  # type: ignore
-        from ins_pricing.reporting.report_builder import (  # type: ignore
-            ReportPayload,
-            write_report,
-        )
-    except Exception:  # pragma: no cover
-        try:
-            from evaluation import (  # type: ignore
-                bootstrap_ci,
-                calibrate_predictions,
-                metrics_report as eval_metrics_report,
-                select_threshold,
-            )
-            from ins_pricing.governance.registry import (  # type: ignore
-                ModelArtifact,
-                ModelRegistry,
-            )
-            from ins_pricing.production import psi_report as drift_psi_report  # type: ignore
-            from ins_pricing.production.monitoring import group_metrics  # type: ignore
-            from ins_pricing.reporting.report_builder import (  # type: ignore
-                ReportPayload,
-                write_report,
-            )
-        except Exception:  # pragma: no cover
-            bootstrap_ci = None  # type: ignore
-            calibrate_predictions = None  # type: ignore
-            eval_metrics_report = None  # type: ignore
-            select_threshold = None  # type: ignore
-            drift_psi_report = None  # type: ignore
-            group_metrics = None  # type: ignore
-            ReportPayload = None  # type: ignore
-            write_report = None  # type: ignore
-            ModelRegistry = None  # type: ignore
-            ModelArtifact = None  # type: ignore
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1081,31 +958,63 @@ def _evaluate_and_report(
         )
 
 
-def train_from_config(args: argparse.Namespace) -> None:
-    script_dir = Path(__file__).resolve().parents[1]
-    config_path, cfg = resolve_and_load_config(
-        args.config_json,
-        script_dir,
-        required_keys=["data_dir", "model_list",
-                       "model_categories", "target", "weight"],
+def _evaluate_with_context(
+    model: ropt.BayesOptModel,
+    ctx: EvaluationContext,
+) -> None:
+    """Evaluate model predictions using context object.
+
+    This is a cleaner interface that uses the EvaluationContext dataclass
+    instead of 19+ individual parameters.
+    """
+    _evaluate_and_report(
+        model,
+        model_name=ctx.identity.model_name,
+        model_key=ctx.identity.model_key,
+        cfg=ctx.cfg,
+        data_path=ctx.data_path,
+        data_fingerprint=ctx.data_fingerprint.to_dict(),
+        report_output_dir=ctx.report.output_dir,
+        report_group_cols=ctx.report.group_cols,
+        report_time_col=ctx.report.time_col,
+        report_time_freq=ctx.report.time_freq,
+        report_time_ascending=ctx.report.time_ascending,
+        psi_report_df=ctx.psi_report_df,
+        calibration_cfg={
+            "enable": ctx.calibration.enable,
+            "method": ctx.calibration.method,
+            "max_rows": ctx.calibration.max_rows,
+            "seed": ctx.calibration.seed,
+        },
+        threshold_cfg={
+            "enable": ctx.threshold.enable,
+            "metric": ctx.threshold.metric,
+            "value": ctx.threshold.value,
+            "min_positive_rate": ctx.threshold.min_positive_rate,
+            "grid": ctx.threshold.grid,
+            "max_rows": ctx.threshold.max_rows,
+            "seed": ctx.threshold.seed,
+        },
+        bootstrap_cfg={
+            "enable": ctx.bootstrap.enable,
+            "metrics": ctx.bootstrap.metrics,
+            "n_samples": ctx.bootstrap.n_samples,
+            "ci": ctx.bootstrap.ci,
+            "seed": ctx.bootstrap.seed,
+        },
+        register_model=ctx.registry.register,
+        registry_path=ctx.registry.path,
+        registry_tags=ctx.registry.tags,
+        registry_status=ctx.registry.status,
+        run_id=ctx.run_id,
+        config_sha=ctx.config_sha,
     )
-    plot_requested = bool(args.plot_curves or cfg.get("plot_curves", False))
-    config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    def _safe_int_env(key: str, default: int) -> int:
-        try:
-            return int(os.environ.get(key, default))
-        except (TypeError, ValueError):
-            return default
 
-    dist_world_size = _safe_int_env("WORLD_SIZE", 1)
-    dist_rank = _safe_int_env("RANK", 0)
-    dist_active = dist_world_size > 1
-    is_main_process = (not dist_active) or dist_rank == 0
-
+def _create_ddp_barrier(dist_ctx: TrainingContext):
+    """Create a DDP barrier function for distributed training synchronization."""
     def _ddp_barrier(reason: str) -> None:
-        if not dist_active:
+        if not dist_ctx.is_distributed:
             return
         torch_mod = getattr(ropt, "torch", None)
         dist_mod = getattr(torch_mod, "distributed", None)
@@ -1122,6 +1031,28 @@ def train_from_config(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"[DDP] barrier failed during {reason}: {exc}", flush=True)
             raise
+    return _ddp_barrier
+
+
+def train_from_config(args: argparse.Namespace) -> None:
+    script_dir = Path(__file__).resolve().parents[1]
+    config_path, cfg = resolve_and_load_config(
+        args.config_json,
+        script_dir,
+        required_keys=["data_dir", "model_list",
+                       "model_categories", "target", "weight"],
+    )
+    plot_requested = bool(args.plot_curves or cfg.get("plot_curves", False))
+    config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    # Use TrainingContext for distributed training state
+    dist_ctx = TrainingContext.from_env()
+    dist_world_size = dist_ctx.world_size
+    dist_rank = dist_ctx.rank
+    dist_active = dist_ctx.is_distributed
+    is_main_process = dist_ctx.is_main_process
+    _ddp_barrier = _create_ddp_barrier(dist_ctx)
 
     data_dir, data_format, data_path_template, dtype_map = resolve_data_config(
         cfg,
