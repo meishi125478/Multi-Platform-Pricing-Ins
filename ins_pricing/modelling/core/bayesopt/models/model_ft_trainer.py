@@ -626,6 +626,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         best_state = None
         patience_counter = 0
         is_ddp_model = isinstance(self.ft, DDP)
+        use_collectives = dist.is_initialized() and is_ddp_model
 
         clip_fn = None
         if self.device.type == 'cuda':
@@ -669,7 +670,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                             device=X_num_b.device)
                         local_bad = 0 if bool(torch.isfinite(batch_loss)) else 1
                         global_bad = local_bad
-                        if dist.is_initialized():
+                        if use_collectives:
                             bad = torch.tensor(
                                 [local_bad],
                                 device=batch_loss.device,
@@ -774,7 +775,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                             total_n += float(end - start)
                     val_loss_tensor[0] = total_val / max(total_n, 1.0)
 
-                if dist.is_initialized():
+                if use_collectives:
                     dist.broadcast(val_loss_tensor, src=0)
                 val_loss_value = float(val_loss_tensor.item())
                 prune_now = False
@@ -806,7 +807,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                     if trial.should_prune():
                         prune_now = True
 
-                if dist.is_initialized():
+                if use_collectives:
                     flag = torch.tensor(
                         [1 if prune_now else 0],
                         device=loss_tensor_device,

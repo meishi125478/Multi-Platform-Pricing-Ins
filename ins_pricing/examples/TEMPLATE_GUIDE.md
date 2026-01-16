@@ -94,6 +94,7 @@ categorical_features = [...]
 # Modify these in the CONFIGURATION section:
 ft_cfg_path = work_dir / 'config_ft_unsupervised_ddp_embed.json'
 xgb_cfg_path = work_dir / 'config_xgb_from_ft_unsupervised.json'
+resn_cfg_path = work_dir / 'config_resn_from_ft_unsupervised.json'
 input_path = work_dir / 'Data/new_data.csv'
 output_path = work_dir / 'Results/predictions.csv'
 model_keys = ["xgb", "resn"]  # Which models to use
@@ -114,7 +115,7 @@ model_keys = ["xgb", "resn"]  # Which models to use
 # Modify config paths in CONFIGURATION section:
 cfg_path = work_dir / 'config_xgb_from_ft_unsupervised.json'
 xgb_cfg_path = work_dir / 'config_xgb_from_ft_unsupervised.json'
-resn_cfg_path = work_dir / 'config_resn_from_ft_unsupervised_ddp.json'
+resn_cfg_path = work_dir / 'config_resn_from_ft_unsupervised.json'
 ft_cfg_path = work_dir / 'config_ft_unsupervised_ddp_embed.json'
 ```
 

@@ -99,12 +99,12 @@ The simplest way to get started - no configuration files needed!
 Open [Plot_Oneway_Pre.ipynb](Plot_Oneway_Pre.ipynb):
 ```python
 # Just set these variables in the notebook
-use_config_file = False
 data_path = work_dir / 'Data/od_bc.csv'
 model_name = 'od_bc'
 target_col = 'response'
 weight_col = 'weights'
 feature_list = ['age_owner', 'gender_owner', ...]  # Your features
+categorical_features = ['gender_owner', ...]  # Your categorical features
 ```
 
 Run the notebook - plots will be generated without any config file!

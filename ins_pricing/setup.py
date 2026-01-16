@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="ins_pricing",
-    version="0.2.9",
+    version="0.3.1",
     description="Reusable modelling, pricing, governance, and reporting utilities.",
     author="meishi125478",
     license="Proprietary",

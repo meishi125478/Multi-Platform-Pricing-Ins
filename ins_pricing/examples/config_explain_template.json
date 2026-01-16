@@ -5,7 +5,7 @@
   "dtype_map": null,
   "model_list": ["od"],
   "model_categories": ["bc"],
-  "target": "response",
+  "target": "reponse",
   "weight": "weights",
   "feature_list": [
     "feature_1",

@@ -6,7 +6,7 @@
   "model_categories": [
     "bc"
   ],
-  "target": "reponse",
+  "target": "response",
   "weight": "weights",
   "feature_list": [
     "age_owner",

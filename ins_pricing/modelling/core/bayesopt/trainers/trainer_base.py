@@ -1094,7 +1094,7 @@ class TrainerBase:
                 split_iter = splitter
 
         losses: List[float] = []
-        for train_idx, val_idx in split_iter:
+        for fold_idx, (train_idx, val_idx) in enumerate(split_iter):
             X_train = X_all.iloc[train_idx]
             y_train = y_all.iloc[train_idx]
             X_val = X_all.iloc[val_idx]
@@ -1108,9 +1108,11 @@ class TrainerBase:
             model = model_builder(params)
             try:
                 if fit_predict_fn:
+                    # Avoid duplicate Optuna step reports across folds.
+                    trial_for_fold = trial if fold_idx == 0 else None
                     y_pred = fit_predict_fn(
                         model, X_train, y_train, w_train,
-                        X_val, y_val, w_val, trial
+                        X_val, y_val, w_val, trial_for_fold
                     )
                 else:
                     fit_kwargs = {}
@@ -1288,4 +1290,3 @@ class TrainerBase:
             predict_kwargs_train=predict_kwargs_train,
             predict_kwargs_test=predict_kwargs_test,
             predict_fn=predict_fn)
-

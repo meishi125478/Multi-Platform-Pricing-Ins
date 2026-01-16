@@ -314,7 +314,10 @@ class TorchTrainerMixin:
             f">>> DataLoader config: Batch Size={batch_size}, Accum Steps={accum_steps}, "
             f"Workers={workers}, Prefetch={prefetch_factor or 'off'}, Profile={profile}")
         sampler = None
-        if dist.is_initialized():
+        use_distributed_sampler = bool(
+            dist.is_initialized() and getattr(self, "is_ddp_enabled", False)
+        )
+        if use_distributed_sampler:
             sampler = DistributedSampler(dataset, shuffle=True)
             shuffle = False
         else:
@@ -413,6 +416,7 @@ class TorchTrainerMixin:
         val_history: List[float] = []
 
         is_ddp_model = isinstance(model, DDP)
+        use_collectives = dist.is_initialized() and is_ddp_model
 
         for epoch in range(1, getattr(self, "epochs", 1) + 1):
             epoch_start_ts = time.time()
@@ -487,7 +491,7 @@ class TorchTrainerMixin:
                             val_weighted_loss = val_result
                     val_loss_tensor[0] = float(val_weighted_loss)
 
-                if dist.is_initialized():
+                if use_collectives:
                     dist.broadcast(val_loss_tensor, src=0)
                 val_weighted_loss = float(val_loss_tensor.item())
 
@@ -502,7 +506,7 @@ class TorchTrainerMixin:
                     trial.report(val_weighted_loss, epoch)
                     prune_flag = trial.should_prune()
 
-                if dist.is_initialized():
+                if use_collectives:
                     prune_device = getattr(self, "device", torch.device("cpu"))
                     if not isinstance(prune_device, torch.device):
                         prune_device = torch.device(prune_device)

@@ -3,7 +3,7 @@
   "data_format": "csv",
   "data_path_template": "{model_name}.{ext}",
   "dtype_map": null,
-  "target": "reponse",
+  "target": "response",
   "weight": "weights",
   "prop_test": 0.25,
   "holdout_ratio": 0.25,
