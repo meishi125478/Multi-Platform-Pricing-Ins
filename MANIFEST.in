@@ -1,3 +1,0 @@
-include README.md
-recursive-include ins_pricing *.md
-recursive-exclude ins_pricing/examples *
