@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import torch
 
+from ins_pricing.utils.torch_compat import disable_torch_dynamo_if_requested
+
+disable_torch_dynamo_if_requested()
+
 from .config_preprocess import (
     BayesOptConfig,
     DatasetPreprocessor,

@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,14 +71,39 @@ class ResolvedImports:
     plot_loss_curve: Optional[Callable] = None
 
 
+def _debug_imports_enabled() -> bool:
+    value = os.environ.get("BAYESOPT_DEBUG_IMPORTS")
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _try_import(module_path: str, attr_name: Optional[str] = None) -> Optional[Any]:
     """Attempt to import a module or attribute, returning None on failure."""
     try:
         module = importlib.import_module(module_path)
         if attr_name:
-            return getattr(module, attr_name, None)
-        return module
-    except Exception:
+            result = getattr(module, attr_name, None)
+        else:
+            result = module
+        if _debug_imports_enabled():
+            origin = getattr(module, "__file__", None)
+            origin = origin or getattr(module, "__path__", None)
+            print(
+                f"[BAYESOPT_DEBUG_IMPORTS] imported {module_path}"
+                f"{'::' + attr_name if attr_name else ''} from {origin}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return result
+    except Exception as exc:
+        if _debug_imports_enabled():
+            print(
+                f"[BAYESOPT_DEBUG_IMPORTS] failed import {module_path}"
+                f"{'::' + attr_name if attr_name else ''}: {exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         return None
 
 

@@ -24,6 +24,7 @@ from .scoring import batch_score
 from ..modelling.core.bayesopt.models.model_gnn import GraphNeuralNetSklearn
 from ..modelling.core.bayesopt.models.model_resn import ResNetSklearn
 from ins_pricing.utils import DeviceManager, get_logger
+from ins_pricing.utils.torch_compat import torch_load
 
 _logger = get_logger("ins_pricing.production.predict")
 
@@ -130,7 +131,7 @@ def _load_preprocess_from_model_file(
     if model_key in {"xgb", "glm"}:
         payload = joblib.load(model_path)
     else:
-        payload = torch.load(model_path, map_location="cpu")
+        payload = torch_load(model_path, map_location="cpu")
     if isinstance(payload, dict):
         return payload.get("preprocess_artifacts")
     return None
@@ -261,7 +262,7 @@ def load_saved_model(
         return payload
 
     if model_key == "ft":
-        payload = torch.load(model_path, map_location="cpu", weights_only=False)
+        payload = torch_load(model_path, map_location="cpu", weights_only=False)
         if isinstance(payload, dict):
             if "state_dict" in payload and "model_config" in payload:
                 # New format: state_dict + model_config (DDP-safe)
@@ -325,7 +326,7 @@ def load_saved_model(
     if model_key == "resn":
         if input_dim is None:
             raise ValueError("input_dim is required for ResNet loading")
-        payload = torch.load(model_path, map_location="cpu")
+        payload = torch_load(model_path, map_location="cpu")
         if isinstance(payload, dict) and "state_dict" in payload:
             state_dict = payload.get("state_dict")
             params = payload.get("best_params") or load_best_params(
@@ -351,7 +352,7 @@ def load_saved_model(
     if model_key == "gnn":
         if input_dim is None:
             raise ValueError("input_dim is required for GNN loading")
-        payload = torch.load(model_path, map_location="cpu")
+        payload = torch_load(model_path, map_location="cpu")
         if not isinstance(payload, dict):
             raise ValueError(f"Invalid GNN checkpoint: {model_path}")
         params = payload.get("best_params") or {}

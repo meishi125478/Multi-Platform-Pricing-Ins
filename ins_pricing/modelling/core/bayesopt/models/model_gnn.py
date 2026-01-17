@@ -42,6 +42,12 @@ _GNN_MPS_WARNED = False
 # Simplified GNN implementation.
 # =============================================================================
 
+def _adj_mm(adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Matrix multiply that supports sparse or dense adjacency."""
+    if adj.is_sparse:
+        return torch.sparse.mm(adj, x)
+    return adj.matmul(x)
+
 
 class SimpleGraphLayer(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
@@ -52,7 +58,7 @@ class SimpleGraphLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         # Message passing with normalized sparse adjacency: A_hat * X * W.
-        h = torch.sparse.mm(adj, x)
+        h = _adj_mm(adj, x)
         h = self.linear(h)
         h = self.activation(h)
         return self.dropout(h)
@@ -86,7 +92,7 @@ class SimpleGNN(nn.Module):
         h = x
         for layer in self.layers:
             h = layer(h, adj_used)
-        h = torch.sparse.mm(adj_used, h)
+        h = _adj_mm(adj_used, h)
         out = self.output(h)
         return self.output_act(out)
 
@@ -124,7 +130,11 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self.knn_gpu_mem_ratio = max(0.0, min(1.0, knn_gpu_mem_ratio))
         self.knn_gpu_mem_overhead = max(1.0, knn_gpu_mem_overhead)
         self.knn_cpu_jobs = knn_cpu_jobs
+        self.mps_dense_max_nodes = int(
+            os.environ.get("BAYESOPT_GNN_MPS_DENSE_MAX_NODES", "5000")
+        )
         self._knn_warning_emitted = False
+        self._mps_fallback_triggered = False
         self._adj_cache_meta: Optional[Dict[str, Any]] = None
         self._adj_cache_key: Optional[Tuple[Any, ...]] = None
         self._adj_cache_tensor: Optional[torch.Tensor] = None
@@ -168,11 +178,11 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             else:
                 self.device = torch.device('cuda')
         elif torch.backends.mps.is_available():
-            self.device = torch.device('cpu')
+            self.device = torch.device('mps')
             global _GNN_MPS_WARNED
             if not _GNN_MPS_WARNED:
                 print(
-                    "[GNN] MPS backend does not support sparse ops; falling back to CPU.",
+                    "[GNN] Using MPS backend; will fall back to CPU on unsupported ops.",
                     flush=True,
                 )
                 _GNN_MPS_WARNED = True
@@ -235,6 +245,41 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         else:
             base.register_buffer("adj_buffer", adj)
 
+    @staticmethod
+    def _is_mps_unsupported_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        if "mps" not in msg:
+            return False
+        if any(token in msg for token in ("not supported", "not implemented", "does not support", "unimplemented", "out of memory")):
+            return True
+        return "sparse" in msg
+
+    def _fallback_to_cpu(self, reason: str) -> None:
+        if self.device.type != "mps" or self._mps_fallback_triggered:
+            return
+        self._mps_fallback_triggered = True
+        print(f"[GNN] MPS op unsupported ({reason}); falling back to CPU.", flush=True)
+        self.device = torch.device("cpu")
+        self.use_pyg_knn = False
+        self.data_parallel_enabled = False
+        self.ddp_enabled = False
+        base = self._unwrap_gnn()
+        try:
+            base = base.to(self.device)
+        except Exception:
+            pass
+        self.gnn = base
+        self.invalidate_graph_cache()
+
+    def _run_with_mps_fallback(self, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (RuntimeError, NotImplementedError) as exc:
+            if self.device.type == "mps" and self._is_mps_unsupported_error(exc):
+                self._fallback_to_cpu(str(exc))
+                return fn(*args, **kwargs)
+            raise
+
     def _graph_cache_meta(self, X_df: pd.DataFrame) -> Dict[str, Any]:
         row_hash = pd.util.hash_pandas_object(X_df, index=False).values
         idx_hash = pd.util.hash_pandas_object(X_df.index, index=False).values
@@ -255,11 +300,14 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             "knn_gpu_mem_ratio": float(self.knn_gpu_mem_ratio),
             "knn_gpu_mem_overhead": float(self.knn_gpu_mem_overhead),
         }
+        adj_format = "dense" if self.device.type == "mps" else "sparse"
         return {
             "n_samples": int(X_df.shape[0]),
             "n_features": int(X_df.shape[1]),
             "hash": hasher.hexdigest(),
             "knn_config": knn_config,
+            "adj_format": adj_format,
+            "device_type": self.device.type,
         }
 
     def _graph_cache_key(self, X_df: pd.DataFrame) -> Tuple[Any, ...]:
@@ -284,8 +332,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             if meta_expected is None:
                 meta_expected = self._graph_cache_meta(X_df)
             try:
-                payload = torch.load(self.graph_cache_path,
-                                     map_location=self.device)
+                payload = torch.load(self.graph_cache_path, map_location="cpu")
             except Exception as exc:
                 print(
                     f"[GNN] Failed to load cached graph from {self.graph_cache_path}: {exc}")
@@ -293,7 +340,13 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             if isinstance(payload, dict) and "adj" in payload:
                 meta_cached = payload.get("meta")
                 if meta_cached == meta_expected:
-                    return payload["adj"].to(self.device)
+                    adj = payload["adj"]
+                    if self.device.type == "mps" and getattr(adj, "is_sparse", False):
+                        print(
+                            f"[GNN] Cached sparse graph incompatible with MPS; rebuilding: {self.graph_cache_path}"
+                        )
+                        return None
+                    return adj.to(self.device)
                 print(
                     f"[GNN] Cached graph metadata mismatch; rebuilding: {self.graph_cache_path}")
                 return None
@@ -408,6 +461,11 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         return True
 
     def _normalized_adj(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        if self.device.type == "mps":
+            return self._normalized_adj_dense(edge_index, num_nodes)
+        return self._normalized_adj_sparse(edge_index, num_nodes)
+
+    def _normalized_adj_sparse(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
         values = torch.ones(edge_index.shape[1], device=self.device)
         adj = torch.sparse_coo_tensor(
             edge_index.to(self.device), values, (num_nodes, num_nodes))
@@ -420,6 +478,21 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         adj_norm = torch.sparse_coo_tensor(
             adj.indices(), norm_values, size=adj.shape)
         return adj_norm
+
+    def _normalized_adj_dense(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        if self.mps_dense_max_nodes <= 0 or num_nodes > self.mps_dense_max_nodes:
+            raise RuntimeError(
+                f"MPS dense adjacency not supported for {num_nodes} nodes; "
+                f"max={self.mps_dense_max_nodes}. Falling back to CPU."
+            )
+        edge_index = edge_index.to(self.device)
+        adj = torch.zeros((num_nodes, num_nodes), device=self.device, dtype=torch.float32)
+        adj[edge_index[0], edge_index[1]] = 1.0
+        deg = adj.sum(dim=1)
+        deg_inv_sqrt = torch.pow(deg + 1e-8, -0.5)
+        adj = adj * deg_inv_sqrt.view(-1, 1)
+        adj = adj * deg_inv_sqrt.view(1, -1)
+        return adj
 
     def _tensorize_split(self, X, y, w, allow_none: bool = False):
         if X is None and allow_none:
@@ -462,17 +535,25 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             if self._adj_cache_meta == meta_expected and self._adj_cache_tensor is not None:
                 cached = self._adj_cache_tensor
                 if cached.device != self.device:
-                    cached = cached.to(self.device)
-                    self._adj_cache_tensor = cached
-                return cached
+                    if self.device.type == "mps" and getattr(cached, "is_sparse", False):
+                        self._adj_cache_tensor = None
+                    else:
+                        cached = cached.to(self.device)
+                        self._adj_cache_tensor = cached
+                if self._adj_cache_tensor is not None:
+                    return self._adj_cache_tensor
         else:
             cache_key = self._graph_cache_key(X_df)
             if self._adj_cache_key == cache_key and self._adj_cache_tensor is not None:
                 cached = self._adj_cache_tensor
                 if cached.device != self.device:
-                    cached = cached.to(self.device)
-                    self._adj_cache_tensor = cached
-                return cached
+                    if self.device.type == "mps" and getattr(cached, "is_sparse", False):
+                        self._adj_cache_tensor = None
+                    else:
+                        cached = cached.to(self.device)
+                        self._adj_cache_tensor = cached
+                if self._adj_cache_tensor is not None:
+                    return self._adj_cache_tensor
         X_np = None
         if X_tensor is None:
             X_np = X_df.to_numpy(dtype=np.float32, copy=False)
@@ -511,7 +592,20 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
     def fit(self, X_train, y_train, w_train=None,
             X_val=None, y_val=None, w_val=None,
             trial: Optional[optuna.trial.Trial] = None):
+        return self._run_with_mps_fallback(
+            self._fit_impl,
+            X_train,
+            y_train,
+            w_train,
+            X_val,
+            y_val,
+            w_val,
+            trial,
+        )
 
+    def _fit_impl(self, X_train, y_train, w_train=None,
+                  X_val=None, y_val=None, w_val=None,
+                  trial: Optional[optuna.trial.Trial] = None):
         X_train_tensor, y_train_tensor, w_train_tensor = self._tensorize_split(
             X_train, y_train, w_train, allow_none=False)
         has_val = X_val is not None and y_val is not None
@@ -621,6 +715,9 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self.best_epoch = int(best_epoch or self.epochs)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return self._run_with_mps_fallback(self._predict_impl, X)
+
+    def _predict_impl(self, X: pd.DataFrame) -> np.ndarray:
         self.gnn.eval()
         X_tensor, _, _ = self._tensorize_split(
             X, None, None, allow_none=False)
@@ -640,6 +737,9 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         return y_pred.ravel()
 
     def encode(self, X: pd.DataFrame) -> np.ndarray:
+        return self._run_with_mps_fallback(self._encode_impl, X)
+
+    def _encode_impl(self, X: pd.DataFrame) -> np.ndarray:
         """Return per-sample node embeddings (hidden representations)."""
         base = self._unwrap_gnn()
         base.eval()
@@ -655,7 +755,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                 raise RuntimeError("GNN base module does not expose layers.")
             for layer in layers:
                 h = layer(h, adj)
-            h = torch.sparse.mm(adj, h)
+            h = _adj_mm(adj, h)
         return h.detach().cpu().numpy()
 
     def set_params(self, params: Dict[str, Any]):

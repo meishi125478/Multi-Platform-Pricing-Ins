@@ -12,6 +12,7 @@ from .trainer_base import TrainerBase
 from ..models import GraphNeuralNetSklearn
 from ..utils import EPS
 from ins_pricing.utils import get_logger
+from ins_pricing.utils.torch_compat import torch_load
 
 _logger = get_logger("ins_pricing.trainer.gnn")
 
@@ -300,7 +301,7 @@ class GNNTrainer(TrainerBase):
         if not os.path.exists(path):
             print(f"[load] Warning: Model file not found: {path}")
             return
-        payload = torch.load(path, map_location='cpu', weights_only=False)
+        payload = torch_load(path, map_location='cpu', weights_only=False)
         if not isinstance(payload, dict):
             raise ValueError(f"Invalid GNN checkpoint: {path}")
         params = payload.get("best_params") or {}
@@ -322,4 +323,3 @@ class GNNTrainer(TrainerBase):
         self.model = model
         self.best_params = dict(params) if isinstance(params, dict) else None
         self.ctx.gnn_best = self.model
-

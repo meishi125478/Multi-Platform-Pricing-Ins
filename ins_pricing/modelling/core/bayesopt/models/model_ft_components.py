@@ -106,31 +106,58 @@ class ScaledTransformerEncoderLayer(nn.Module):
         self.res_scale_attn = residual_scale_attn
         self.res_scale_ffn = residual_scale_ffn
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal: Optional[bool] = None, **_kwargs):
         # Input tensor shape: (batch, seq_len, d_model).
         x = src
 
         if self.norm_first:
             # Pre-norm before attention.
-            x = x + self._sa_block(self.norm1(x), src_mask,
-                                   src_key_padding_mask)
+            x = x + self._sa_block(
+                self.norm1(x),
+                src_mask,
+                src_key_padding_mask,
+                is_causal=is_causal,
+            )
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm (usually disabled).
             x = self.norm1(
-                x + self._sa_block(x, src_mask, src_key_padding_mask))
+                x + self._sa_block(
+                    x,
+                    src_mask,
+                    src_key_padding_mask,
+                    is_causal=is_causal,
+                )
+            )
             x = self.norm2(x + self._ff_block(x))
 
         return x
 
-    def _sa_block(self, x, attn_mask, key_padding_mask):
+    def _sa_block(self, x, attn_mask, key_padding_mask, *, is_causal: Optional[bool] = None):
         # Self-attention with residual scaling.
-        attn_out, _ = self.self_attn(
-            x, x, x,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False
-        )
+        if is_causal is None:
+            attn_out, _ = self.self_attn(
+                x, x, x,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+        else:
+            try:
+                attn_out, _ = self.self_attn(
+                    x, x, x,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                    is_causal=is_causal,
+                )
+            except TypeError:
+                attn_out, _ = self.self_attn(
+                    x, x, x,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
         return self.res_scale_attn * self.dropout1(attn_out)
 
     def _ff_block(self, x):
@@ -313,4 +340,3 @@ class MaskedTabularDataset(Dataset):
             None if self.X_cat_true is None else self.X_cat_true[idx],
             None if self.cat_mask is None else self.cat_mask[idx],
         )
-

@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, cast
 
 try:
-    from .cli_config import add_config_json_arg  # type: ignore
+    from .cli_config import add_config_json_arg, set_env  # type: ignore
 except Exception:  # pragma: no cover
-    from cli_config import add_config_json_arg  # type: ignore
+    from cli_config import add_config_json_arg, set_env  # type: ignore
 
 
 def _find_ins_pricing_dir(cwd: Optional[Path] = None) -> Path:
@@ -261,6 +261,7 @@ def run_from_config(config_json: str | Path) -> subprocess.CompletedProcess:
     if not config_path.is_absolute():
         config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
     raw = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
+    set_env(raw.get("env", {}))
     runner = cast(dict, raw.get("runner") or {})
 
     mode = str(runner.get("mode") or "entry").strip().lower()

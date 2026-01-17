@@ -27,6 +27,7 @@ from sklearn.preprocessing import StandardScaler
 from ..config_preprocess import BayesOptConfig, OutputManager
 from ..utils import DistributedUtils, EPS, ensure_parent_dir
 from ins_pricing.utils import get_logger, GPUMemoryManager, DeviceManager
+from ins_pricing.utils.torch_compat import torch_load
 
 # Module-level logger
 _logger = get_logger("ins_pricing.trainer")
@@ -616,7 +617,7 @@ class TrainerBase:
                 pass
             else:
                 # FT-Transformer: load state_dict and reconstruct model
-                loaded = torch.load(path, map_location='cpu', weights_only=False)
+                loaded = torch_load(path, map_location='cpu', weights_only=False)
                 if isinstance(loaded, dict):
                     if "state_dict" in loaded and "model_config" in loaded:
                         # New format: state_dict + model_config
