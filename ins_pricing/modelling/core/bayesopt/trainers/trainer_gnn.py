@@ -6,11 +6,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import optuna
 import torch
-from sklearn.metrics import log_loss, mean_tweedie_deviance
+from sklearn.metrics import log_loss
 
 from .trainer_base import TrainerBase
 from ..models import GraphNeuralNetSklearn
 from ..utils import EPS
+from ..utils.losses import regression_loss
 from ins_pricing.utils import get_logger
 from ins_pricing.utils.torch_compat import torch_load
 
@@ -25,6 +26,15 @@ class GNNTrainer(TrainerBase):
     def _build_model(self, params: Optional[Dict[str, Any]] = None) -> GraphNeuralNetSklearn:
         params = params or {}
         base_tw_power = self.ctx.default_tweedie_power()
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
+        tw_power = params.get("tw_power")
+        if self.ctx.task_type == "regression":
+            if loss_name == "tweedie":
+                tw_power = base_tw_power if tw_power is None else float(tw_power)
+            elif loss_name in ("poisson", "gamma"):
+                tw_power = base_tw_power
+            else:
+                tw_power = None
         model = GraphNeuralNetSklearn(
             model_nme=f"{self.ctx.model_nme}_gnn",
             input_dim=len(self.ctx.var_nmes),
@@ -36,7 +46,7 @@ class GNNTrainer(TrainerBase):
             epochs=int(params.get("epochs", self.ctx.epochs)),
             patience=int(params.get("patience", 5)),
             task_type=self.ctx.task_type,
-            tweedie_power=float(params.get("tw_power", base_tw_power or 1.5)),
+            tweedie_power=tw_power,
             weight_decay=float(params.get("weight_decay", 0.0)),
             use_data_parallel=bool(self.ctx.config.use_gnn_data_parallel),
             use_ddp=bool(self.ctx.config.use_gnn_ddp),
@@ -47,11 +57,13 @@ class GNNTrainer(TrainerBase):
             knn_gpu_mem_ratio=float(self.ctx.config.gnn_knn_gpu_mem_ratio),
             knn_gpu_mem_overhead=float(
                 self.ctx.config.gnn_knn_gpu_mem_overhead),
+            loss_name=loss_name,
         )
         return model
 
     def cross_val(self, trial: optuna.trial.Trial) -> float:
         base_tw_power = self.ctx.default_tweedie_power()
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         metric_ctx: Dict[str, Any] = {}
 
         def data_provider():
@@ -60,8 +72,16 @@ class GNNTrainer(TrainerBase):
             return data[self.ctx.var_nmes], data[self.ctx.resp_nme], data[self.ctx.weight_nme]
 
         def model_builder(params: Dict[str, Any]):
-            tw_power = params.get("tw_power", base_tw_power)
+            if loss_name == "tweedie":
+                tw_power = params.get("tw_power", base_tw_power)
+            elif loss_name in ("poisson", "gamma"):
+                tw_power = base_tw_power
+            else:
+                tw_power = None
             metric_ctx["tw_power"] = tw_power
+            if tw_power is None:
+                params = dict(params)
+                params.pop("tw_power", None)
             return self._build_model(params)
 
         def preprocess_fn(X_train, X_val):
@@ -85,13 +105,12 @@ class GNNTrainer(TrainerBase):
             if self.ctx.task_type == 'classification':
                 y_pred_clipped = np.clip(y_pred, EPS, 1 - EPS)
                 return log_loss(y_true, y_pred_clipped, sample_weight=weight)
-            y_pred_safe = np.maximum(y_pred, EPS)
-            power = metric_ctx.get("tw_power", base_tw_power or 1.5)
-            return mean_tweedie_deviance(
+            return regression_loss(
                 y_true,
-                y_pred_safe,
-                sample_weight=weight,
-                power=power,
+                y_pred,
+                weight,
+                loss_name=loss_name,
+                tweedie_power=metric_ctx.get("tw_power", base_tw_power),
             )
 
         # Keep GNN BO lightweight: sample during CV, use full data for final training.
@@ -106,7 +125,7 @@ class GNNTrainer(TrainerBase):
             "dropout": lambda t: t.suggest_float('dropout', 0.0, 0.3),
             "weight_decay": lambda t: t.suggest_float('weight_decay', 1e-6, 1e-2, log=True),
         }
-        if self.ctx.task_type == 'regression' and self.ctx.obj == 'reg:tweedie':
+        if self.ctx.task_type == 'regression' and loss_name == 'tweedie':
             param_space["tw_power"] = lambda t: t.suggest_float(
                 'tw_power', 1.0, 2.0)
 

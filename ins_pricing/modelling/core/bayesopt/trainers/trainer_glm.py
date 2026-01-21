@@ -6,10 +6,11 @@ import numpy as np
 import optuna
 import pandas as pd
 import statsmodels.api as sm
-from sklearn.metrics import log_loss, mean_tweedie_deviance
+from sklearn.metrics import log_loss
 
 from .trainer_base import TrainerBase
 from ..utils import EPS
+from ..utils.losses import regression_loss
 
 class GLMTrainer(TrainerBase):
     def __init__(self, context: "BayesOptModel") -> None:
@@ -19,10 +20,13 @@ class GLMTrainer(TrainerBase):
     def _select_family(self, tweedie_power: Optional[float] = None):
         if self.ctx.task_type == 'classification':
             return sm.families.Binomial()
-        if self.ctx.obj == 'count:poisson':
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
+        if loss_name == "poisson":
             return sm.families.Poisson()
-        if self.ctx.obj == 'reg:gamma':
+        if loss_name == "gamma":
             return sm.families.Gamma()
+        if loss_name in {"mse", "mae"}:
+            return sm.families.Gaussian()
         power = tweedie_power if tweedie_power is not None else 1.5
         return sm.families.Tweedie(var_power=power, link=sm.families.links.log())
 
@@ -45,7 +49,8 @@ class GLMTrainer(TrainerBase):
             "alpha": lambda t: t.suggest_float('alpha', 1e-6, 1e2, log=True),
             "l1_ratio": lambda t: t.suggest_float('l1_ratio', 0.0, 1.0)
         }
-        if self.ctx.task_type == 'regression' and self.ctx.obj == 'reg:tweedie':
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
+        if self.ctx.task_type == 'regression' and loss_name == 'tweedie':
             param_space["tweedie_power"] = lambda t: t.suggest_float(
                 'tweedie_power', 1.0, 2.0)
 
@@ -87,13 +92,12 @@ class GLMTrainer(TrainerBase):
             if self.ctx.task_type == 'classification':
                 y_pred_clipped = np.clip(y_pred, EPS, 1 - EPS)
                 return log_loss(y_true, y_pred_clipped, sample_weight=weight)
-            y_pred_safe = np.maximum(y_pred, EPS)
-            return mean_tweedie_deviance(
+            return regression_loss(
                 y_true,
-                y_pred_safe,
-                sample_weight=weight,
-                power=self._metric_power(
-                    metric_ctx.get("family"), metric_ctx.get("tweedie_power"))
+                y_pred,
+                weight,
+                loss_name=loss_name,
+                tweedie_power=metric_ctx.get("tweedie_power"),
             )
 
         return self.cross_val_generic(
@@ -191,5 +195,4 @@ class GLMTrainer(TrainerBase):
         preds_train = preds_train_sum / float(split_count)
         preds_test = preds_test_sum / float(split_count)
         self._cache_predictions("glm", preds_train, preds_test)
-
 

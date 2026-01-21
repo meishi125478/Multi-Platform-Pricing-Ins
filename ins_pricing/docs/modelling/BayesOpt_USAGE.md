@@ -75,13 +75,13 @@ Under `ins_pricing/modelling/core/bayesopt/`:
 
 1) **Tools and utilities**
 
-- `IOUtils / TrainingUtils / PlotUtils`: I/O, training utilities (batch size, tweedie loss, free_cuda), plotting helpers
+- `IOUtils / TrainingUtils / PlotUtils`: I/O, training utilities (batch size, loss functions, free_cuda), plotting helpers
 - `DistributedUtils`: DDP init, rank/world_size helpers
 
 2) **TorchTrainerMixin (common components for torch tabular training)**
 
 - DataLoader: `_build_dataloader()` / `_build_val_dataloader()` (prints batch/accum/workers)
-- Loss: `_compute_losses()` / `_compute_weighted_loss()` (regression uses tweedie; classification uses BCEWithLogits)
+- Loss: `_compute_losses()` / `_compute_weighted_loss()` (regression supports tweedie/poisson/gamma/mse/mae; classification uses BCEWithLogits)
 - Early stop: `_early_stop_update()`
 
 3) **Sklearn-style model classes (core training objects)**
@@ -292,7 +292,7 @@ FT role is controlled by `ft_role` (from config or CLI `--ft-role`):
 ### 4.1 Supervised models (GLM/XGB/ResNet/FT-as-model)
 
 - `TrainerBase.tune()` calls each trainer's `cross_val()` and minimizes validation metric (default direction `minimize`)
-- Regression typically uses Tweedie deviance or related loss; classification uses logloss
+- Regression loss is configurable (tweedie/poisson/gamma/mse/mae); classification uses logloss
 
 ### 4.2 FT self-supervised (`unsupervised_embedding`)
 

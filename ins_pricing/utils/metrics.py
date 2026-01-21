@@ -22,9 +22,16 @@ import numpy as np
 import pandas as pd
 
 try:
-    from sklearn.metrics import log_loss, mean_tweedie_deviance
+    from sklearn.metrics import (
+        log_loss,
+        mean_absolute_error,
+        mean_squared_error,
+        mean_tweedie_deviance,
+    )
 except ImportError:
     log_loss = None
+    mean_absolute_error = None
+    mean_squared_error = None
     mean_tweedie_deviance = None
 
 
@@ -198,6 +205,7 @@ class MetricFactory:
         self,
         task_type: str = "regression",
         tweedie_power: float = 1.5,
+        loss_name: str = "tweedie",
         clip_min: float = 1e-8,
         clip_max: float = 1 - 1e-8,
     ):
@@ -206,11 +214,13 @@ class MetricFactory:
         Args:
             task_type: Either 'regression' or 'classification'
             tweedie_power: Power parameter for Tweedie deviance (1.0-2.0)
+            loss_name: Regression loss name ('tweedie', 'poisson', 'gamma', 'mse', 'mae')
             clip_min: Minimum value for clipping predictions
             clip_max: Maximum value for clipping predictions (for classification)
         """
         self.task_type = task_type
         self.tweedie_power = tweedie_power
+        self.loss_name = loss_name
         self.clip_min = clip_min
         self.clip_max = clip_max
 
@@ -240,14 +250,28 @@ class MetricFactory:
             y_pred_clipped = np.clip(y_pred, self.clip_min, self.clip_max)
             return float(log_loss(y_true, y_pred_clipped, sample_weight=sample_weight))
 
-        # Regression: use Tweedie deviance
+        loss_name = str(self.loss_name or "tweedie").strip().lower()
+        if loss_name in {"mse", "mae"}:
+            if mean_squared_error is None or mean_absolute_error is None:
+                raise ImportError("sklearn is required for metric computation")
+            if loss_name == "mse":
+                return float(mean_squared_error(
+                    y_true, y_pred, sample_weight=sample_weight))
+            return float(mean_absolute_error(
+                y_true, y_pred, sample_weight=sample_weight))
+
         y_pred_safe = np.maximum(y_pred, self.clip_min)
+        power = self.tweedie_power
+        if loss_name == "poisson":
+            power = 1.0
+        elif loss_name == "gamma":
+            power = 2.0
         return float(
             mean_tweedie_deviance(
                 y_true,
                 y_pred_safe,
                 sample_weight=sample_weight,
-                power=self.tweedie_power,
+                power=power,
             )
         )
 

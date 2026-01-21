@@ -5,11 +5,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import log_loss, mean_tweedie_deviance
+from sklearn.metrics import log_loss
 from sklearn.model_selection import GroupKFold, TimeSeriesSplit
 
 from .trainer_base import TrainerBase
 from ..models import FTTransformerSklearn
+from ..utils.losses import regression_loss
 
 class FTTrainer(TrainerBase):
     def __init__(self, context: "BayesOptModel") -> None:
@@ -67,6 +68,7 @@ class FTTrainer(TrainerBase):
 
     def cross_val_unsupervised(self, trial: Optional[optuna.trial.Trial]) -> float:
         """Optuna objective A: minimize validation loss for masked reconstruction."""
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {
             "learning_rate": lambda t: t.suggest_float('learning_rate', 1e-5, 5e-3, log=True),
             "d_model": lambda t: t.suggest_int('d_model', 16, 128, step=16),
@@ -159,6 +161,7 @@ class FTTrainer(TrainerBase):
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
             num_numeric_tokens=num_numeric_tokens,
+            loss_name=loss_name,
         )
         model.set_params(model_params)
         try:
@@ -191,7 +194,8 @@ class FTTrainer(TrainerBase):
             "dropout": lambda t: t.suggest_float('dropout', 0.0, 0.2),
             "weight_decay": lambda t: t.suggest_float('weight_decay', 1e-6, 1e-2, log=True),
         }
-        if self.ctx.task_type == 'regression' and self.ctx.obj == 'reg:tweedie':
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
+        if self.ctx.task_type == 'regression' and loss_name == 'tweedie':
             param_space["tw_power"] = lambda t: t.suggest_float(
                 'tw_power', 1.0, 2.0)
         geo_enabled = bool(
@@ -231,10 +235,12 @@ class FTTrainer(TrainerBase):
             tw_power = params.get("tw_power")
             if self.ctx.task_type == 'regression':
                 base_tw = self.ctx.default_tweedie_power()
-                if self.ctx.obj in ('count:poisson', 'reg:gamma'):
+                if loss_name == "tweedie":
+                    tw_power = base_tw if tw_power is None else tw_power
+                elif loss_name in ("poisson", "gamma"):
                     tw_power = base_tw
-                elif tw_power is None:
-                    tw_power = base_tw
+                else:
+                    tw_power = None
             metric_ctx["tw_power"] = tw_power
 
             adaptive_heads, _ = self._resolve_adaptive_heads(
@@ -259,6 +265,7 @@ class FTTrainer(TrainerBase):
                 use_data_parallel=self.ctx.config.use_ft_data_parallel,
                 use_ddp=self.ctx.config.use_ft_ddp,
                 num_numeric_tokens=num_numeric_tokens,
+                loss_name=loss_name,
             ).set_params({"_geo_params": geo_params_local} if geo_enabled else {})
 
         def fit_predict(model, X_train, y_train, w_train, X_val, y_val, w_val, trial_obj):
@@ -286,11 +293,12 @@ class FTTrainer(TrainerBase):
 
         def metric_fn(y_true, y_pred, weight):
             if self.ctx.task_type == 'regression':
-                return mean_tweedie_deviance(
+                return regression_loss(
                     y_true,
                     y_pred,
-                    sample_weight=weight,
-                    power=metric_ctx.get("tw_power", 1.5)
+                    weight,
+                    loss_name=loss_name,
+                    tweedie_power=metric_ctx.get("tw_power", 1.5),
                 )
             return log_loss(y_true, y_pred, sample_weight=weight)
 
@@ -313,6 +321,7 @@ class FTTrainer(TrainerBase):
     def train(self) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best FT-Transformer parameters.")
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         resolved_params = dict(self.best_params)
         d_model_value = resolved_params.get("d_model", 64)
         adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
@@ -342,6 +351,7 @@ class FTTrainer(TrainerBase):
                 use_ddp=self.ctx.config.use_ft_ddp,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
+                loss_name=loss_name,
             )
             tmp_model.set_params(resolved_params)
             geo_train_full = self.ctx.train_geo_tokens
@@ -375,6 +385,7 @@ class FTTrainer(TrainerBase):
             use_ddp=self.ctx.config.use_ft_ddp,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             weight_decay=float(resolved_params.get("weight_decay", 0.0)),
+            loss_name=loss_name,
         )
         if refit_epochs is not None:
             self.model.epochs = int(refit_epochs)
@@ -408,6 +419,7 @@ class FTTrainer(TrainerBase):
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best FT-Transformer parameters.")
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         k = max(2, int(k))
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
         y_all = self.ctx.train_data[self.ctx.resp_nme]
@@ -446,6 +458,7 @@ class FTTrainer(TrainerBase):
                 use_ddp=self.ctx.config.use_ft_ddp,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
+                loss_name=loss_name,
             )
             model.set_params(resolved_params)
 
@@ -541,6 +554,7 @@ class FTTrainer(TrainerBase):
         return splitter, None, oof_folds
 
     def _build_ft_feature_model(self, resolved_params: Dict[str, Any]) -> FTTransformerSklearn:
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         model = FTTransformerSklearn(
             model_nme=self.ctx.model_nme,
             num_cols=self.ctx.num_features,
@@ -549,6 +563,7 @@ class FTTrainer(TrainerBase):
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
             num_numeric_tokens=self._resolve_numeric_tokens(),
+            loss_name=loss_name,
         )
         adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
             d_model=resolved_params.get("d_model", model.d_model),
@@ -702,6 +717,7 @@ class FTTrainer(TrainerBase):
                                          num_loss_weight: float = 1.0,
                                          cat_loss_weight: float = 1.0) -> None:
         """Self-supervised pretraining (masked reconstruction) and cache embeddings."""
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         self.model = FTTransformerSklearn(
             model_nme=self.ctx.model_nme,
             num_cols=self.ctx.num_features,
@@ -710,6 +726,7 @@ class FTTrainer(TrainerBase):
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
             num_numeric_tokens=self._resolve_numeric_tokens(),
+            loss_name=loss_name,
         )
         resolved_params = dict(params or {})
         # Reuse supervised tuning structure params unless explicitly overridden.

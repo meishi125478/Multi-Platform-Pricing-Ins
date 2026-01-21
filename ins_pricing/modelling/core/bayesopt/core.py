@@ -17,6 +17,12 @@ from .model_plotting_mixin import BayesOptPlottingMixin
 from .models import GraphNeuralNetSklearn
 from .trainers import FTTrainer, GLMTrainer, GNNTrainer, ResNetTrainer, XGBTrainer
 from .utils import EPS, infer_factor_and_cate_list, set_global_seed
+from .utils.losses import (
+    infer_loss_name_from_model_name,
+    normalize_loss_name,
+    resolve_tweedie_power,
+    resolve_xgb_objective,
+)
 
 
 class _CVSplitter:
@@ -293,6 +299,14 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type
+        normalized_loss = normalize_loss_name(getattr(cfg, "loss_name", None), self.task_type)
+        if self.task_type == "classification":
+            self.loss_name = "logloss" if normalized_loss == "auto" else normalized_loss
+        else:
+            if normalized_loss == "auto":
+                self.loss_name = infer_loss_name_from_model_name(self.model_nme)
+            else:
+                self.loss_name = normalized_loss
         self.resp_nme = cfg.resp_nme
         self.weight_nme = cfg.weight_nme
         self.factor_nmes = cfg.factor_nmes
@@ -339,14 +353,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         if self.task_type == 'classification':
             self.obj = 'binary:logistic'
         else:  # regression task
-            if 'f' in self.model_nme:
-                self.obj = 'count:poisson'
-            elif 's' in self.model_nme:
-                self.obj = 'reg:gamma'
-            elif 'bc' in self.model_nme:
-                self.obj = 'reg:tweedie'
-            else:
-                self.obj = 'reg:tweedie'
+            self.obj = resolve_xgb_objective(self.loss_name)
         self.fit_params = {
             'sample_weight': self.train_data[self.weight_nme].values
         }
@@ -426,6 +433,11 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
     def default_tweedie_power(self, obj: Optional[str] = None) -> Optional[float]:
         if self.task_type == 'classification':
             return None
+        loss_name = getattr(self, "loss_name", None)
+        if loss_name:
+            resolved = resolve_tweedie_power(str(loss_name), default=1.5)
+            if resolved is not None:
+                return resolved
         objective = obj or getattr(self, "obj", None)
         if objective == 'count:poisson':
             return 1.0
@@ -503,6 +515,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 patience=5,
                 task_type=self.task_type,
                 tweedie_power=tw_power,
+                loss_name=self.loss_name,
                 use_data_parallel=False,
                 use_ddp=False,
                 use_approx_knn=self.config.gnn_use_approx_knn,

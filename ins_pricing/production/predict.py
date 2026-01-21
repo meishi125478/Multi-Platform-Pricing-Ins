@@ -23,6 +23,11 @@ from .preprocess import (
 from .scoring import batch_score
 from ..modelling.core.bayesopt.models.model_gnn import GraphNeuralNetSklearn
 from ..modelling.core.bayesopt.models.model_resn import ResNetSklearn
+from ..modelling.core.bayesopt.utils.losses import (
+    infer_loss_name_from_model_name,
+    normalize_loss_name,
+    resolve_tweedie_power,
+)
 from ins_pricing.utils import DeviceManager, get_logger
 from ins_pricing.utils.torch_compat import torch_load
 
@@ -48,6 +53,15 @@ def _default_tweedie_power(model_name: str, task_type: str) -> Optional[float]:
     if "s" in model_name:
         return 2.0
     return 1.5
+
+
+def _resolve_loss_name(cfg: Dict[str, Any], model_name: str, task_type: str) -> str:
+    normalized = normalize_loss_name(cfg.get("loss_name"), task_type)
+    if task_type == "classification":
+        return "logloss" if normalized == "auto" else normalized
+    if normalized == "auto":
+        return infer_loss_name_from_model_name(model_name)
+    return normalized
 
 
 def _resolve_value(
@@ -182,11 +196,14 @@ def _build_resn_model(
     task_type: str,
     epochs: int,
     resn_weight_decay: float,
+    loss_name: str,
     params: Dict[str, Any],
 ) -> ResNetSklearn:
-    power = params.get("tw_power", _default_tweedie_power(model_name, task_type))
-    if power is not None:
-        power = float(power)
+    if loss_name == "tweedie":
+        power = params.get("tw_power", _default_tweedie_power(model_name, task_type))
+        power = float(power) if power is not None else None
+    else:
+        power = resolve_tweedie_power(loss_name, default=1.5)
     weight_decay = float(params.get("weight_decay", resn_weight_decay))
     return ResNetSklearn(
         model_nme=model_name,
@@ -205,6 +222,7 @@ def _build_resn_model(
         weight_decay=weight_decay,
         use_data_parallel=False,
         use_ddp=False,
+        loss_name=loss_name,
     )
 
 
@@ -215,9 +233,15 @@ def _build_gnn_model(
     task_type: str,
     epochs: int,
     cfg: Dict[str, Any],
+    loss_name: str,
     params: Dict[str, Any],
 ) -> GraphNeuralNetSklearn:
     base_tw = _default_tweedie_power(model_name, task_type)
+    if loss_name == "tweedie":
+        tw_power = params.get("tw_power", base_tw)
+        tw_power = float(tw_power) if tw_power is not None else None
+    else:
+        tw_power = resolve_tweedie_power(loss_name, default=1.5)
     return GraphNeuralNetSklearn(
         model_nme=f"{model_name}_gnn",
         input_dim=input_dim,
@@ -229,7 +253,7 @@ def _build_gnn_model(
         epochs=int(params.get("epochs", epochs)),
         patience=int(params.get("patience", 5)),
         task_type=task_type,
-        tweedie_power=float(params.get("tw_power", base_tw or 1.5)),
+        tweedie_power=tw_power,
         weight_decay=float(params.get("weight_decay", 0.0)),
         use_data_parallel=False,
         use_ddp=False,
@@ -239,6 +263,7 @@ def _build_gnn_model(
         max_gpu_knn_nodes=cfg.get("gnn_max_gpu_knn_nodes"),
         knn_gpu_mem_ratio=cfg.get("gnn_knn_gpu_mem_ratio", 0.9),
         knn_gpu_mem_overhead=cfg.get("gnn_knn_gpu_mem_overhead", 2.0),
+        loss_name=loss_name,
     )
 
 
@@ -282,6 +307,7 @@ def load_saved_model(
                     n_layers=model_config.get("n_layers", 4),
                     dropout=model_config.get("dropout", 0.1),
                     task_type=model_config.get("task_type", "regression"),
+                    loss_name=model_config.get("loss_name"),
                     tweedie_power=model_config.get("tw_power", 1.5),
                     num_numeric_tokens=model_config.get("num_numeric_tokens"),
                     use_data_parallel=False,
@@ -337,12 +363,14 @@ def load_saved_model(
             params = load_best_params(output_dir, model_name, model_key)
         if params is None:
             raise RuntimeError("Best params not found for resn")
+        loss_name = _resolve_loss_name(cfg, model_name, task_type)
         model = _build_resn_model(
             model_name=model_name,
             input_dim=input_dim,
             task_type=task_type,
             epochs=int(cfg.get("epochs", 50)),
             resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
+            loss_name=loss_name,
             params=params,
         )
         model.resnet.load_state_dict(state_dict)
@@ -357,12 +385,14 @@ def load_saved_model(
             raise ValueError(f"Invalid GNN checkpoint: {model_path}")
         params = payload.get("best_params") or {}
         state_dict = payload.get("state_dict")
+        loss_name = _resolve_loss_name(cfg, model_name, task_type)
         model = _build_gnn_model(
             model_name=model_name,
             input_dim=input_dim,
             task_type=task_type,
             epochs=int(cfg.get("epochs", 50)),
             cfg=cfg,
+            loss_name=loss_name,
             params=params,
         )
         model.set_params(dict(params))

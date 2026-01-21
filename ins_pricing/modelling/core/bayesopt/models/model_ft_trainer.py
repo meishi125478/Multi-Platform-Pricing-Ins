@@ -16,6 +16,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
 from ..utils import DistributedUtils, EPS, TorchTrainerMixin
+from ..utils.losses import (
+    infer_loss_name_from_model_name,
+    normalize_loss_name,
+    resolve_tweedie_power,
+)
 from .model_ft_components import FTTransformerCore, MaskedTabularDataset, TabularDataset
 
 
@@ -159,7 +164,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                  weight_decay: float = 0.0,
                  use_data_parallel: bool = True,
                  use_ddp: bool = False,
-                 num_numeric_tokens: Optional[int] = None
+                 num_numeric_tokens: Optional[int] = None,
+                 loss_name: Optional[str] = None
                  ):
         super().__init__()
 
@@ -187,14 +193,18 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         self.weight_decay = weight_decay
         self.task_type = task_type
         self.patience = patience
+        resolved_loss = normalize_loss_name(loss_name, self.task_type)
         if self.task_type == 'classification':
+            self.loss_name = "logloss"
             self.tw_power = None  # No Tweedie power for classification.
-        elif 'f' in self.model_nme:
-            self.tw_power = 1.0
-        elif 's' in self.model_nme:
-            self.tw_power = 2.0
         else:
-            self.tw_power = tweedie_power
+            if resolved_loss == "auto":
+                resolved_loss = infer_loss_name_from_model_name(self.model_nme)
+            self.loss_name = resolved_loss
+            if self.loss_name == "tweedie":
+                self.tw_power = float(tweedie_power) if tweedie_power is not None else 1.5
+            else:
+                self.tw_power = resolve_tweedie_power(self.loss_name, default=1.5)
 
         if self.is_ddp_enabled:
             self.device = torch.device(f"cuda:{self.local_rank}")

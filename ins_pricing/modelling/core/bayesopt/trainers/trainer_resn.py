@@ -6,10 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import optuna
 import torch
-from sklearn.metrics import log_loss, mean_tweedie_deviance
+from sklearn.metrics import log_loss
 
 from .trainer_base import TrainerBase
 from ..models import ResNetSklearn
+from ..utils.losses import regression_loss
 
 class ResNetTrainer(TrainerBase):
     def __init__(self, context: "BayesOptModel") -> None:
@@ -28,9 +29,16 @@ class ResNetTrainer(TrainerBase):
 
     def _build_model(self, params: Optional[Dict[str, Any]] = None) -> ResNetSklearn:
         params = params or {}
-        power = params.get("tw_power", self.ctx.default_tweedie_power())
-        if power is not None:
-            power = float(power)
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
+        power = params.get("tw_power")
+        if self.ctx.task_type == "regression":
+            base_tw = self.ctx.default_tweedie_power()
+            if loss_name == "tweedie":
+                power = base_tw if power is None else float(power)
+            elif loss_name in ("poisson", "gamma"):
+                power = base_tw
+            else:
+                power = None
         resn_weight_decay = float(
             params.get(
                 "weight_decay",
@@ -53,7 +61,8 @@ class ResNetTrainer(TrainerBase):
             stochastic_depth=float(params.get("stochastic_depth", 0.0)),
             weight_decay=resn_weight_decay,
             use_data_parallel=self.ctx.config.use_resn_data_parallel,
-            use_ddp=self.ctx.config.use_resn_ddp
+            use_ddp=self.ctx.config.use_resn_ddp,
+            loss_name=loss_name
         )
 
     # ========= Cross-validation (for BayesOpt) =========
@@ -64,6 +73,7 @@ class ResNetTrainer(TrainerBase):
         #   - Optionally sample part of training data during BayesOpt to reduce memory.
 
         base_tw_power = self.ctx.default_tweedie_power()
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
 
         def data_provider():
             data = self.ctx.train_oht_data if self.ctx.train_oht_data is not None else self.ctx.train_oht_scl_data
@@ -73,10 +83,16 @@ class ResNetTrainer(TrainerBase):
         metric_ctx: Dict[str, Any] = {}
 
         def model_builder(params):
-            power = params.get("tw_power", base_tw_power)
+            if loss_name == "tweedie":
+                power = params.get("tw_power", base_tw_power)
+            elif loss_name in ("poisson", "gamma"):
+                power = base_tw_power
+            else:
+                power = None
             metric_ctx["tw_power"] = power
             params_local = dict(params)
-            params_local["tw_power"] = power
+            if power is not None:
+                params_local["tw_power"] = power
             return self._build_model(params_local)
 
         def preprocess_fn(X_train, X_val):
@@ -94,11 +110,12 @@ class ResNetTrainer(TrainerBase):
 
         def metric_fn(y_true, y_pred, weight):
             if self.ctx.task_type == 'regression':
-                return mean_tweedie_deviance(
+                return regression_loss(
                     y_true,
                     y_pred,
-                    sample_weight=weight,
-                    power=metric_ctx.get("tw_power", base_tw_power)
+                    weight,
+                    loss_name=loss_name,
+                    tweedie_power=metric_ctx.get("tw_power", base_tw_power),
                 )
             return log_loss(y_true, y_pred, sample_weight=weight)
 
@@ -115,7 +132,7 @@ class ResNetTrainer(TrainerBase):
                 "residual_scale": lambda t: t.suggest_float('residual_scale', 0.05, 0.3, step=0.05),
                 "patience": lambda t: t.suggest_int('patience', 3, 12),
                 "stochastic_depth": lambda t: t.suggest_float('stochastic_depth', 0.0, 0.2, step=0.05),
-                **({"tw_power": lambda t: t.suggest_float('tw_power', 1.0, 2.0)} if self.ctx.task_type == 'regression' and self.ctx.obj == 'reg:tweedie' else {})
+                **({"tw_power": lambda t: t.suggest_float('tw_power', 1.0, 2.0)} if self.ctx.task_type == 'regression' and loss_name == 'tweedie' else {})
             },
             data_provider=data_provider,
             model_builder=model_builder,
@@ -263,4 +280,3 @@ class ResNetTrainer(TrainerBase):
             self.ctx.resn_best = self.model
         else:
             print(f"[ResNetTrainer.load] Model file not found: {path}")
-

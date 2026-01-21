@@ -12,6 +12,11 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import TensorDataset
 
 from ..utils import DistributedUtils, EPS, TorchTrainerMixin
+from ..utils.losses import (
+    infer_loss_name_from_model_name,
+    normalize_loss_name,
+    resolve_tweedie_power,
+)
 
 
 # =============================================================================
@@ -140,7 +145,8 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
                  stochastic_depth: float = 0.0,
                  weight_decay: float = 1e-4,
                  use_data_parallel: bool = True,
-                 use_ddp: bool = False):
+                 use_ddp: bool = False,
+                 loss_name: Optional[str] = None):
         super(ResNetSklearn, self).__init__()
 
         self.use_ddp = use_ddp
@@ -179,15 +185,18 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
         else:
             self.device = torch.device('cpu')
 
-        # Tweedie power (unused for classification)
+        resolved_loss = normalize_loss_name(loss_name, self.task_type)
         if self.task_type == 'classification':
+            self.loss_name = "logloss"
             self.tw_power = None
-        elif 'f' in self.model_nme:
-            self.tw_power = 1
-        elif 's' in self.model_nme:
-            self.tw_power = 2
         else:
-            self.tw_power = tweedie_power
+            if resolved_loss == "auto":
+                resolved_loss = infer_loss_name_from_model_name(self.model_nme)
+            self.loss_name = resolved_loss
+            if self.loss_name == "tweedie":
+                self.tw_power = float(tweedie_power) if tweedie_power is not None else 1.5
+            else:
+                self.tw_power = resolve_tweedie_power(self.loss_name, default=1.5)
 
         # Build network (construct on CPU first)
         core = ResNetSequential(

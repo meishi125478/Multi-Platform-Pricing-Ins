@@ -12,6 +12,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 from .utils import IOUtils
+from .utils.losses import normalize_loss_name
 from ....exceptions import ConfigurationError, DataValidationError
 
 # NOTE: Some CSV exports may contain invisible BOM characters or leading/trailing
@@ -81,6 +82,7 @@ class BayesOptConfig:
         task_type: Either 'regression' or 'classification'
         binary_resp_nme: Column name for binary response (optional)
         cate_list: List of categorical feature column names
+        loss_name: Regression loss ('auto', 'tweedie', 'poisson', 'gamma', 'mse', 'mae')
         prop_test: Proportion of data for validation (0.0-1.0)
         rand_seed: Random seed for reproducibility
         epochs: Number of training epochs
@@ -117,6 +119,7 @@ class BayesOptConfig:
     task_type: str = 'regression'
     binary_resp_nme: Optional[str] = None
     cate_list: Optional[List[str]] = None
+    loss_name: str = "auto"
 
     # Training configuration
     prop_test: float = 0.25
@@ -207,6 +210,15 @@ class BayesOptConfig:
             errors.append(
                 f"task_type must be one of {valid_task_types}, got '{self.task_type}'"
             )
+        # Validate loss_name
+        try:
+            normalized_loss = normalize_loss_name(self.loss_name, self.task_type)
+            if self.task_type == "classification" and normalized_loss not in {"auto", "logloss", "bce"}:
+                errors.append(
+                    "loss_name must be 'auto', 'logloss', or 'bce' for classification tasks."
+                )
+        except ValueError as exc:
+            errors.append(str(exc))
 
         # Validate prop_test
         if not 0.0 < self.prop_test < 1.0:

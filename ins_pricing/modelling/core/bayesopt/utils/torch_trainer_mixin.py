@@ -52,6 +52,12 @@ except Exception:
 
 # Import from other utils modules
 from .constants import EPS, compute_batch_size, tweedie_loss, ensure_parent_dir
+from .losses import (
+    infer_loss_name_from_model_name,
+    loss_requires_positive,
+    normalize_loss_name,
+    resolve_tweedie_power,
+)
 from .distributed_utils import DistributedUtils
 
 
@@ -359,11 +365,26 @@ class TorchTrainerMixin:
         if task == 'classification':
             loss_fn = nn.BCEWithLogitsLoss(reduction='none')
             return loss_fn(y_pred, y_true).view(-1)
+        loss_name = normalize_loss_name(
+            getattr(self, "loss_name", None), task_type="regression"
+        )
+        if loss_name == "auto":
+            loss_name = infer_loss_name_from_model_name(getattr(self, "model_nme", ""))
         if apply_softplus:
             y_pred = F.softplus(y_pred)
-        y_pred = torch.clamp(y_pred, min=1e-6)
-        power = getattr(self, "tw_power", 1.5)
-        return tweedie_loss(y_pred, y_true, p=power).view(-1)
+        if loss_requires_positive(loss_name):
+            y_pred = torch.clamp(y_pred, min=1e-6)
+            power = resolve_tweedie_power(
+                loss_name, default=float(getattr(self, "tw_power", 1.5) or 1.5)
+            )
+            if power is None:
+                power = float(getattr(self, "tw_power", 1.5) or 1.5)
+            return tweedie_loss(y_pred, y_true, p=power).view(-1)
+        if loss_name == "mse":
+            return (y_pred - y_true).pow(2).view(-1)
+        if loss_name == "mae":
+            return (y_pred - y_true).abs().view(-1)
+        raise ValueError(f"Unsupported loss_name '{loss_name}' for regression.")
 
     def _compute_weighted_loss(self, y_pred, y_true, weights, apply_softplus: bool = False):
         """Compute weighted loss."""

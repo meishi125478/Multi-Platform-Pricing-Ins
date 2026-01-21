@@ -7,10 +7,11 @@ import numpy as np
 import optuna
 import torch
 import xgboost as xgb
-from sklearn.metrics import log_loss, mean_tweedie_deviance
+from sklearn.metrics import log_loss
 
 from .trainer_base import TrainerBase
 from ..utils import EPS
+from ..utils.losses import regression_loss
 
 _XGB_CUDA_CHECKED = False
 _XGB_HAS_CUDA = False
@@ -230,18 +231,17 @@ class XGBTrainer(TrainerBase):
             'reg_alpha': reg_alpha,
             'reg_lambda': reg_lambda
         }
+        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         tweedie_variance_power = None
         if self.ctx.task_type != 'classification':
-            if self.ctx.obj == 'reg:tweedie':
+            if loss_name == "tweedie":
                 tweedie_variance_power = trial.suggest_float(
                     'tweedie_variance_power', 1, 2)
                 params['tweedie_variance_power'] = tweedie_variance_power
-            elif self.ctx.obj == 'count:poisson':
-                tweedie_variance_power = 1
-            elif self.ctx.obj == 'reg:gamma':
-                tweedie_variance_power = 2
-            else:
-                tweedie_variance_power = 1.5
+            elif loss_name == "poisson":
+                tweedie_variance_power = 1.0
+            elif loss_name == "gamma":
+                tweedie_variance_power = 2.0
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
         y_all = self.ctx.train_data[self.ctx.resp_nme].values
         w_all = self.ctx.train_data[self.ctx.weight_nme].values
@@ -272,12 +272,12 @@ class XGBTrainer(TrainerBase):
                 loss = log_loss(y_val, y_pred, sample_weight=w_val)
             else:
                 y_pred = clf.predict(X_val)
-                y_pred_safe = np.maximum(y_pred, EPS)
-                loss = mean_tweedie_deviance(
+                loss = regression_loss(
                     y_val,
-                    y_pred_safe,
-                    sample_weight=w_val,
-                    power=tweedie_variance_power,
+                    y_pred,
+                    w_val,
+                    loss_name=loss_name,
+                    tweedie_power=tweedie_variance_power,
                 )
             losses.append(float(loss))
             self._clean_gpu()
@@ -344,5 +344,4 @@ class XGBTrainer(TrainerBase):
             predict_fn=predict_fn
         )
         self.ctx.xgb_best = self.model
-
 
