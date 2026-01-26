@@ -1,0 +1,36 @@
+{
+  "data_dir": "./Data",
+  "model_list": ["od"],
+  "model_categories": ["bc"],
+  "target": "response",
+  "weight": "weights",
+  "feature_list": [
+    "age_owner",
+    "gender_owner",
+    "plt_zone",
+    "carbrand"
+  ],
+  "categorical_features": [
+    "gender_owner",
+    "plt_zone",
+    "carbrand"
+  ],
+  "task_type": "regression",
+  "prop_test": 0.25,
+  "holdout_ratio": 0.25,
+  "val_ratio": 0.25,
+  "split_strategy": "random",
+  "rand_seed": 13,
+  "epochs": 50,
+  "output_dir": "./Results",
+  "use_gpu": true,
+  "xgb_max_depth_max": 25,
+  "xgb_n_estimators_max": 500,
+  "optuna_storage": "./Results/optuna/bayesopt.sqlite3",
+  "runner": {
+    "mode": "entry",
+    "model_keys": ["xgb"],
+    "nproc_per_node": 1,
+    "max_evals": 50
+  }
+}

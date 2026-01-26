@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, TYPE_CHECKING
 
 import joblib
 import numpy as np
 import pandas as pd
-import torch
 try:  # statsmodels is optional when GLM inference is not used
     import statsmodels.api as sm
     _SM_IMPORT_ERROR: Optional[BaseException] = None
@@ -21,18 +20,28 @@ from .preprocess import (
     prepare_raw_features,
 )
 from .scoring import batch_score
-from ..modelling.core.bayesopt.models.model_gnn import GraphNeuralNetSklearn
-from ..modelling.core.bayesopt.models.model_resn import ResNetSklearn
 from ..modelling.core.bayesopt.utils.losses import (
     infer_loss_name_from_model_name,
     normalize_loss_name,
     resolve_tweedie_power,
 )
-from ins_pricing.utils import DeviceManager, get_logger
-from ins_pricing.utils.torch_compat import torch_load
+from ins_pricing.utils.logging import get_logger
 
 _logger = get_logger("ins_pricing.production.predict")
 
+
+if TYPE_CHECKING:
+    from ..modelling.core.bayesopt.models.model_gnn import GraphNeuralNetSklearn
+    from ..modelling.core.bayesopt.models.model_resn import ResNetSklearn
+
+
+def _torch_load(*args, **kwargs):
+    from ins_pricing.utils.torch_compat import torch_load
+    return torch_load(*args, **kwargs)
+
+def _get_device_manager():
+    from ins_pricing.utils.device import DeviceManager
+    return DeviceManager
 
 MODEL_PREFIX = {
     "xgb": "Xgboost",
@@ -145,7 +154,7 @@ def _load_preprocess_from_model_file(
     if model_key in {"xgb", "glm"}:
         payload = joblib.load(model_path)
     else:
-        payload = torch_load(model_path, map_location="cpu")
+        payload = _torch_load(model_path, map_location="cpu")
     if isinstance(payload, dict):
         return payload.get("preprocess_artifacts")
     return None
@@ -153,6 +162,7 @@ def _load_preprocess_from_model_file(
 
 def _move_to_device(model_obj: Any) -> None:
     """Move model to best available device using shared DeviceManager."""
+    DeviceManager = _get_device_manager()
     DeviceManager.move_to_device(model_obj)
     if hasattr(model_obj, "eval"):
         model_obj.eval()
@@ -199,8 +209,10 @@ def _build_resn_model(
     loss_name: str,
     params: Dict[str, Any],
 ) -> ResNetSklearn:
+    from ..modelling.core.bayesopt.models.model_resn import ResNetSklearn
     if loss_name == "tweedie":
-        power = params.get("tw_power", _default_tweedie_power(model_name, task_type))
+        power = params.get(
+            "tw_power", _default_tweedie_power(model_name, task_type))
         power = float(power) if power is not None else None
     else:
         power = resolve_tweedie_power(loss_name, default=1.5)
@@ -236,6 +248,7 @@ def _build_gnn_model(
     loss_name: str,
     params: Dict[str, Any],
 ) -> GraphNeuralNetSklearn:
+    from ..modelling.core.bayesopt.models.model_gnn import GraphNeuralNetSklearn
     base_tw = _default_tweedie_power(model_name, task_type)
     if loss_name == "tweedie":
         tw_power = params.get("tw_power", base_tw)
@@ -287,7 +300,8 @@ def load_saved_model(
         return payload
 
     if model_key == "ft":
-        payload = torch_load(model_path, map_location="cpu", weights_only=False)
+        payload = _torch_load(
+            model_path, map_location="cpu", weights_only=False)
         if isinstance(payload, dict):
             if "state_dict" in payload and "model_config" in payload:
                 # New format: state_dict + model_config (DDP-safe)
@@ -298,6 +312,10 @@ def load_saved_model(
                 from ..modelling.core.bayesopt.models.model_ft_components import FTTransformerCore
 
                 # Reconstruct model from config
+                resolved_loss = model_config.get("loss_name")
+                if not resolved_loss:
+                    resolved_loss = _resolve_loss_name(
+                        cfg, model_name, task_type)
                 model = FTTransformerSklearn(
                     model_nme=model_config.get("model_nme", ""),
                     num_cols=model_config.get("num_cols", []),
@@ -307,7 +325,7 @@ def load_saved_model(
                     n_layers=model_config.get("n_layers", 4),
                     dropout=model_config.get("dropout", 0.1),
                     task_type=model_config.get("task_type", "regression"),
-                    loss_name=model_config.get("loss_name"),
+                    loss_name=resolved_loss,
                     tweedie_power=model_config.get("tw_power", 1.5),
                     num_numeric_tokens=model_config.get("num_numeric_tokens"),
                     use_data_parallel=False,
@@ -316,11 +334,14 @@ def load_saved_model(
                 # Restore internal state
                 model.num_geo = model_config.get("num_geo", 0)
                 model.cat_cardinalities = model_config.get("cat_cardinalities")
-                model.cat_categories = {k: pd.Index(v) for k, v in model_config.get("cat_categories", {}).items()}
+                model.cat_categories = {k: pd.Index(
+                    v) for k, v in model_config.get("cat_categories", {}).items()}
                 if model_config.get("_num_mean") is not None:
-                    model._num_mean = np.array(model_config["_num_mean"], dtype=np.float32)
+                    model._num_mean = np.array(
+                        model_config["_num_mean"], dtype=np.float32)
                 if model_config.get("_num_std") is not None:
-                    model._num_std = np.array(model_config["_num_std"], dtype=np.float32)
+                    model._num_std = np.array(
+                        model_config["_num_std"], dtype=np.float32)
 
                 # Build the model architecture and load weights
                 if model.cat_cardinalities is not None:
@@ -352,7 +373,7 @@ def load_saved_model(
     if model_key == "resn":
         if input_dim is None:
             raise ValueError("input_dim is required for ResNet loading")
-        payload = torch_load(model_path, map_location="cpu")
+        payload = _torch_load(model_path, map_location="cpu")
         if isinstance(payload, dict) and "state_dict" in payload:
             state_dict = payload.get("state_dict")
             params = payload.get("best_params") or load_best_params(
@@ -380,7 +401,7 @@ def load_saved_model(
     if model_key == "gnn":
         if input_dim is None:
             raise ValueError("input_dim is required for GNN loading")
-        payload = torch_load(model_path, map_location="cpu")
+        payload = _torch_load(model_path, map_location="cpu")
         if not isinstance(payload, dict):
             raise ValueError(f"Invalid GNN checkpoint: {model_path}")
         params = payload.get("best_params") or {}
@@ -484,7 +505,8 @@ class SavedModelPredictor:
         if model_key == "ft" and str(cfg.get("ft_role", "model")) != "model":
             raise ValueError("FT predictions require ft_role == 'model'.")
         if model_key == "ft" and cfg.get("geo_feature_nmes"):
-            raise ValueError("FT inference with geo tokens is not supported in this helper.")
+            raise ValueError(
+                "FT inference with geo tokens is not supported in this helper.")
 
         input_dim = None
         if model_key in OHT_MODELS and artifacts is not None:
@@ -531,7 +553,8 @@ def load_predictor_from_config(
         model_list = list(cfg.get("model_list") or [])
         model_categories = list(cfg.get("model_categories") or [])
         if len(model_list) != 1 or len(model_categories) != 1:
-            raise ValueError("Provide model_name when config has multiple models.")
+            raise ValueError(
+                "Provide model_name when config has multiple models.")
         model_name = f"{model_list[0]}_{model_categories[0]}"
 
     resolved_output = (
@@ -553,7 +576,8 @@ def load_predictor_from_config(
         )
 
     if resolved_artifact is None:
-        candidate = resolved_output / "Results" / f"{model_name}_preprocess.json"
+        candidate = resolved_output / "Results" / \
+            f"{model_name}_preprocess.json"
         if candidate.exists():
             resolved_artifact = candidate
 
@@ -658,8 +682,12 @@ def predict_from_config(
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if output_path.suffix.lower() in {".parquet", ".pq"}:
+        suffix = output_path.suffix.lower()
+        if suffix in {".parquet", ".pq"}:
             result.to_parquet(output_path, index=False)
+        elif suffix in {".feather", ".ft"}:
+            result.to_feather(output_path)
         else:
             result.to_csv(output_path, index=False)
+
     return result

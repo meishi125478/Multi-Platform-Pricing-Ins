@@ -1,0 +1,9 @@
+# Frontend Requirements for Insurance Pricing Model Training Interface
+
+# Web Framework
+gradio>=4,<5
+
+# The main ins_pricing package should already be installed
+# If not, install it first:
+# pip install -e .
+huggingface_hub<0.24
