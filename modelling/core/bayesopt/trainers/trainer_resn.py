@@ -45,7 +45,7 @@ class ResNetTrainer(TrainerBase):
                 getattr(self.ctx.config, "resn_weight_decay", 1e-4),
             )
         )
-        return ResNetSklearn(
+        model = ResNetSklearn(
             model_nme=self.ctx.model_nme,
             input_dim=self._resolve_input_dim(),
             hidden_dim=int(params.get("hidden_dim", 64)),
@@ -64,6 +64,7 @@ class ResNetTrainer(TrainerBase):
             use_ddp=self.ctx.config.use_resn_ddp,
             loss_name=loss_name
         )
+        return self._apply_dataloader_overrides(model)
 
     # ========= Cross-validation (for BayesOpt) =========
     def cross_val(self, trial: optuna.trial.Trial) -> float:

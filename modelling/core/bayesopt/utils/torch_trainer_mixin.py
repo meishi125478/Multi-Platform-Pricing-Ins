@@ -232,6 +232,14 @@ class TorchTrainerMixin:
         """Determine number of DataLoader workers."""
         if os.name == 'nt':
             return 0
+        override = getattr(self, "dataloader_workers", None)
+        if override is None:
+            override = os.environ.get("BAYESOPT_DATALOADER_WORKERS")
+        if override is not None:
+            try:
+                return max(0, int(override))
+            except (TypeError, ValueError):
+                pass
         if getattr(self, "is_ddp_enabled", False):
             return 0
         profile = profile or self._resolve_resource_profile()
@@ -269,13 +277,16 @@ class TorchTrainerMixin:
         cpu_mid, cpu_small = base_bs_cpu
 
         if self._device_type() == 'cuda':
-            device_count = torch.cuda.device_count()
+            # Only scale batch size by GPU count when DDP is enabled.
+            # In single-process (non-DDP) mode, large multi-GPU nodes can
+            # still OOM on RAM/VRAM if we scale by device_count.
+            device_count = 1
             if getattr(self, "is_ddp_enabled", False):
-                device_count = 1
-            if device_count > 1:
-                min_bs = min_bs * device_count
-                print(
-                    f">>> Multi-GPU detected: {device_count} devices. Adjusted min_bs to {min_bs}.")
+                device_count = torch.cuda.device_count()
+                if device_count > 1:
+                    min_bs = min_bs * device_count
+                    print(
+                        f">>> Multi-GPU detected: {device_count} devices. Adjusted min_bs to {min_bs}.")
 
             if N > large_threshold:
                 base_bs = gpu_large * device_count

@@ -1,110 +1,66 @@
-# Insurance-Pricing
+# ins_pricing
 
-A reusable toolkit for insurance modeling, pricing, governance, and reporting.
+Distribution name: ins_pricing (import package is `ins_pricing`; legacy alias `user_packages` still works).
 
-## Overview
+Reusable modelling and pricing utilities organized as a small toolbox with clear boundaries
+between modelling, production, governance, and reporting.
 
-Insurance-Pricing (ins_pricing) is an enterprise-grade Python library designed for machine learning model training, pricing calculations, and model governance workflows in the insurance industry.
+## Architecture
 
-### Core Modules
+- `cli/`: CLI entry points and shared utilities.
+- `modelling/`
+  - `core/`: BayesOpt training core (GLM / XGB / ResNet / FT / GNN).
+  - `plotting/`: model-agnostic curves and geo visualizations.
+  - `explain/`: permutation, gradients, and SHAP helpers.
+- `examples/`: demo configs and notebooks (repo only; not packaged).
+- `pricing/`: factor tables, calibration, exposure, monitoring.
+- `production/`: scoring, metrics, drift/PSI.
+- `governance/`: registry, approval, audit workflows.
+- `reporting/`: report builder and scheduler.
 
-| Module | Description |
-|--------|-------------|
-| **modelling** | ML model training (GLM, XGBoost, ResNet, FT-Transformer, GNN) and model interpretability (SHAP, permutation importance) |
-| **pricing** | Factor table construction, numeric binning, premium calibration, exposure calculation, PSI monitoring |
-| **production** | Model prediction, batch scoring, data drift detection, production metrics monitoring |
-| **governance** | Model registry, version management, approval workflows, audit logging |
-| **reporting** | Report generation (Markdown format), report scheduling |
-| **utils** | Data validation, performance profiling, device management, logging configuration |
+## Call flow (typical)
 
-### Quick Start
+1. Model training
+   - Python API: `from ins_pricing.modelling import BayesOptModel`
+   - CLI: `python ins_pricing/cli/BayesOpt_entry.py --config-json ...`
+2. Evaluation and visualization
+   - Curves: `from ins_pricing.plotting import curves`
+   - Importance: `from ins_pricing.plotting import importance`
+   - Geo: `from ins_pricing.plotting import geo`
+3. Explainability
+   - `from ins_pricing.explain import permutation_importance, integrated_gradients_torch`
+4. Pricing loop
+   - `from ins_pricing.pricing import build_factor_table, rate_premium`
+5. Production and governance
+   - `from ins_pricing.production import batch_score, psi_report`
+   - `from ins_pricing.governance import ModelRegistry, ReleaseManager`
+6. Reporting
+   - `from ins_pricing.reporting import build_report, write_report, schedule_daily`
 
-```python
-# Model training with Bayesian optimization
-from ins_pricing import bayesopt as ropt
+## Import notes
 
-model = ropt.BayesOptModel(
-    train_data, test_data,
-    model_name='my_model',
-    resp_nme='target',
-    weight_nme='weight',
-    factor_nmes=feature_list,
-    cate_list=categorical_features,
-)
-model.bayesopt_xgb(max_evals=100)      # Train XGBoost
-model.bayesopt_resnet(max_evals=50)    # Train ResNet
-model.bayesopt_ft(max_evals=50)        # Train FT-Transformer
+- `ins_pricing` exposes lightweight lazy imports so that pricing/production/governance
+  can be used without installing heavy ML dependencies.
+- Demo notebooks/configs live in the repo under `examples/` and are not shipped
+  in the PyPI package.
+- Heavy dependencies are only required when you import or use the related modules:
+  - BayesOpt: `torch`, `optuna`, `xgboost`, etc.
+  - Explain: `torch` (gradients), `shap` (SHAP).
+  - Geo plotting on basemap: `contextily`.
+  - Plotting: `matplotlib`.
 
-# Pricing: build factor table
-from ins_pricing.pricing import build_factor_table
-factors = build_factor_table(
-    df,
-    factor_col='age_band',
-    loss_col='claim_amount',
-    exposure_col='exposure',
-)
+## Multi-platform and GPU notes
 
-# Production: batch scoring
-from ins_pricing.production import batch_score
-scores = batch_score(model.trainers['xgb'].predict, df)
+- Install the correct PyTorch build for your platform/GPU before installing extras.
+- Torch Geometric requires platform-specific wheels; follow the official PyG install guide.
+- Multi-GPU uses DDP or DataParallel where supported; Windows disables CUDA DDP.
 
-# Model governance
-from ins_pricing.governance import ModelRegistry
-registry = ModelRegistry('models.json')
-registry.register(model_name, version, metrics=metrics)
-```
+## Backward-compatible imports
 
-### Project Structure
+Legacy import paths continue to work:
 
-```
-ins_pricing/
-├── cli/                    # Command-line entry points
-├── modelling/
-│   ├── core/bayesopt/     # ML model training core
-│   ├── explain/           # Model interpretability
-│   └── plotting/          # Model visualization
-├── pricing/               # Insurance pricing module
-├── production/            # Production deployment module
-├── governance/            # Model governance
-├── reporting/             # Report generation
-├── utils/                 # Utilities
-└── tests/                 # Test suite
-```
-
-### Installation
-
-```bash
-# Basic installation
-pip install ins_pricing
-
-# Full installation (all optional dependencies)
-pip install ins_pricing[all]
-
-# Install specific extras
-pip install ins_pricing[bayesopt]    # Model training
-pip install ins_pricing[explain]     # Model explanation
-pip install ins_pricing[plotting]    # Visualization
-pip install ins_pricing[gnn]         # Graph neural networks
-```
-
-#### Multi-platform & GPU installation notes
-
-- **PyTorch (CPU/GPU/MPS)**: Install the correct PyTorch build for your platform/GPU first (CUDA on
-  Linux/Windows, ROCm on supported AMD platforms, or MPS on Apple Silicon). Then install the
-  optional extras you need (e.g., `bayesopt`, `explain`, or `gnn`). This avoids pip pulling a
-  mismatched wheel.
-- **Torch Geometric (GNN)**: `torch-geometric` often requires platform-specific wheels (e.g.,
-  `torch-scatter`, `torch-sparse`). Follow the official PyG installation instructions for your
-  CUDA/ROCm/CPU environment, then install `ins_pricing[gnn]`.
-- **Multi-GPU**: Training code will use CUDA when available and can enable multi-GPU via
-  `torch.distributed`/`DataParallel` where supported. On Windows, CUDA DDP is not supported and will
-  fall back to single-GPU or DataParallel where possible.
-
-### Requirements
-
-- Python >= 3.9
-- Core dependencies: numpy >= 1.20, pandas >= 1.4
-
-### License
-
-Proprietary
+- `import user_packages`
+- `import user_packages.bayesopt`
+- `import user_packages.plotting`
+- `import user_packages.explain`
+- `import user_packages.BayesOpt`

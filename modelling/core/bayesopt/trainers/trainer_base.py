@@ -306,6 +306,19 @@ class TrainerBase:
         self.enable_distributed_optuna: bool = False
         self._distributed_forced_params: Optional[Dict[str, Any]] = None
 
+    def _apply_dataloader_overrides(self, model: Any) -> Any:
+        """Apply dataloader-related overrides from config to a model."""
+        cfg = getattr(self.ctx, "config", None)
+        if cfg is None:
+            return model
+        workers = getattr(cfg, "dataloader_workers", None)
+        if workers is not None:
+            model.dataloader_workers = int(workers)
+        profile = getattr(cfg, "resource_profile", None)
+        if profile:
+            model.resource_profile = str(profile)
+        return model
+
     def _export_preprocess_artifacts(self) -> Dict[str, Any]:
         dummy_columns: List[str] = []
         if getattr(self.ctx, "train_oht_data", None) is not None:

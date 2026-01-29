@@ -59,7 +59,7 @@ class GNNTrainer(TrainerBase):
                 self.ctx.config.gnn_knn_gpu_mem_overhead),
             loss_name=loss_name,
         )
-        return model
+        return self._apply_dataloader_overrides(model)
 
     def cross_val(self, trial: optuna.trial.Trial) -> float:
         base_tw_power = self.ctx.default_tweedie_power()

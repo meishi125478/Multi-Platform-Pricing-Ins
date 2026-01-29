@@ -195,6 +195,7 @@ class BayesOptConfig:
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"
+    dataloader_workers: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
@@ -210,6 +211,12 @@ class BayesOptConfig:
             errors.append(
                 f"task_type must be one of {valid_task_types}, got '{self.task_type}'"
             )
+        if self.dataloader_workers is not None:
+            try:
+                if int(self.dataloader_workers) < 0:
+                    errors.append("dataloader_workers must be >= 0 when provided.")
+            except (TypeError, ValueError):
+                errors.append("dataloader_workers must be an integer when provided.")
         # Validate loss_name
         try:
             normalized_loss = normalize_loss_name(self.loss_name, self.task_type)
