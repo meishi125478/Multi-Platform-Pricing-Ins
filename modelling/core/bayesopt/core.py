@@ -201,6 +201,8 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 raise ValueError("weight_nme is required when not using config parameter")
 
             # Infer categorical features if needed
+            # Only use user-specified categorical list for one-hot; do not auto-infer.
+            user_cate_list = [] if cate_list is None else list(cate_list)
             inferred_factors, inferred_cats = infer_factor_and_cate_list(
                 train_df=train_data,
                 test_df=test_data,
@@ -208,7 +210,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 weight_nme=weight_nme,
                 binary_resp_nme=binary_resp_nme,
                 factor_nmes=factor_nmes,
-                cate_list=cate_list,
+                cate_list=user_cate_list,
                 infer_categorical_max_unique=int(infer_categorical_max_unique),
                 infer_categorical_max_ratio=float(infer_categorical_max_ratio),
             )

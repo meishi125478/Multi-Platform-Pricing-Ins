@@ -32,6 +32,7 @@ class ConfigBuilder:
             "save_preprocess": False,
             "preprocess_artifact_path": None,
             "bo_sample_limit": None,
+            "build_oht": True,
             "cache_predictions": False,
             "prediction_cache_dir": None,
             "prediction_cache_format": "parquet",

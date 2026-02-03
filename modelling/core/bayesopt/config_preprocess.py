@@ -97,6 +97,7 @@ class BayesOptConfig:
         use_gnn_ddp: Use DDP for GNN
         ft_role: FT-Transformer role ('model', 'embedding', 'unsupervised_embedding')
         cv_strategy: CV strategy ('random', 'group', 'time', 'stratified')
+        build_oht: Whether to build one-hot encoded features (default True)
 
     Example:
         >>> config = BayesOptConfig(
@@ -192,6 +193,7 @@ class BayesOptConfig:
     preprocess_artifact_path: Optional[str] = None
     plot_path_style: str = "nested"
     bo_sample_limit: Optional[int] = None
+    build_oht: bool = True
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"
@@ -464,6 +466,16 @@ class DatasetPreprocessor:
                 self.cat_categories_for_shap[cate] = list(cats)
         self.num_features = [
             nme for nme in cfg.factor_nmes if nme not in cate_list]
+
+        build_oht = bool(getattr(cfg, "build_oht", True))
+        if not build_oht:
+            print("[Preprocess] build_oht=False; skip one-hot features.", flush=True)
+            self.train_oht_data = None
+            self.test_oht_data = None
+            self.train_oht_scl_data = None
+            self.test_oht_scl_data = None
+            self.var_nmes = list(cfg.factor_nmes)
+            return self
 
         # Memory optimization: Single copy + in-place operations
         train_oht = self.train_data[cfg.factor_nmes +
