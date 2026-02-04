@@ -23,6 +23,7 @@ _LAZY_ATTRS = {
     "bayesopt": "ins_pricing.modelling.bayesopt",
     "plotting": "ins_pricing.modelling.plotting",
     "explain": "ins_pricing.modelling.explain",
+    "evaluation": "ins_pricing.modelling.evaluation",
     "BayesOptConfig": "ins_pricing.modelling.bayesopt.core",
     "BayesOptModel": "ins_pricing.modelling.bayesopt.core",
 }
@@ -74,7 +75,6 @@ __all__ = sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(_LEGACY_EXPORTS))
 
 _LAZY_SUBMODULES = {
     "bayesopt": "ins_pricing.modelling.bayesopt",
-    "evaluation": "ins_pricing.modelling.evaluation",
     "cli": "ins_pricing.cli",
 }
 
@@ -111,6 +111,9 @@ def _install_proxy(alias: str, target: str) -> None:
     module_name = f"{__name__}.{alias}"
     if module_name in sys.modules:
         return
+    # Avoid self-referential proxies (e.g. modelling.bayesopt -> modelling.bayesopt).
+    if target == module_name:
+        return
     proxy = _lazy_module(module_name, target, _PACKAGE_PATHS.get(alias))
     sys.modules[module_name] = proxy
     globals()[alias] = proxy
@@ -124,7 +127,7 @@ def __getattr__(name: str):
     target = _LAZY_ATTRS.get(name)
     if target:
         module = import_module(target)
-        if name in {"bayesopt", "plotting", "explain"}:
+        if name in {"bayesopt", "plotting", "explain", "evaluation"}:
             value = module
         else:
             value = getattr(module, name)
