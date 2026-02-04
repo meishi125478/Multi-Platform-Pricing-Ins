@@ -6,8 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from .audit import AuditLogger
-from .registry import ModelRegistry
+from ins_pricing.governance.audit import AuditLogger
+from ins_pricing.governance.registry import ModelRegistry
 
 
 @dataclass

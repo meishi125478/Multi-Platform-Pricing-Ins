@@ -217,6 +217,7 @@ def load_dataset(
     data_format: str = "auto",
     dtype_map: Optional[Dict[str, Any]] = None,
     low_memory: bool = False,
+    chunksize: Optional[int] = None,
 ) -> pd.DataFrame:
     """Load a dataset from various formats.
 
@@ -225,6 +226,7 @@ def load_dataset(
         data_format: Format ('csv', 'parquet', 'feather', 'auto')
         dtype_map: Column type mapping
         low_memory: Whether to use low memory mode for CSV
+        chunksize: Optional chunk size for CSV streaming
 
     Returns:
         Loaded DataFrame
@@ -238,7 +240,13 @@ def load_dataset(
     elif fmt == "feather":
         df = pd.read_feather(path)
     elif fmt == "csv":
-        df = pd.read_csv(path, low_memory=low_memory, dtype=dtype_map or None)
+        if chunksize is not None:
+            chunks = []
+            for chunk in pd.read_csv(path, low_memory=low_memory, dtype=dtype_map or None, chunksize=chunksize):
+                chunks.append(chunk)
+            df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        else:
+            df = pd.read_csv(path, low_memory=low_memory, dtype=dtype_map or None)
     else:
         raise ValueError(f"Unsupported data_format: {data_format}")
 

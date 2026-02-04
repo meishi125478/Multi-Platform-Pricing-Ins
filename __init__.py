@@ -16,20 +16,59 @@ _ROOT_SUBPACKAGES = {
 _MODELLING_EXPORTS = {
     "BayesOptConfig",
     "BayesOptModel",
-    "IOUtils",
-    "TrainingUtils",
-    "free_cuda",
+}
+
+_BAYESOPT_EXPORTS = {
+    "BayesOptConfig",
+    "DatasetPreprocessor",
+    "OutputManager",
+    "VersionManager",
+    "BayesOptModel",
+    "FeatureTokenizer",
+    "FTTransformerCore",
+    "FTTransformerSklearn",
+    "GraphNeuralNetSklearn",
+    "MaskedTabularDataset",
+    "ResBlock",
+    "ResNetSequential",
+    "ResNetSklearn",
+    "ScaledTransformerEncoderLayer",
+    "SimpleGraphLayer",
+    "SimpleGNN",
+    "TabularDataset",
+    "FTTrainer",
+    "GLMTrainer",
+    "GNNTrainer",
+    "ResNetTrainer",
+    "TrainerBase",
+    "XGBTrainer",
+    "_xgb_cuda_available",
+}
+
+_LEGACY_EXPORTS = {
+    "IOUtils": "ins_pricing.utils",
+    "DeviceManager": "ins_pricing.utils",
+    "GPUMemoryManager": "ins_pricing.utils",
+    "MetricFactory": "ins_pricing.utils",
+    "EPS": "ins_pricing.utils",
+    "set_global_seed": "ins_pricing.utils",
+    "compute_batch_size": "ins_pricing.utils",
+    "tweedie_loss": "ins_pricing.utils",
+    "infer_factor_and_cate_list": "ins_pricing.utils",
+    "DistributedUtils": "ins_pricing.modelling.bayesopt.utils",
+    "TrainingUtils": "ins_pricing.modelling.bayesopt.utils",
+    "free_cuda": "ins_pricing.modelling.bayesopt.utils",
+    "TorchTrainerMixin": "ins_pricing.modelling.bayesopt.utils",
 }
 
 _LAZY_SUBMODULES = {
-    "bayesopt": "ins_pricing.modelling.core.bayesopt",
+    "bayesopt": "ins_pricing.modelling.bayesopt",
     "plotting": "ins_pricing.modelling.plotting",
     "explain": "ins_pricing.modelling.explain",
-    "BayesOpt": "ins_pricing.modelling.core.BayesOpt",
 }
 
 _PACKAGE_PATHS = {
-    "bayesopt": Path(__file__).resolve().parent / "modelling" / "core" / "bayesopt",
+    "bayesopt": Path(__file__).resolve().parent / "modelling" / "bayesopt",
     "plotting": Path(__file__).resolve().parent / "modelling" / "plotting",
     "explain": Path(__file__).resolve().parent / "modelling" / "explain",
 }
@@ -37,6 +76,8 @@ _PACKAGE_PATHS = {
 __all__ = sorted(
     set(_ROOT_SUBPACKAGES)
     | set(_MODELLING_EXPORTS)
+    | set(_BAYESOPT_EXPORTS)
+    | set(_LEGACY_EXPORTS)
     | set(_LAZY_SUBMODULES)
 )
 
@@ -84,6 +125,17 @@ def __getattr__(name: str):
         return module
     if name in _MODELLING_EXPORTS:
         module = import_module("ins_pricing.modelling")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    if name in _BAYESOPT_EXPORTS:
+        module = import_module("ins_pricing.modelling.bayesopt")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    legacy_module = _LEGACY_EXPORTS.get(name)
+    if legacy_module:
+        module = import_module(legacy_module)
         value = getattr(module, name)
         globals()[name] = value
         return value

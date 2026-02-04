@@ -6,14 +6,26 @@ The main implementation lives in bayesopt_entry_runner.py.
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 import json
 import os
 import sys
 
-if __package__ in {None, ""}:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+def _ensure_repo_root() -> None:
+    if __package__ not in {None, ""}:
+        return
+    if importlib.util.find_spec("ins_pricing") is not None:
+        return
+    bootstrap_path = Path(__file__).resolve().parents[1] / "utils" / "bootstrap.py"
+    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ensure_repo_root()
+
+
+_ensure_repo_root()
 
 def _apply_env_from_config(argv: list[str]) -> None:
     if "--config-json" not in argv:
@@ -46,7 +58,7 @@ def _apply_env_from_config(argv: list[str]) -> None:
 _apply_env_from_config(sys.argv)
 
 try:
-    from .bayesopt_entry_runner import main
+    from ins_pricing.cli.bayesopt_entry_runner import main
 except Exception:  # pragma: no cover
     from ins_pricing.cli.bayesopt_entry_runner import main
 

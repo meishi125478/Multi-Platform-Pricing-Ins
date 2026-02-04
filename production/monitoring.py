@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from ins_pricing.utils.metrics import mae, mape, r2_score, rmse
+
 
 def _safe_div(numer: float, denom: float, default: float = 0.0) -> float:
     if denom == 0:
@@ -18,27 +20,12 @@ def regression_metrics(
     *,
     weight: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-    if weight is not None:
-        weight = np.asarray(weight, dtype=float).reshape(-1)
-        if weight.shape[0] != y_true.shape[0]:
-            raise ValueError("weight length must match y_true.")
-    err = y_true - y_pred
-    if weight is None:
-        mse = float(np.mean(err ** 2))
-        mae = float(np.mean(np.abs(err)))
-    else:
-        w_sum = float(np.sum(weight))
-        mse = float(np.sum(weight * (err ** 2)) / max(w_sum, 1.0))
-        mae = float(np.sum(weight * np.abs(err)) / max(w_sum, 1.0))
-    rmse = float(np.sqrt(mse))
-    denom = float(np.mean(y_true)) if np.mean(y_true) != 0 else 1.0
-    mape = float(np.mean(np.abs(err) / np.clip(np.abs(y_true), 1e-9, None)))
-    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    ss_res = float(np.sum(err ** 2))
-    r2 = 1.0 - _safe_div(ss_res, ss_tot, default=0.0)
-    return {"rmse": rmse, "mae": mae, "mape": mape, "r2": r2}
+    return {
+        "rmse": rmse(y_true, y_pred, sample_weight=weight),
+        "mae": mae(y_true, y_pred, sample_weight=weight),
+        "mape": mape(y_true, y_pred, sample_weight=weight),
+        "r2": r2_score(y_true, y_pred, sample_weight=weight),
+    }
 
 
 def loss_ratio(

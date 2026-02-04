@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
-from .metrics import resolve_metric
+from ins_pricing.modelling.explain.metrics import resolve_metric
 
 
 def _compute_feature_importance(

@@ -17,16 +17,31 @@ from ins_pricing.frontend.ft_workflow import FTWorkflowHelper
 from ins_pricing.frontend.runner import TaskRunner
 from ins_pricing.frontend.config_builder import ConfigBuilder
 import json
+import tempfile
 import sys
 import inspect
+import importlib.util
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable, Iterable, Tuple
+from typing import Optional, Dict, Any, Callable, Iterable, Tuple, Generator
 import threading
 import queue
 import time
 
-# Add parent directory to path to import ins_pricing modules
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+def _ensure_repo_root() -> None:
+    if __package__ not in {None, ""}:
+        return
+    if importlib.util.find_spec("ins_pricing") is not None:
+        return
+    bootstrap_path = Path(__file__).resolve().parents[1] / "cli" / "utils" / "bootstrap.py"
+    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ensure_repo_root()
+
+
+_ensure_repo_root()
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "False")
@@ -115,6 +130,17 @@ class PricingApp:
         max_evals: int,
         xgb_max_depth_max: int,
         xgb_n_estimators_max: int,
+        xgb_gpu_id: int,
+        xgb_cleanup_per_fold: bool,
+        xgb_cleanup_synchronize: bool,
+        xgb_use_dmatrix: bool,
+        ft_cleanup_per_fold: bool,
+        ft_cleanup_synchronize: bool,
+        resn_cleanup_per_fold: bool,
+        resn_cleanup_synchronize: bool,
+        gnn_cleanup_per_fold: bool,
+        gnn_cleanup_synchronize: bool,
+        optuna_cleanup_synchronize: bool,
     ) -> tuple[str, str]:
         """Build configuration from UI parameters."""
         try:
@@ -151,6 +177,17 @@ class PricingApp:
                 max_evals=max_evals,
                 xgb_max_depth_max=xgb_max_depth_max,
                 xgb_n_estimators_max=xgb_n_estimators_max,
+                xgb_gpu_id=xgb_gpu_id,
+                xgb_cleanup_per_fold=xgb_cleanup_per_fold,
+                xgb_cleanup_synchronize=xgb_cleanup_synchronize,
+                xgb_use_dmatrix=xgb_use_dmatrix,
+                ft_cleanup_per_fold=ft_cleanup_per_fold,
+                ft_cleanup_synchronize=ft_cleanup_synchronize,
+                resn_cleanup_per_fold=resn_cleanup_per_fold,
+                resn_cleanup_synchronize=resn_cleanup_synchronize,
+                gnn_cleanup_per_fold=gnn_cleanup_per_fold,
+                gnn_cleanup_synchronize=gnn_cleanup_synchronize,
+                optuna_cleanup_synchronize=optuna_cleanup_synchronize,
             )
 
             is_valid, msg = self.config_builder.validate_config(config)
@@ -180,21 +217,22 @@ class PricingApp:
         except Exception as e:
             return f"Error saving config: {str(e)}"
 
-    def run_training(self, config_json: str) -> tuple[str, str]:
+    def run_training(self, config_json: str) -> Generator[tuple[str, str], None, None]:
         """
         Run task (training, explain, plotting, etc.) with the current configuration.
 
         The task type is automatically detected from config.runner.mode.
         Supported modes: entry (training), explain, incremental, watchdog, etc.
         """
+        temp_config_path: Optional[Path] = None
         try:
-            temp_config_path = None
             if config_json:
                 config = json.loads(config_json)
                 task_mode = config.get('runner', {}).get('mode', 'entry')
                 base_dir = self.current_config_dir or Path.cwd()
-                temp_config_path = (base_dir / "temp_config.json").resolve()
-                with open(temp_config_path, 'w', encoding='utf-8') as f:
+                fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
+                temp_config_path = Path(temp_path)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
                 config_path = temp_config_path
             elif self.current_config_path and self.current_config_path.exists():
@@ -204,12 +242,15 @@ class PricingApp:
             elif self.current_config:
                 config = self.current_config
                 task_mode = config.get('runner', {}).get('mode', 'entry')
-                temp_config_path = (Path.cwd() / "temp_config.json").resolve()
-                with open(temp_config_path, 'w', encoding='utf-8') as f:
+                base_dir = Path.cwd()
+                fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
+                temp_config_path = Path(temp_path)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
                 config_path = temp_config_path
             else:
-                return "No configuration provided", ""
+                yield "No configuration provided", ""
+                return
 
             log_generator = self.runner.run_task(str(config_path))
 
@@ -219,15 +260,17 @@ class PricingApp:
                 full_log += log_line + "\n"
                 yield f"Task [{task_mode}] in progress...", full_log
 
-            # Clean up
-            if temp_config_path and temp_config_path.exists():
-                temp_config_path.unlink()
-
             yield f"Task [{task_mode}] completed!", full_log
 
         except Exception as e:
             error_msg = f"Error during task execution: {str(e)}"
             yield error_msg, error_msg
+        finally:
+            if temp_config_path is not None:
+                try:
+                    temp_config_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def prepare_ft_step1(self, config_json: str, use_ddp: bool, nproc: int) -> tuple[str, str]:
         """Prepare FT Step 1 configuration."""
@@ -556,6 +599,29 @@ def create_ui():
                         label="XGB Max Depth", value=25, precision=0)
                     xgb_n_estimators_max = gr.Number(
                         label="XGB Max Estimators", value=500, precision=0)
+                    xgb_gpu_id = gr.Number(
+                        label="XGB GPU ID", value=0, precision=0)
+                    xgb_cleanup_per_fold = gr.Checkbox(
+                        label="XGB Cleanup Per Fold", value=False)
+                    xgb_cleanup_synchronize = gr.Checkbox(
+                        label="XGB Cleanup Synchronize", value=False)
+                    xgb_use_dmatrix = gr.Checkbox(
+                        label="XGB Use DMatrix", value=True)
+                    gr.Markdown("#### Fold Cleanup")
+                    ft_cleanup_per_fold = gr.Checkbox(
+                        label="FT Cleanup Per Fold", value=False)
+                    ft_cleanup_synchronize = gr.Checkbox(
+                        label="FT Cleanup Synchronize", value=False)
+                    resn_cleanup_per_fold = gr.Checkbox(
+                        label="ResNet Cleanup Per Fold", value=False)
+                    resn_cleanup_synchronize = gr.Checkbox(
+                        label="ResNet Cleanup Synchronize", value=False)
+                    gnn_cleanup_per_fold = gr.Checkbox(
+                        label="GNN Cleanup Per Fold", value=False)
+                    gnn_cleanup_synchronize = gr.Checkbox(
+                        label="GNN Cleanup Synchronize", value=False)
+                    optuna_cleanup_synchronize = gr.Checkbox(
+                        label="Optuna Cleanup Synchronize", value=False)
 
             with gr.Row():
                 build_btn = gr.Button(
@@ -837,7 +903,12 @@ def create_ui():
                 feature_list, categorical_features, task_type, prop_test,
                 holdout_ratio, val_ratio, split_strategy, rand_seed, epochs,
                 output_dir, use_gpu, model_keys, max_evals,
-                xgb_max_depth_max, xgb_n_estimators_max
+                xgb_max_depth_max, xgb_n_estimators_max,
+                xgb_gpu_id, xgb_cleanup_per_fold, xgb_cleanup_synchronize,
+                xgb_use_dmatrix, ft_cleanup_per_fold, ft_cleanup_synchronize,
+                resn_cleanup_per_fold, resn_cleanup_synchronize,
+                gnn_cleanup_per_fold, gnn_cleanup_synchronize,
+                optuna_cleanup_synchronize
             ],
             outputs=[build_status, config_json]
         )

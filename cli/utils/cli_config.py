@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 try:
-    from .cli_common import resolve_dir_path, resolve_path  # type: ignore
+    from ins_pricing.cli.utils.cli_common import resolve_dir_path, resolve_path  # type: ignore
 except Exception:  # pragma: no cover
     from cli_common import resolve_dir_path, resolve_path  # type: ignore
 
@@ -340,6 +340,14 @@ def resolve_split_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    xgb_gpu_id = cfg.get("xgb_gpu_id")
+    if isinstance(xgb_gpu_id, str) and xgb_gpu_id.strip() == "":
+        xgb_gpu_id = None
+    if xgb_gpu_id is not None:
+        try:
+            xgb_gpu_id = int(xgb_gpu_id)
+        except (TypeError, ValueError):
+            xgb_gpu_id = None
     return {
         "save_preprocess": bool(cfg.get("save_preprocess", False)),
         "preprocess_artifact_path": cfg.get("preprocess_artifact_path"),
@@ -349,6 +357,17 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "reuse_best_params": bool(cfg.get("reuse_best_params", False)),
         "xgb_max_depth_max": int(cfg.get("xgb_max_depth_max", 25)),
         "xgb_n_estimators_max": int(cfg.get("xgb_n_estimators_max", 500)),
+        "xgb_gpu_id": xgb_gpu_id,
+        "xgb_cleanup_per_fold": bool(cfg.get("xgb_cleanup_per_fold", False)),
+        "xgb_cleanup_synchronize": bool(cfg.get("xgb_cleanup_synchronize", False)),
+        "xgb_use_dmatrix": bool(cfg.get("xgb_use_dmatrix", True)),
+        "ft_cleanup_per_fold": bool(cfg.get("ft_cleanup_per_fold", False)),
+        "ft_cleanup_synchronize": bool(cfg.get("ft_cleanup_synchronize", False)),
+        "resn_cleanup_per_fold": bool(cfg.get("resn_cleanup_per_fold", False)),
+        "resn_cleanup_synchronize": bool(cfg.get("resn_cleanup_synchronize", False)),
+        "gnn_cleanup_per_fold": bool(cfg.get("gnn_cleanup_per_fold", False)),
+        "gnn_cleanup_synchronize": bool(cfg.get("gnn_cleanup_synchronize", False)),
+        "optuna_cleanup_synchronize": bool(cfg.get("optuna_cleanup_synchronize", False)),
         "optuna_storage": cfg.get("optuna_storage"),
         "optuna_study_prefix": cfg.get("optuna_study_prefix"),
         "best_params_files": cfg.get("best_params_files"),

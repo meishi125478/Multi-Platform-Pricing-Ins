@@ -1,5 +1,4 @@
-"""Incremental training harness built on top of ``ins_pricing.bayesopt``
-(compat via ``BayesOpt.py``).
+"""Incremental training harness built on top of ``ins_pricing.bayesopt``.
 
 This utility lets you append new observations to an existing dataset,
 reuse previously tuned hyperparameters and retrain a subset of models
@@ -18,12 +17,25 @@ Example:
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 import sys
 
-if __package__ in {None, ""}:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+
+def _ensure_repo_root() -> None:
+    if __package__ not in {None, ""}:
+        return
+    if importlib.util.find_spec("ins_pricing") is not None:
+        return
+    bootstrap_path = Path(__file__).resolve().parents[1] / "utils" / "bootstrap.py"
+    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ensure_repo_root()
+
+
+_ensure_repo_root()
 
 import argparse
 import json
@@ -33,100 +45,33 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-try:
-    from .. import bayesopt as ropt  # type: ignore
-    from .utils.cli_common import (  # type: ignore
-        PLOT_MODEL_LABELS,
-        PYTORCH_TRAINERS,
-        build_model_names,
-        dedupe_preserve_order,
-        load_dataset,
-        parse_model_pairs,
-        resolve_data_path,
-        resolve_path,
-        split_train_test,
-    )
-    from .utils.cli_config import (  # type: ignore
-        add_config_json_arg,
-        resolve_and_load_config,
-        resolve_data_config,
-        resolve_split_config,
-        resolve_runtime_config,
-        resolve_output_dirs,
-    )
-except Exception:  # pragma: no cover
-    try:
-        import bayesopt as ropt  # type: ignore
-        from utils.cli_common import (  # type: ignore
-            PLOT_MODEL_LABELS,
-            PYTORCH_TRAINERS,
-            build_model_names,
-            dedupe_preserve_order,
-            load_dataset,
-            parse_model_pairs,
-            resolve_data_path,
-            resolve_path,
-            split_train_test,
-        )
-        from utils.cli_config import (  # type: ignore
-            add_config_json_arg,
-            resolve_and_load_config,
-            resolve_data_config,
-            resolve_split_config,
-            resolve_runtime_config,
-            resolve_output_dirs,
-        )
-    except Exception:
-        try:
-            import ins_pricing.modelling.core.bayesopt as ropt  # type: ignore
-            from ins_pricing.cli.utils.cli_common import (  # type: ignore
-                PLOT_MODEL_LABELS,
-                PYTORCH_TRAINERS,
-                build_model_names,
-                dedupe_preserve_order,
-                load_dataset,
-                parse_model_pairs,
-                resolve_data_path,
-                resolve_path,
-                split_train_test,
-            )
-            from ins_pricing.cli.utils.cli_config import (  # type: ignore
-                add_config_json_arg,
-                resolve_and_load_config,
-                resolve_data_config,
-                resolve_split_config,
-                resolve_runtime_config,
-                resolve_output_dirs,
-            )
-        except Exception:
-            import BayesOpt as ropt  # type: ignore
-            from utils.cli_common import (  # type: ignore
-                PLOT_MODEL_LABELS,
-                PYTORCH_TRAINERS,
-                build_model_names,
-                dedupe_preserve_order,
-                load_dataset,
-                parse_model_pairs,
-                resolve_data_path,
-                resolve_path,
-                split_train_test,
-            )
-            from utils.cli_config import (  # type: ignore
-                add_config_json_arg,
-                resolve_and_load_config,
-                resolve_data_config,
-                resolve_split_config,
-                resolve_runtime_config,
-                resolve_output_dirs,
-            )
+from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
 
-try:
-    from .utils.run_logging import configure_run_logging  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from utils.run_logging import configure_run_logging  # type: ignore
-    except Exception:  # pragma: no cover
-        configure_run_logging = None  # type: ignore
+setup_sys_path()
+_imports = resolve_imports()
+
+ropt = _imports.bayesopt
+if ropt is None:  # pragma: no cover
+    raise ImportError("Failed to resolve ins_pricing.bayesopt for incremental CLI.")
+
+PLOT_MODEL_LABELS = _imports.PLOT_MODEL_LABELS
+PYTORCH_TRAINERS = _imports.PYTORCH_TRAINERS
+build_model_names = _imports.build_model_names
+dedupe_preserve_order = _imports.dedupe_preserve_order
+load_dataset = _imports.load_dataset
+parse_model_pairs = _imports.parse_model_pairs
+resolve_data_path = _imports.resolve_data_path
+resolve_path = _imports.resolve_path
+split_train_test = _imports.split_train_test
+
+add_config_json_arg = _imports.add_config_json_arg
+resolve_and_load_config = _imports.resolve_and_load_config
+resolve_data_config = _imports.resolve_data_config
+resolve_split_config = _imports.resolve_split_config
+resolve_runtime_config = _imports.resolve_runtime_config
+resolve_output_dirs = _imports.resolve_output_dirs
+
+configure_run_logging = _imports.configure_run_logging
 
 
 def _log(message: str) -> None:
@@ -490,6 +435,17 @@ class IncrementalUpdateRunner:
         self.plot_path_style = runtime_cfg["plot_path_style"]
         self.xgb_max_depth_max = runtime_cfg["xgb_max_depth_max"]
         self.xgb_n_estimators_max = runtime_cfg["xgb_n_estimators_max"]
+        self.xgb_gpu_id = runtime_cfg["xgb_gpu_id"]
+        self.xgb_cleanup_per_fold = runtime_cfg["xgb_cleanup_per_fold"]
+        self.xgb_cleanup_synchronize = runtime_cfg["xgb_cleanup_synchronize"]
+        self.xgb_use_dmatrix = runtime_cfg["xgb_use_dmatrix"]
+        self.ft_cleanup_per_fold = runtime_cfg["ft_cleanup_per_fold"]
+        self.ft_cleanup_synchronize = runtime_cfg["ft_cleanup_synchronize"]
+        self.resn_cleanup_per_fold = runtime_cfg["resn_cleanup_per_fold"]
+        self.resn_cleanup_synchronize = runtime_cfg["resn_cleanup_synchronize"]
+        self.gnn_cleanup_per_fold = runtime_cfg["gnn_cleanup_per_fold"]
+        self.gnn_cleanup_synchronize = runtime_cfg["gnn_cleanup_synchronize"]
+        self.optuna_cleanup_synchronize = runtime_cfg["optuna_cleanup_synchronize"]
         self.optuna_storage = runtime_cfg["optuna_storage"]
         self.optuna_study_prefix = runtime_cfg["optuna_study_prefix"]
         self.best_params_files = runtime_cfg["best_params_files"]
@@ -661,6 +617,17 @@ class IncrementalUpdateRunner:
             output_dir=str(self.output_root) if self.output_root else None,
             xgb_max_depth_max=self.xgb_max_depth_max,
             xgb_n_estimators_max=self.xgb_n_estimators_max,
+            xgb_gpu_id=self.xgb_gpu_id,
+            xgb_cleanup_per_fold=self.xgb_cleanup_per_fold,
+            xgb_cleanup_synchronize=self.xgb_cleanup_synchronize,
+            xgb_use_dmatrix=self.xgb_use_dmatrix,
+            ft_cleanup_per_fold=self.ft_cleanup_per_fold,
+            ft_cleanup_synchronize=self.ft_cleanup_synchronize,
+            resn_cleanup_per_fold=self.resn_cleanup_per_fold,
+            resn_cleanup_synchronize=self.resn_cleanup_synchronize,
+            gnn_cleanup_per_fold=self.gnn_cleanup_per_fold,
+            gnn_cleanup_synchronize=self.gnn_cleanup_synchronize,
+            optuna_cleanup_synchronize=self.optuna_cleanup_synchronize,
             resn_weight_decay=self.cfg.get("resn_weight_decay"),
             final_ensemble=bool(self.cfg.get("final_ensemble", False)),
             final_ensemble_k=int(self.cfg.get("final_ensemble_k", 3)),

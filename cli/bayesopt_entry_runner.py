@@ -12,12 +12,25 @@ Example:
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 import sys
 
-if __package__ in {None, ""}:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+
+def _ensure_repo_root() -> None:
+    if __package__ not in {None, ""}:
+        return
+    if importlib.util.find_spec("ins_pricing") is not None:
+        return
+    bootstrap_path = Path(__file__).resolve().parents[1] / "utils" / "bootstrap.py"
+    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ensure_repo_root()
+
+
+_ensure_repo_root()
 
 import argparse
 import hashlib
@@ -30,8 +43,8 @@ import numpy as np
 import pandas as pd
 
 # Use unified import resolver to eliminate nested try/except chains
-from .utils.import_resolver import resolve_imports, setup_sys_path
-from .utils.evaluation_context import (
+from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
+from ins_pricing.cli.utils.evaluation_context import (
     EvaluationContext,
     TrainingContext,
     ModelIdentity,
@@ -1116,6 +1129,17 @@ def train_from_config(args: argparse.Namespace) -> None:
         args.reuse_best_params or runtime_cfg["reuse_best_params"])
     xgb_max_depth_max = runtime_cfg["xgb_max_depth_max"]
     xgb_n_estimators_max = runtime_cfg["xgb_n_estimators_max"]
+    xgb_gpu_id = runtime_cfg["xgb_gpu_id"]
+    xgb_cleanup_per_fold = runtime_cfg["xgb_cleanup_per_fold"]
+    xgb_cleanup_synchronize = runtime_cfg["xgb_cleanup_synchronize"]
+    xgb_use_dmatrix = runtime_cfg["xgb_use_dmatrix"]
+    ft_cleanup_per_fold = runtime_cfg["ft_cleanup_per_fold"]
+    ft_cleanup_synchronize = runtime_cfg["ft_cleanup_synchronize"]
+    resn_cleanup_per_fold = runtime_cfg["resn_cleanup_per_fold"]
+    resn_cleanup_synchronize = runtime_cfg["resn_cleanup_synchronize"]
+    gnn_cleanup_per_fold = runtime_cfg["gnn_cleanup_per_fold"]
+    gnn_cleanup_synchronize = runtime_cfg["gnn_cleanup_synchronize"]
+    optuna_cleanup_synchronize = runtime_cfg["optuna_cleanup_synchronize"]
     optuna_storage = runtime_cfg["optuna_storage"]
     optuna_study_prefix = runtime_cfg["optuna_study_prefix"]
     best_params_files = runtime_cfg["best_params_files"]
@@ -1249,6 +1273,17 @@ def train_from_config(args: argparse.Namespace) -> None:
             "output_dir": output_dir,
             "xgb_max_depth_max": xgb_max_depth_max,
             "xgb_n_estimators_max": xgb_n_estimators_max,
+            "xgb_gpu_id": xgb_gpu_id,
+            "xgb_cleanup_per_fold": xgb_cleanup_per_fold,
+            "xgb_cleanup_synchronize": xgb_cleanup_synchronize,
+            "xgb_use_dmatrix": xgb_use_dmatrix,
+            "ft_cleanup_per_fold": ft_cleanup_per_fold,
+            "ft_cleanup_synchronize": ft_cleanup_synchronize,
+            "resn_cleanup_per_fold": resn_cleanup_per_fold,
+            "resn_cleanup_synchronize": resn_cleanup_synchronize,
+            "gnn_cleanup_per_fold": gnn_cleanup_per_fold,
+            "gnn_cleanup_synchronize": gnn_cleanup_synchronize,
+            "optuna_cleanup_synchronize": optuna_cleanup_synchronize,
             "resn_weight_decay": cfg.get("resn_weight_decay"),
             "final_ensemble": bool(cfg.get("final_ensemble", False)),
             "final_ensemble_k": int(cfg.get("final_ensemble_k", 3)),

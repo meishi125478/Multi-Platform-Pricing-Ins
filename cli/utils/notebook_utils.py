@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, cast
 
 try:
-    from .cli_config import add_config_json_arg, set_env  # type: ignore
+    from ins_pricing.cli.utils.cli_config import add_config_json_arg, set_env  # type: ignore
 except Exception:  # pragma: no cover
     from cli_config import add_config_json_arg, set_env  # type: ignore
 
@@ -197,6 +197,100 @@ def _build_config_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
+    """Build a command list from config.json runner settings.
+
+    Returns:
+        (cmd, mode) where mode is one of: entry, incremental, explain.
+    """
+    pkg_dir = _find_ins_pricing_dir()
+    config_path = Path(config_json)
+    if not config_path.is_absolute():
+        config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
+    raw = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
+    set_env(raw.get("env", {}))
+    runner = cast(dict, raw.get("runner") or {})
+
+    mode = str(runner.get("mode") or "entry").strip().lower()
+    use_watchdog = bool(runner.get("use_watchdog", False))
+    if mode == "watchdog":
+        use_watchdog = True
+        mode = "entry"
+
+    idle_seconds = int(runner.get("idle_seconds", 7200))
+    max_restarts = int(runner.get("max_restarts", 50))
+    restart_delay_seconds = int(runner.get("restart_delay_seconds", 10))
+
+    if mode == "incremental":
+        inc_args = runner.get("incremental_args") or []
+        if not isinstance(inc_args, list):
+            raise ValueError("config.runner.incremental_args must be a list of strings.")
+        cmd = build_incremental_cmd(config_path, extra_args=[str(x) for x in inc_args])
+        if use_watchdog:
+            cmd = wrap_with_watchdog(
+                cmd,
+                idle_seconds=idle_seconds,
+                max_restarts=max_restarts,
+                restart_delay_seconds=restart_delay_seconds,
+            )
+        return cmd, "incremental"
+
+    if mode == "explain":
+        exp_args = runner.get("explain_args") or []
+        if not isinstance(exp_args, list):
+            raise ValueError("config.runner.explain_args must be a list of strings.")
+        cmd = build_explain_cmd(config_path, extra_args=[str(x) for x in exp_args])
+        if use_watchdog:
+            cmd = wrap_with_watchdog(
+                cmd,
+                idle_seconds=idle_seconds,
+                max_restarts=max_restarts,
+                restart_delay_seconds=restart_delay_seconds,
+            )
+        return cmd, "explain"
+
+    if mode != "entry":
+        raise ValueError(
+            f"Unsupported runner.mode={mode!r}, expected 'entry', 'incremental', or 'explain'."
+        )
+
+    model_keys = runner.get("model_keys")
+    if not model_keys:
+        model_keys = raw.get("model_keys")
+    if not model_keys:
+        model_keys = ["ft"]
+    if not isinstance(model_keys, list):
+        raise ValueError("runner.model_keys must be a list of strings.")
+
+    nproc_per_node = int(runner.get("nproc_per_node", 1))
+    max_evals = int(runner.get("max_evals", raw.get("max_evals", 50)))
+    plot_curves = bool(runner.get("plot_curves", raw.get("plot_curves", True)))
+    ft_role = runner.get("ft_role", None)
+    if ft_role is None:
+        ft_role = raw.get("ft_role")
+
+    cmd = build_bayesopt_entry_cmd(
+        config_path,
+        model_keys=[str(x) for x in model_keys],
+        nproc_per_node=nproc_per_node,
+        extra_args=[
+            "--max-evals",
+            str(max_evals),
+            *(["--plot-curves"] if plot_curves else []),
+            *(["--ft-role", str(ft_role)] if ft_role else []),
+        ],
+    )
+
+    if use_watchdog:
+        cmd = wrap_with_watchdog(
+            cmd,
+            idle_seconds=idle_seconds,
+            max_restarts=max_restarts,
+            restart_delay_seconds=restart_delay_seconds,
+        )
+    return cmd, "entry"
+
+
 def run_from_config_cli(
     description: str,
     argv: Optional[Sequence[str]] = None,
@@ -256,85 +350,5 @@ def run_from_config(config_json: str | Path) -> subprocess.CompletedProcess:
     - runner.use_watchdog / runner.idle_seconds / runner.max_restarts / runner.restart_delay_seconds
     - runner.incremental_args: List[str] (incremental only; extra args for cli/BayesOpt_incremental.py)
     """
-    pkg_dir = _find_ins_pricing_dir()
-    config_path = Path(config_json)
-    if not config_path.is_absolute():
-        config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
-    raw = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
-    set_env(raw.get("env", {}))
-    runner = cast(dict, raw.get("runner") or {})
-
-    mode = str(runner.get("mode") or "entry").strip().lower()
-    use_watchdog = bool(runner.get("use_watchdog", False))
-    idle_seconds = int(runner.get("idle_seconds", 7200))
-    max_restarts = int(runner.get("max_restarts", 50))
-    restart_delay_seconds = int(runner.get("restart_delay_seconds", 10))
-
-    if mode == "incremental":
-        inc_args = runner.get("incremental_args") or []
-        if not isinstance(inc_args, list):
-            raise ValueError("config.runner.incremental_args must be a list of strings.")
-        cmd = build_incremental_cmd(config_path, extra_args=[str(x) for x in inc_args])
-        if use_watchdog:
-            cmd = wrap_with_watchdog(
-                cmd,
-                idle_seconds=idle_seconds,
-                max_restarts=max_restarts,
-                restart_delay_seconds=restart_delay_seconds,
-            )
-        return run(cmd, check=True)
-
-    if mode == "explain":
-        exp_args = runner.get("explain_args") or []
-        if not isinstance(exp_args, list):
-            raise ValueError("config.runner.explain_args must be a list of strings.")
-        cmd = build_explain_cmd(config_path, extra_args=[str(x) for x in exp_args])
-        if use_watchdog:
-            cmd = wrap_with_watchdog(
-                cmd,
-                idle_seconds=idle_seconds,
-                max_restarts=max_restarts,
-                restart_delay_seconds=restart_delay_seconds,
-            )
-        return run(cmd, check=True)
-
-    if mode != "entry":
-        raise ValueError(
-            f"Unsupported runner.mode={mode!r}, expected 'entry', 'incremental', or 'explain'."
-        )
-
-    model_keys = runner.get("model_keys")
-    if not model_keys:
-        model_keys = raw.get("model_keys")
-    if not model_keys:
-        model_keys = ["ft"]
-    if not isinstance(model_keys, list):
-        raise ValueError("runner.model_keys must be a list of strings.")
-
-    nproc_per_node = int(runner.get("nproc_per_node", 1))
-    max_evals = int(runner.get("max_evals", raw.get("max_evals", 50)))
-    plot_curves = bool(runner.get("plot_curves", raw.get("plot_curves", True)))
-    ft_role = runner.get("ft_role", None)
-    if ft_role is None:
-        ft_role = raw.get("ft_role")
-
-    cmd = build_bayesopt_entry_cmd(
-        config_path,
-        model_keys=[str(x) for x in model_keys],
-        nproc_per_node=nproc_per_node,
-        extra_args=[
-            "--max-evals",
-            str(max_evals),
-            *(["--plot-curves"] if plot_curves else []),
-            *(["--ft-role", str(ft_role)] if ft_role else []),
-        ],
-    )
-
-    if use_watchdog:
-        cmd = wrap_with_watchdog(
-            cmd,
-            idle_seconds=idle_seconds,
-            max_restarts=max_restarts,
-            restart_delay_seconds=restart_delay_seconds,
-        )
+    cmd, _mode = build_cmd_from_config(config_json)
     return run(cmd, check=True)

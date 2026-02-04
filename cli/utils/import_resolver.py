@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
+from ins_pricing.cli.utils.bootstrap import ensure_repo_root
+
 
 @dataclass
 class ResolvedImports:
@@ -46,6 +48,10 @@ class ResolvedImports:
     resolve_and_load_config: Optional[Callable] = None
     resolve_data_config: Optional[Callable] = None
     resolve_report_config: Optional[Callable] = None
+    resolve_explain_save_root: Optional[Callable] = None
+    resolve_explain_save_dir: Optional[Callable] = None
+    resolve_explain_output_overrides: Optional[Callable] = None
+    resolve_model_path_value: Optional[Callable] = None
     resolve_split_config: Optional[Callable] = None
     resolve_runtime_config: Optional[Callable] = None
     resolve_output_dirs: Optional[Callable] = None
@@ -122,7 +128,7 @@ def _try_import_from_paths(
 def _resolve_bayesopt() -> Optional[Any]:
     """Resolve the bayesopt module from multiple possible locations."""
     paths = [
-        "ins_pricing.modelling.core.bayesopt",
+        "ins_pricing.modelling.bayesopt",
         "bayesopt",
         "BayesOpt",
     ]
@@ -179,6 +185,10 @@ def _resolve_cli_config() -> Dict[str, Any]:
         "resolve_and_load_config",
         "resolve_data_config",
         "resolve_report_config",
+        "resolve_explain_save_root",
+        "resolve_explain_save_dir",
+        "resolve_explain_output_overrides",
+        "resolve_model_path_value",
         "resolve_split_config",
         "resolve_runtime_config",
         "resolve_output_dirs",
@@ -200,7 +210,7 @@ def _resolve_cli_config() -> Dict[str, Any]:
 def _resolve_evaluation() -> Dict[str, Any]:
     """Resolve evaluation utilities."""
     paths = [
-        "ins_pricing.modelling.core.evaluation",
+        "ins_pricing.modelling.evaluation",
         "evaluation",
     ]
 
@@ -337,6 +347,10 @@ def resolve_imports() -> ResolvedImports:
     imports.resolve_and_load_config = cli_config.get("resolve_and_load_config")
     imports.resolve_data_config = cli_config.get("resolve_data_config")
     imports.resolve_report_config = cli_config.get("resolve_report_config")
+    imports.resolve_explain_save_root = cli_config.get("resolve_explain_save_root")
+    imports.resolve_explain_save_dir = cli_config.get("resolve_explain_save_dir")
+    imports.resolve_explain_output_overrides = cli_config.get("resolve_explain_output_overrides")
+    imports.resolve_model_path_value = cli_config.get("resolve_model_path_value")
     imports.resolve_split_config = cli_config.get("resolve_split_config")
     imports.resolve_runtime_config = cli_config.get("resolve_runtime_config")
     imports.resolve_output_dirs = cli_config.get("resolve_output_dirs")
@@ -371,6 +385,9 @@ def resolve_imports() -> ResolvedImports:
 # Convenience function for backward compatibility
 def setup_sys_path() -> None:
     """Ensure the repository root is in sys.path for imports."""
-    repo_root = Path(__file__).resolve().parents[3]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    try:
+        if importlib.util.find_spec("ins_pricing") is not None:
+            return
+    except Exception:
+        pass
+    ensure_repo_root()

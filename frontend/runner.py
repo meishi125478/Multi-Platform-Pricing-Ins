@@ -4,6 +4,7 @@ Executes model training, explanation, plotting, and other tasks based on config.
 """
 
 import sys
+import os
 import threading
 import queue
 import time
@@ -13,6 +14,18 @@ from pathlib import Path
 from typing import Generator, Optional, Dict, Any, List, Sequence, Tuple
 import logging
 
+from ins_pricing.utils import get_logger, log_print
+
+_logger = get_logger("ins_pricing.frontend.runner")
+_logger.propagate = False
+if not _logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(_handler)
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
 
 class LogCapture:
     """Capture stdout and stderr for real-time display."""
@@ -45,6 +58,7 @@ class TaskRunner:
     def __init__(self):
         self.task_thread = None
         self.log_capture = None
+        self._proc: Optional[subprocess.Popen] = None
 
     def _detect_task_mode(self, config_path: str) -> str:
         """
@@ -65,98 +79,14 @@ class TaskRunner:
             return str(mode).lower()
 
         except Exception as e:
-            print(f"Warning: Could not detect task mode, defaulting to 'entry': {e}")
+            _log(f"Warning: Could not detect task mode, defaulting to 'entry': {e}")
             return 'entry'
 
     def _build_cmd_from_config(self, config_path: str) -> Tuple[List[str], str]:
-        """
-        Build the command to execute based on config.runner.mode, mirroring
-        ins_pricing.cli.utils.notebook_utils.run_from_config behavior.
-        """
-        from ins_pricing.cli.utils.cli_config import set_env
-        from ins_pricing.cli.utils.notebook_utils import (
-            build_bayesopt_entry_cmd,
-            build_incremental_cmd,
-            build_explain_cmd,
-            wrap_with_watchdog,
-        )
+        """Build the command to execute based on config.runner.mode."""
+        from ins_pricing.cli.utils.notebook_utils import build_cmd_from_config
 
-        cfg_path = Path(config_path).resolve()
-        raw = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
-        set_env(raw.get("env", {}))
-        runner = dict(raw.get("runner") or {})
-
-        mode = str(runner.get("mode") or "entry").strip().lower()
-        use_watchdog = bool(runner.get("use_watchdog", False))
-        if mode == "watchdog":
-            use_watchdog = True
-            mode = "entry"
-
-        idle_seconds = int(runner.get("idle_seconds", 7200))
-        max_restarts = int(runner.get("max_restarts", 50))
-        restart_delay_seconds = int(runner.get("restart_delay_seconds", 10))
-
-        if mode == "incremental":
-            inc_args = runner.get("incremental_args") or []
-            if not isinstance(inc_args, list):
-                raise ValueError("config.runner.incremental_args must be a list of strings.")
-            cmd = build_incremental_cmd(cfg_path, extra_args=[str(x) for x in inc_args])
-            if use_watchdog:
-                cmd = wrap_with_watchdog(
-                    cmd,
-                    idle_seconds=idle_seconds,
-                    max_restarts=max_restarts,
-                    restart_delay_seconds=restart_delay_seconds,
-                )
-            return cmd, "incremental"
-
-        if mode == "explain":
-            exp_args = runner.get("explain_args") or []
-            if not isinstance(exp_args, list):
-                raise ValueError("config.runner.explain_args must be a list of strings.")
-            cmd = build_explain_cmd(cfg_path, extra_args=[str(x) for x in exp_args])
-            if use_watchdog:
-                cmd = wrap_with_watchdog(
-                    cmd,
-                    idle_seconds=idle_seconds,
-                    max_restarts=max_restarts,
-                    restart_delay_seconds=restart_delay_seconds,
-                )
-            return cmd, "explain"
-
-        if mode != "entry":
-            raise ValueError(
-                f"Unsupported runner.mode={mode!r}, expected 'entry', 'incremental', or 'explain'."
-            )
-
-        model_keys = runner.get("model_keys") or raw.get("model_keys") or ["ft"]
-        if not isinstance(model_keys, list):
-            raise ValueError("runner.model_keys must be a list of strings.")
-        nproc_per_node = int(runner.get("nproc_per_node", 1))
-        max_evals = int(runner.get("max_evals", raw.get("max_evals", 50)))
-        plot_curves = bool(runner.get("plot_curves", raw.get("plot_curves", True)))
-        ft_role = runner.get("ft_role", raw.get("ft_role"))
-
-        extra_args: List[str] = ["--max-evals", str(max_evals)]
-        if plot_curves:
-            extra_args.append("--plot-curves")
-        if ft_role:
-            extra_args += ["--ft-role", str(ft_role)]
-
-        cmd = build_bayesopt_entry_cmd(
-            cfg_path,
-            model_keys=[str(x) for x in model_keys],
-            nproc_per_node=nproc_per_node,
-            extra_args=extra_args,
-        )
-        if use_watchdog:
-            cmd = wrap_with_watchdog(
-                cmd,
-                idle_seconds=idle_seconds,
-                max_restarts=max_restarts,
-                restart_delay_seconds=restart_delay_seconds,
-            )
-        return cmd, "entry"
+        return build_cmd_from_config(config_path)
 
     def run_task(self, config_path: str) -> Generator[str, None, None]:
         """
@@ -202,8 +132,8 @@ class TaskRunner:
 
                     # Log start
                     cmd, task_mode = self._build_cmd_from_config(config_path)
-                    print(f"Starting task [{task_mode}] with config: {config_path}")
-                    print("=" * 80)
+                    _log(f"Starting task [{task_mode}] with config: {config_path}")
+                    _log("=" * 80)
 
                     # Run subprocess with streamed output
                     proc = subprocess.Popen(
@@ -214,23 +144,25 @@ class TaskRunner:
                         bufsize=1,
                         cwd=str(Path(config_path).resolve().parent),
                     )
+                    self._proc = proc
                     if proc.stdout is not None:
                         for line in proc.stdout:
-                            print(line.rstrip())
+                            _log(line.rstrip())
                     return_code = proc.wait()
                     if return_code != 0:
                         raise RuntimeError(f"Task exited with code {return_code}")
 
-                    print("=" * 80)
-                    print(f"Task [{task_mode}] completed successfully!")
+                    _log("=" * 80)
+                    _log(f"Task [{task_mode}] completed successfully!")
 
                 except Exception as e:
                     exception_holder.append(e)
-                    print(f"Error during task execution: {str(e)}")
+                    _log(f"Error during task execution: {str(e)}")
                     import traceback
-                    print(traceback.format_exc())
+                    _log(traceback.format_exc())
 
                 finally:
+                    self._proc = None
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
 
@@ -294,9 +226,9 @@ class TaskRunner:
                     func(*args, **kwargs)
                 except Exception as e:
                     exception_holder.append(e)
-                    print(f"Error during task execution: {str(e)}")
+                    _log(f"Error during task execution: {str(e)}")
                     import traceback
-                    print(traceback.format_exc())
+                    _log(traceback.format_exc())
                 finally:
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
@@ -329,9 +261,29 @@ class TaskRunner:
         if self.log_capture:
             self.log_capture.stop_flag.set()
 
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
         if self.task_thread and self.task_thread.is_alive():
-            # Note: Thread.join() will wait for completion
-            # For forceful termination, you may need to use process-based approach
             self.task_thread.join(timeout=5)
 
 

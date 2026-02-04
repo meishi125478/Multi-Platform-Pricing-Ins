@@ -19,7 +19,7 @@ from ins_pricing.modelling.plotting import (
     plot_oneway,
 )
 from ins_pricing.modelling.plotting.common import finalize_figure, plt
-from ins_pricing.production.predict import load_predictor_from_config
+from ins_pricing.production.inference import load_predictor_from_config
 
 
 def _parse_csv_list(value: str) -> List[str]:

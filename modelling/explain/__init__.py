@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .gradients import (
+from ins_pricing.modelling.explain.gradients import (
     ft_integrated_gradients,
     gradient_x_input_torch,
     integrated_gradients_multi_input_torch,
@@ -8,7 +8,7 @@ from .gradients import (
     resnet_integrated_gradients,
     summarize_attributions,
 )
-from .metrics import (
+from ins_pricing.modelling.explain.metrics import (
     auc_score,
     logloss,
     mae,
@@ -20,8 +20,8 @@ from .metrics import (
     tweedie_deviance,
     resolve_metric,
 )
-from .permutation import permutation_importance
-from .shap_utils import (
+from ins_pricing.modelling.explain.permutation import permutation_importance
+from ins_pricing.modelling.explain.shap_utils import (
     compute_shap_core,
     compute_shap_ft,
     compute_shap_glm,

@@ -4,7 +4,7 @@ This directory contains reusable training tooling and frameworks centered on Bay
 
 ## Key locations
 
-- `core/bayesopt/` - core training/tuning package
+- `bayesopt/` - core training/tuning package
 - `explain/` - explainability helpers
 - `plotting/` - plotting utilities
 - `ins_pricing/cli/` - CLI entry points

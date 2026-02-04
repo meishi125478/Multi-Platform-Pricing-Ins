@@ -7,37 +7,79 @@ import types
 
 # Keep imports lazy to avoid hard dependencies when only using lightweight modules.
 
-__all__ = [
-    "BayesOptConfig",
-    "BayesOptModel",
-    "IOUtils",
-    "TrainingUtils",
-    "free_cuda",
-    "bayesopt",
-    "plotting",
-    "explain",
-]
+__all__ = sorted(
+    {
+        "BayesOptConfig",
+        "BayesOptModel",
+        "bayesopt",
+        "plotting",
+        "explain",
+        "evaluation",
+        "cli",
+    }
+)
 
 _LAZY_ATTRS = {
-    "bayesopt": "ins_pricing.modelling.core.bayesopt",
+    "bayesopt": "ins_pricing.modelling.bayesopt",
     "plotting": "ins_pricing.modelling.plotting",
     "explain": "ins_pricing.modelling.explain",
-    "BayesOptConfig": "ins_pricing.modelling.core.bayesopt.core",
-    "BayesOptModel": "ins_pricing.modelling.core.bayesopt.core",
-    "IOUtils": "ins_pricing.modelling.core.bayesopt.utils",
-    "TrainingUtils": "ins_pricing.modelling.core.bayesopt.utils",
-    "free_cuda": "ins_pricing.modelling.core.bayesopt.utils",
+    "BayesOptConfig": "ins_pricing.modelling.bayesopt.core",
+    "BayesOptModel": "ins_pricing.modelling.bayesopt.core",
 }
 
+_BAYESOPT_EXPORTS = {
+    "BayesOptConfig",
+    "DatasetPreprocessor",
+    "OutputManager",
+    "VersionManager",
+    "BayesOptModel",
+    "FeatureTokenizer",
+    "FTTransformerCore",
+    "FTTransformerSklearn",
+    "GraphNeuralNetSklearn",
+    "MaskedTabularDataset",
+    "ResBlock",
+    "ResNetSequential",
+    "ResNetSklearn",
+    "ScaledTransformerEncoderLayer",
+    "SimpleGraphLayer",
+    "SimpleGNN",
+    "TabularDataset",
+    "FTTrainer",
+    "GLMTrainer",
+    "GNNTrainer",
+    "ResNetTrainer",
+    "TrainerBase",
+    "XGBTrainer",
+    "_xgb_cuda_available",
+}
+
+_LEGACY_EXPORTS = {
+    "IOUtils": "ins_pricing.utils",
+    "DeviceManager": "ins_pricing.utils",
+    "GPUMemoryManager": "ins_pricing.utils",
+    "MetricFactory": "ins_pricing.utils",
+    "EPS": "ins_pricing.utils",
+    "set_global_seed": "ins_pricing.utils",
+    "compute_batch_size": "ins_pricing.utils",
+    "tweedie_loss": "ins_pricing.utils",
+    "infer_factor_and_cate_list": "ins_pricing.utils",
+    "DistributedUtils": "ins_pricing.modelling.bayesopt.utils",
+    "TrainingUtils": "ins_pricing.modelling.bayesopt.utils",
+    "free_cuda": "ins_pricing.modelling.bayesopt.utils",
+    "TorchTrainerMixin": "ins_pricing.modelling.bayesopt.utils",
+}
+
+__all__ = sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(_LEGACY_EXPORTS))
+
 _LAZY_SUBMODULES = {
-    "bayesopt": "ins_pricing.modelling.core.bayesopt",
-    "BayesOpt": "ins_pricing.modelling.core.BayesOpt",
-    "evaluation": "ins_pricing.modelling.core.evaluation",
+    "bayesopt": "ins_pricing.modelling.bayesopt",
+    "evaluation": "ins_pricing.modelling.evaluation",
     "cli": "ins_pricing.cli",
 }
 
 _PACKAGE_PATHS = {
-    "bayesopt": Path(__file__).resolve().parent / "core" / "bayesopt",
+    "bayesopt": Path(__file__).resolve().parent / "bayesopt",
     "cli": Path(__file__).resolve().parents[1] / "cli",
 }
 
@@ -80,16 +122,29 @@ for _alias, _target in _LAZY_SUBMODULES.items():
 
 def __getattr__(name: str):
     target = _LAZY_ATTRS.get(name)
-    if not target:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = import_module(target)
-    if name in {"bayesopt", "plotting", "explain"}:
-        value = module
-    else:
+    if target:
+        module = import_module(target)
+        if name in {"bayesopt", "plotting", "explain"}:
+            value = module
+        else:
+            value = getattr(module, name)
+        globals()[name] = value
+        return value
+
+    if name in _BAYESOPT_EXPORTS:
+        module = import_module("ins_pricing.modelling.bayesopt")
         value = getattr(module, name)
-    globals()[name] = value
-    return value
+        globals()[name] = value
+        return value
+
+    legacy_module = _LEGACY_EXPORTS.get(name)
+    if legacy_module:
+        module = import_module(legacy_module)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(__all__) | set(globals().keys()))
+    return sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(_LEGACY_EXPORTS) | set(globals().keys()))

@@ -148,6 +148,17 @@ class ConfigBuilder:
         max_evals: int = 50,
         xgb_max_depth_max: int = 25,
         xgb_n_estimators_max: int = 500,
+        xgb_gpu_id: Optional[int] = None,
+        xgb_cleanup_per_fold: bool = False,
+        xgb_cleanup_synchronize: bool = False,
+        xgb_use_dmatrix: bool = True,
+        ft_cleanup_per_fold: bool = False,
+        ft_cleanup_synchronize: bool = False,
+        resn_cleanup_per_fold: bool = False,
+        resn_cleanup_synchronize: bool = False,
+        gnn_cleanup_per_fold: bool = False,
+        gnn_cleanup_synchronize: bool = False,
+        optuna_cleanup_synchronize: bool = False,
         nproc_per_node: int = 2,
     ) -> Dict[str, Any]:
         """
@@ -174,6 +185,17 @@ class ConfigBuilder:
             max_evals: Maximum number of evaluations for optimization
             xgb_max_depth_max: Maximum depth for XGBoost
             xgb_n_estimators_max: Maximum estimators for XGBoost
+            xgb_gpu_id: XGBoost GPU device id (None = default)
+            xgb_cleanup_per_fold: Cleanup GPU memory per XGBoost fold
+            xgb_cleanup_synchronize: Synchronize CUDA during XGBoost cleanup
+            xgb_use_dmatrix: Use xgb.train with DMatrix/QuantileDMatrix
+            ft_cleanup_per_fold: Cleanup GPU memory per FT fold
+            ft_cleanup_synchronize: Synchronize CUDA during FT cleanup
+            resn_cleanup_per_fold: Cleanup GPU memory per ResNet fold
+            resn_cleanup_synchronize: Synchronize CUDA during ResNet cleanup
+            gnn_cleanup_per_fold: Cleanup GPU memory per GNN fold
+            gnn_cleanup_synchronize: Synchronize CUDA during GNN cleanup
+            optuna_cleanup_synchronize: Synchronize CUDA during Optuna cleanup
             nproc_per_node: Number of processes per node
 
         Returns:
@@ -204,6 +226,17 @@ class ConfigBuilder:
             "use_gpu": use_gpu,
             "xgb_max_depth_max": xgb_max_depth_max,
             "xgb_n_estimators_max": xgb_n_estimators_max,
+            "xgb_gpu_id": xgb_gpu_id,
+            "xgb_cleanup_per_fold": xgb_cleanup_per_fold,
+            "xgb_cleanup_synchronize": xgb_cleanup_synchronize,
+            "xgb_use_dmatrix": xgb_use_dmatrix,
+            "ft_cleanup_per_fold": ft_cleanup_per_fold,
+            "ft_cleanup_synchronize": ft_cleanup_synchronize,
+            "resn_cleanup_per_fold": resn_cleanup_per_fold,
+            "resn_cleanup_synchronize": resn_cleanup_synchronize,
+            "gnn_cleanup_per_fold": gnn_cleanup_per_fold,
+            "gnn_cleanup_synchronize": gnn_cleanup_synchronize,
+            "optuna_cleanup_synchronize": optuna_cleanup_synchronize,
             "optuna_storage": f"{output_dir}/optuna/bayesopt.sqlite3",
             "stack_model_keys": model_keys,
         })

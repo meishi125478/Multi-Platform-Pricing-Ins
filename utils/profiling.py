@@ -18,6 +18,10 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
+from ins_pricing.utils import get_logger
+
+_logger = get_logger("ins_pricing.utils.profiling")
+
 try:
     import psutil
     HAS_PSUTIL = True
@@ -96,7 +100,7 @@ def profile_section(
         if logger:
             logger.log(log_level, msg)
         else:
-            print(msg)
+            _logger.log(log_level, msg)
 
 
 def get_memory_info() -> dict:
@@ -250,7 +254,7 @@ def cleanup_memory(logger: Optional[logging.Logger] = None) -> None:
     if logger:
         logger.info(msg)
     else:
-        print(msg)
+        _logger.info(msg)
 
 
 class MemoryMonitor:
@@ -301,7 +305,7 @@ class MemoryMonitor:
         if self.logger:
             self.logger.info(msg)
         else:
-            print(msg)
+            _logger.info(msg)
 
         return self
 
@@ -323,7 +327,7 @@ class MemoryMonitor:
         if self.logger:
             self.logger.info(msg)
         else:
-            print(msg)
+            _logger.info(msg)
 
         # Check threshold and cleanup if needed
         if self.threshold_gb is not None:

@@ -166,7 +166,7 @@ def split_train_test(
 def _load_cli_config():
     """Load the cli_config module."""
     try:
-        from . import cli_config as _cli_config
+        from ins_pricing.cli.utils import cli_config as _cli_config
     except Exception:
         import cli_config as _cli_config
     return _cli_config

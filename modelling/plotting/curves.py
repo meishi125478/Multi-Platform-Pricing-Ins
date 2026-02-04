@@ -5,7 +5,7 @@ from typing import Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .common import EPS, PlotStyle, finalize_figure, plt
+from ins_pricing.modelling.plotting.common import EPS, PlotStyle, finalize_figure, plt
 
 try:  # optional dependency guard
     from sklearn.metrics import (

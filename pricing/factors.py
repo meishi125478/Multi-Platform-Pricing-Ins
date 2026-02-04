@@ -1,43 +1,46 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from collections import OrderedDict
+import hashlib
 from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-@lru_cache(maxsize=128)
-def _compute_bins_cached(
-    data_hash: int,
-    n_bins: int,
-    method: str,
-    min_val: float,
-    max_val: float,
-    n_unique: int
-) -> Tuple[tuple, int]:
-    """Cache bin edge computation based on data characteristics.
+_BIN_CACHE_MAXSIZE = 128
+_BIN_CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_BIN_CACHE_HITS = 0
+_BIN_CACHE_MISSES = 0
 
-    Args:
-        data_hash: Hash of sorted unique values for cache key
-        n_bins: Number of bins to create
-        method: Binning method ('quantile' or 'uniform')
-        min_val: Minimum value in data
-        max_val: Maximum value in data
-        n_unique: Number of unique values
 
-    Returns:
-        Tuple of (bin_edges_tuple, actual_bins)
+def _cache_key(series: pd.Series, n_bins: int, method: str) -> Optional[tuple]:
+    try:
+        values = series.dropna().to_numpy(dtype=float, copy=False)
+        if values.size == 0:
+            return None
+        values = np.sort(values)
+        digest = hashlib.blake2b(values.tobytes(), digest_size=16).hexdigest()
+        return (digest, int(values.size), int(n_bins), str(method))
+    except Exception:
+        return None
 
-    Note:
-        This function caches bin computation for identical data distributions.
-        The cache key includes data_hash to ensure correctness while enabling
-        reuse when the same column is binned multiple times.
-    """
-    # This function is called after validation, so we can safely compute
-    # The actual binning is done in the calling function
-    # This just provides a cache key mechanism
-    return (data_hash, n_bins, method, min_val, max_val, n_unique), n_bins
+
+def _cache_get(key: tuple) -> Optional[np.ndarray]:
+    global _BIN_CACHE_HITS, _BIN_CACHE_MISSES
+    if key in _BIN_CACHE:
+        _BIN_CACHE_HITS += 1
+        _BIN_CACHE.move_to_end(key)
+        return _BIN_CACHE[key].copy()
+    _BIN_CACHE_MISSES += 1
+    return None
+
+
+def _cache_set(key: tuple, edges: np.ndarray) -> None:
+    _BIN_CACHE[key] = np.asarray(edges, dtype=float)
+    _BIN_CACHE.move_to_end(key)
+    if len(_BIN_CACHE) > _BIN_CACHE_MAXSIZE:
+        _BIN_CACHE.popitem(last=False)
 
 
 def bin_numeric(
@@ -66,34 +69,40 @@ def bin_numeric(
         When use_cache=True, identical distributions will reuse cached bin edges,
         improving performance when the same column is binned multiple times.
     """
-    # Create cache key from data characteristics if caching enabled
-    if use_cache:
-        # Compute data characteristics for cache key
-        unique_vals = series.dropna().unique()
-        unique_sorted = np.sort(unique_vals)
-        data_hash = hash(unique_sorted.tobytes())
-        min_val = float(series.min())
-        max_val = float(series.max())
-        n_unique = len(unique_vals)
+    cache_key = _cache_key(series, bins, method) if use_cache else None
+    bin_edges_full: Optional[np.ndarray] = None
 
-        # Check cache (the function call acts as cache lookup)
-        try:
-            _compute_bins_cached(data_hash, bins, method, min_val, max_val, n_unique)
-        except Exception:
-            # If hashing fails, proceed without cache
-            pass
+    if cache_key is not None:
+        bin_edges_full = _cache_get(cache_key)
+
+    if bin_edges_full is not None:
+        binned = pd.cut(series, bins=bin_edges_full, include_lowest=True, labels=labels)
+        return binned, np.asarray(bin_edges_full[:-1], dtype=float)
 
     # Perform actual binning
     if method == "quantile":
-        binned = pd.qcut(series, q=bins, duplicates="drop", labels=labels)
-        bin_edges = binned.cat.categories.left.to_numpy()
+        binned, bin_edges_full = pd.qcut(
+            series,
+            q=bins,
+            duplicates="drop",
+            labels=labels,
+            retbins=True,
+        )
     elif method == "uniform":
-        binned = pd.cut(series, bins=bins, include_lowest=include_lowest, labels=labels)
-        bin_edges = binned.cat.categories.left.to_numpy()
+        binned, bin_edges_full = pd.cut(
+            series,
+            bins=bins,
+            include_lowest=include_lowest,
+            labels=labels,
+            retbins=True,
+        )
     else:
         raise ValueError("method must be one of: quantile, uniform.")
 
-    return binned, bin_edges
+    if cache_key is not None and bin_edges_full is not None:
+        _cache_set(cache_key, np.asarray(bin_edges_full, dtype=float))
+
+    return binned, np.asarray(bin_edges_full[:-1], dtype=float)
 
 
 def clear_binning_cache() -> None:
@@ -108,7 +117,10 @@ def clear_binning_cache() -> None:
         >>> # After processing many different columns
         >>> clear_binning_cache()
     """
-    _compute_bins_cached.cache_clear()
+    global _BIN_CACHE_HITS, _BIN_CACHE_MISSES
+    _BIN_CACHE.clear()
+    _BIN_CACHE_HITS = 0
+    _BIN_CACHE_MISSES = 0
 
 
 def get_cache_info() -> dict:
@@ -126,12 +138,11 @@ def get_cache_info() -> dict:
         >>> info = get_cache_info()
         >>> print(f"Cache hit rate: {info['hits'] / (info['hits'] + info['misses']):.2%}")
     """
-    cache_info = _compute_bins_cached.cache_info()
     return {
-        'hits': cache_info.hits,
-        'misses': cache_info.misses,
-        'maxsize': cache_info.maxsize,
-        'currsize': cache_info.currsize
+        "hits": _BIN_CACHE_HITS,
+        "misses": _BIN_CACHE_MISSES,
+        "maxsize": _BIN_CACHE_MAXSIZE,
+        "currsize": len(_BIN_CACHE),
     }
 
 

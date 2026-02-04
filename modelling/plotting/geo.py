@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.tri as mtri
 
-from .common import EPS, PlotStyle, finalize_figure, plt
+from ins_pricing.modelling.plotting.common import EPS, PlotStyle, finalize_figure, plt
 
 try:  # optional map basemap support
     import contextily as cx

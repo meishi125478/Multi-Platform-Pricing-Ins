@@ -1,9 +1,9 @@
 """Device management utilities for PyTorch models.
 
 This module consolidates GPU/CPU device management logic from:
-- modelling/core/bayesopt/utils.py
-- modelling/core/bayesopt/trainers/trainer_base.py
-- production/predict.py
+- modelling/bayesopt/utils.py
+- modelling/bayesopt/trainers/trainer_base.py
+- production/inference.py
 
 Example:
     >>> from ins_pricing.utils import DeviceManager, GPUMemoryManager
@@ -32,7 +32,7 @@ except ImportError:
     nn = None
     DDP = None
 
-from .logging import get_logger
+from ins_pricing.utils.logging import get_logger
 
 
 # =============================================================================
@@ -58,19 +58,34 @@ class GPUMemoryManager:
     _logger = get_logger("ins_pricing.gpu")
 
     @classmethod
-    def clean(cls, verbose: bool = False) -> None:
+    def clean(
+        cls,
+        verbose: bool = False,
+        *,
+        synchronize: bool = True,
+        empty_cache: bool = True,
+    ) -> None:
         """Clean up GPU memory.
 
         Args:
             verbose: If True, log cleanup details
+            synchronize: If True, synchronize CUDA device after cleanup
+            empty_cache: If True, clear CUDA cache
         """
         gc.collect()
 
         if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            if empty_cache:
+                torch.cuda.empty_cache()
+            if synchronize:
+                torch.cuda.synchronize()
             if verbose:
-                cls._logger.debug("CUDA cache cleared and synchronized")
+                if empty_cache and synchronize:
+                    cls._logger.debug("CUDA cache cleared and synchronized")
+                elif empty_cache:
+                    cls._logger.debug("CUDA cache cleared")
+                elif synchronize:
+                    cls._logger.debug("CUDA synchronized")
 
             # Optional: Force IPC collect for multi-process scenarios
             if os.environ.get("BAYESOPT_CUDA_IPC_COLLECT", "0") == "1":
@@ -83,7 +98,13 @@ class GPUMemoryManager:
 
     @classmethod
     @contextmanager
-    def cleanup_context(cls, verbose: bool = False):
+    def cleanup_context(
+        cls,
+        verbose: bool = False,
+        *,
+        synchronize: bool = True,
+        empty_cache: bool = True,
+    ):
         """Context manager that cleans GPU memory on exit.
 
         Args:
@@ -95,7 +116,7 @@ class GPUMemoryManager:
         try:
             yield
         finally:
-            cls.clean(verbose=verbose)
+            cls.clean(verbose=verbose, synchronize=synchronize, empty_cache=empty_cache)
 
     @classmethod
     def move_model_to_cpu(cls, model: Any) -> Any:
