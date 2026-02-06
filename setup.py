@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="ins_pricing",
-    version="0.5.4",
+    version="0.5.5",
     description="Reusable modelling, pricing, governance, and reporting utilities.",
     author="meishi125478",
     license="Proprietary",
@@ -43,6 +43,10 @@ setup(
             "pynndescent>=0.5",
             "torch-geometric>=2.3",
         ],
+        "frontend": [
+            "gradio>=4,<5",
+            "huggingface_hub<0.24",
+        ],
         "all": [
             "torch>=1.13",
             "optuna>=3.0",
@@ -55,6 +59,8 @@ setup(
             "contextily>=1.3",
             "pynndescent>=0.5",
             "torch-geometric>=2.3",
+            "gradio>=4,<5",
+            "huggingface_hub<0.24",
         ],
     },
     include_package_data=True,

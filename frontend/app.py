@@ -48,8 +48,6 @@ os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "False")
 os.environ.setdefault("GRADIO_CHECK_VERSION", "False")
 os.environ.setdefault("GRADIO_VERSION_CHECK", "False")
 
-import gradio as gr
-
 
 
 
@@ -498,6 +496,9 @@ class PricingApp:
 
 def create_ui():
     """Create the Gradio interface."""
+    _check_frontend_deps()
+    import gradio as gr
+
     app = PricingApp()
 
     with gr.Blocks(title="Insurance Pricing Model Training", theme=gr.themes.Soft()) as demo:
@@ -677,7 +678,7 @@ def create_ui():
                 """
                 ### FT-Transformer Two-Step Training
 
-                Automates the FT → XGB/ResN workflow:
+                Automates the FT -> XGB/ResN workflow:
                 1. **Step 1**: Train FT-Transformer as unsupervised embedding generator
                 2. **Step 2**: Merge embeddings with raw data and train XGB/ResN
 

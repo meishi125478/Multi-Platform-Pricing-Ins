@@ -17,11 +17,6 @@ import logging
 from ins_pricing.utils import get_logger, log_print
 
 _logger = get_logger("ins_pricing.frontend.runner")
-_logger.propagate = False
-if not _logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(message)s"))
-    _logger.addHandler(_handler)
 
 
 def _log(*args, **kwargs) -> None:
@@ -319,22 +314,7 @@ def setup_logger(name: str = "task") -> logging.Logger:
     Returns:
         Configured logger instance
     """
-    logger = logging.getLogger(name)
+    logger_name = name if "." in name else f"ins_pricing.frontend.{name}"
+    logger = get_logger(logger_name)
     logger.setLevel(logging.INFO)
-
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console_handler.setFormatter(formatter)
-
-    # Add handler to logger
-    if not logger.handlers:
-        logger.addHandler(console_handler)
-
     return logger

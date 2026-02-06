@@ -39,6 +39,13 @@ between modelling, production, governance, and reporting.
 6. Reporting
    - `from ins_pricing.reporting import build_report, write_report, schedule_daily`
 
+## Loss and distribution docs
+
+- Model-level mapping and priority rules:
+  `ins_pricing/modelling/README.md`
+- BayesOpt detailed mapping table and examples:
+  `ins_pricing/modelling/bayesopt/README.md`
+
 ## Import notes
 
 - `ins_pricing` exposes lightweight lazy imports so that pricing/production/governance

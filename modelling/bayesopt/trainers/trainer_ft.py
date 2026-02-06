@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
 import pandas as pd
 from sklearn.metrics import log_loss
-from sklearn.model_selection import GroupKFold, TimeSeriesSplit
+from sklearn.model_selection import GroupKFold, KFold, TimeSeriesSplit
 
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
+from ins_pricing.modelling.bayesopt.trainers.cv_utils import _OrderSplitter
 from ins_pricing.modelling.bayesopt.models import FTTransformerSklearn
 from ins_pricing.utils.losses import regression_loss
 from ins_pricing.utils import get_logger, log_print
@@ -27,7 +28,7 @@ class FTTrainer(TrainerBase):
         else:
             super().__init__(context, 'FTTransformer', 'FTTransformer')
         self.model: Optional[FTTransformerSklearn] = None
-        self.enable_distributed_optuna = bool(context.config.use_ft_ddp)
+        self.enable_distributed_optuna = bool(context.config.use_ft_ddp and context.use_gpu)
         self._cv_geo_warned = False
 
     def _maybe_cleanup_gpu(self, model: Optional[FTTransformerSklearn]) -> None:
@@ -179,8 +180,10 @@ class FTTrainer(TrainerBase):
             weight_decay=float(params.get("weight_decay", 0.0)),
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
+            use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=num_numeric_tokens,
             loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         model = self._apply_dataloader_overrides(model)
         model.set_params(model_params)
@@ -282,8 +285,10 @@ class FTTrainer(TrainerBase):
                 weight_decay=float(params.get("weight_decay", 0.0)),
                 use_data_parallel=self.ctx.config.use_ft_data_parallel,
                 use_ddp=self.ctx.config.use_ft_ddp,
+                use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=num_numeric_tokens,
                 loss_name=loss_name,
+                distribution=getattr(self.ctx, "distribution", None),
             )
             model = self._apply_dataloader_overrides(model)
             model.set_params({"_geo_params": geo_params_local}
@@ -372,9 +377,11 @@ class FTTrainer(TrainerBase):
                 task_type=self.ctx.task_type,
                 use_data_parallel=self.ctx.config.use_ft_data_parallel,
                 use_ddp=self.ctx.config.use_ft_ddp,
+                use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
                 loss_name=loss_name,
+                distribution=getattr(self.ctx, "distribution", None),
             )
             tmp_model = self._apply_dataloader_overrides(tmp_model)
             tmp_model.set_params(resolved_params)
@@ -405,9 +412,11 @@ class FTTrainer(TrainerBase):
             task_type=self.ctx.task_type,
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
+            use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             weight_decay=float(resolved_params.get("weight_decay", 0.0)),
             loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         self.model = self._apply_dataloader_overrides(self.model)
         if refit_epochs is not None:
@@ -480,9 +489,11 @@ class FTTrainer(TrainerBase):
                 task_type=self.ctx.task_type,
                 use_data_parallel=self.ctx.config.use_ft_data_parallel,
                 use_ddp=self.ctx.config.use_ft_ddp,
+                use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
                 loss_name=loss_name,
+                distribution=getattr(self.ctx, "distribution", None),
             )
             model = self._apply_dataloader_overrides(model)
             model.set_params(resolved_params)
@@ -592,8 +603,10 @@ class FTTrainer(TrainerBase):
             task_type=self.ctx.task_type,
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
+            use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         model = self._apply_dataloader_overrides(model)
         adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
@@ -757,8 +770,10 @@ class FTTrainer(TrainerBase):
             task_type=self.ctx.task_type,
             use_data_parallel=self.ctx.config.use_ft_data_parallel,
             use_ddp=self.ctx.config.use_ft_ddp,
+            use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         self.model = self._apply_dataloader_overrides(self.model)
         resolved_params = dict(params or {})

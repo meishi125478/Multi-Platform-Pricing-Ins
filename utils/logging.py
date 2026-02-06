@@ -20,19 +20,49 @@ import os
 from functools import lru_cache
 from typing import Optional, Union
 
+_DEFAULT_HANDLER_FLAG = "_ins_pricing_default_handler"
+
 
 @lru_cache(maxsize=1)
 def _get_package_logger() -> logging.Logger:
-    """Get or create the package-level logger with consistent formatting."""
-    logger = logging.getLogger("ins_pricing")
-    if not logger.handlers:
+    """Get the package-level logger."""
+    return logging.getLogger("ins_pricing")
+
+
+def _sync_package_logger(logger: logging.Logger) -> None:
+    """Sync package logger handlers with root logger configuration.
+
+    Behavior:
+    - If root logger is configured, remove the package default handler so logs
+      flow to root only (single timestamped line).
+    - If root logger is not configured, attach package default handler as
+      fallback so logs remain visible.
+    """
+    level = os.environ.get("INS_PRICING_LOG_LEVEL", "INFO").upper()
+    logger.setLevel(getattr(logging, level, logging.INFO))
+    root_has_handlers = bool(logging.getLogger().handlers)
+
+    if root_has_handlers:
+        for handler in list(logger.handlers):
+            if getattr(handler, _DEFAULT_HANDLER_FLAG, False):
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+        logger.propagate = True
+        return
+
+    has_default_handler = any(
+        getattr(handler, _DEFAULT_HANDLER_FLAG, False) for handler in logger.handlers
+    )
+    if not has_default_handler:
         handler = logging.StreamHandler()
+        setattr(handler, _DEFAULT_HANDLER_FLAG, True)
         formatter = logging.Formatter("[%(levelname)s][%(name)s] %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-        level = os.environ.get("INS_PRICING_LOG_LEVEL", "INFO").upper()
-        logger.setLevel(getattr(logging, level, logging.INFO))
-    return logger
+    logger.propagate = False
 
 
 def get_logger(name: str = "ins_pricing") -> logging.Logger:
@@ -48,7 +78,7 @@ def get_logger(name: str = "ins_pricing") -> logging.Logger:
         >>> logger = get_logger("ins_pricing.trainer.ft")
         >>> logger.info("Training started")
     """
-    _get_package_logger()
+    _sync_package_logger(_get_package_logger())
     return logging.getLogger(name)
 
 
@@ -63,6 +93,7 @@ def configure_logging(
         format_string: Custom format string for log messages
     """
     logger = _get_package_logger()
+    _sync_package_logger(logger)
 
     if level is not None:
         log_level = getattr(logging, level.upper(), logging.INFO)

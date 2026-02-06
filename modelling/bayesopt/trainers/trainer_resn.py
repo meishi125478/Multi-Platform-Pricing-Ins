@@ -5,13 +5,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
-import torch
 from sklearn.metrics import log_loss
 
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import ResNetSklearn
 from ins_pricing.utils.losses import regression_loss
 from ins_pricing.utils import get_logger, log_print
+from ins_pricing.utils.torch_compat import torch_load
 
 _logger = get_logger("ins_pricing.trainer.resn")
 
@@ -26,7 +26,7 @@ class ResNetTrainer(TrainerBase):
         else:
             super().__init__(context, 'ResNet', 'ResNet')
         self.model: Optional[ResNetSklearn] = None
-        self.enable_distributed_optuna = bool(context.config.use_resn_ddp)
+        self.enable_distributed_optuna = bool(context.config.use_resn_ddp and context.use_gpu)
 
     def _maybe_cleanup_gpu(self, model: Optional[ResNetSklearn]) -> None:
         if not bool(getattr(self.ctx.config, "resn_cleanup_per_fold", False)):
@@ -78,7 +78,9 @@ class ResNetTrainer(TrainerBase):
             weight_decay=resn_weight_decay,
             use_data_parallel=self.ctx.config.use_resn_data_parallel,
             use_ddp=self.ctx.config.use_resn_ddp,
-            loss_name=loss_name
+            use_gpu=self.ctx.use_gpu,
+            loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         return self._apply_dataloader_overrides(model)
 
@@ -278,7 +280,7 @@ class ResNetTrainer(TrainerBase):
         # Load ResNet weights to the current device to match context.
         path = self.output.model_path(self._get_model_filename())
         if os.path.exists(path):
-            payload = torch.load(path, map_location='cpu')
+            payload = torch_load(path, map_location='cpu', weights_only=False)
             if isinstance(payload, dict) and "state_dict" in payload:
                 state_dict = payload.get("state_dict")
                 params = payload.get("best_params") or self.best_params

@@ -20,6 +20,7 @@ class ConfigBuilder:
             "data_path_template": "{model_name}.{ext}",
             "dtype_map": None,
             "binary_resp_nme": None,
+            "distribution": None,
             "split_group_col": None,
             "split_time_col": None,
             "split_time_ascending": True,
@@ -56,7 +57,7 @@ class ConfigBuilder:
             "use_gnn_data_parallel": False,
             "use_resn_ddp": True,
             "use_ft_ddp": True,
-            "use_gnn_ddp": True,
+            "use_gnn_ddp": False,
             "ddp_min_rows": 50000,
             "ft_role": "model",
             "ft_feature_prefix": "ft_emb",
@@ -136,6 +137,7 @@ class ConfigBuilder:
         feature_list: List[str],
         categorical_features: List[str],
         task_type: str = "regression",
+        distribution: Optional[str] = None,
         prop_test: float = 0.25,
         holdout_ratio: float = 0.25,
         val_ratio: float = 0.25,
@@ -173,6 +175,7 @@ class ConfigBuilder:
             feature_list: List of feature names
             categorical_features: List of categorical feature names
             task_type: Type of task (regression, binary, multiclass)
+            distribution: Optional target distribution override (e.g., poisson/gamma/tweedie/gaussian)
             prop_test: Proportion of data for testing
             holdout_ratio: Holdout ratio for validation
             val_ratio: Validation ratio
@@ -216,6 +219,7 @@ class ConfigBuilder:
             "feature_list": feature_list,
             "categorical_features": categorical_features,
             "task_type": task_type,
+            "distribution": distribution,
             "prop_test": prop_test,
             "holdout_ratio": holdout_ratio,
             "val_ratio": val_ratio,

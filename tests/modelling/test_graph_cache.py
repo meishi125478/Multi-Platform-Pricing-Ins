@@ -31,3 +31,26 @@ def test_graph_cache_meta_invalidation(tmp_path):
     X_changed = X.copy()
     X_changed.iloc[0, 0] += 1.0
     assert model._load_cached_adj(X_changed) is None
+
+
+def test_graph_cache_meta_uses_sample_rows(tmp_path):
+    X = pd.DataFrame(
+        {
+            "a": np.linspace(0.0, 1.0, 200),
+            "b": np.linspace(1.0, 2.0, 200),
+        }
+    )
+    cache_path = tmp_path / "gnn_cache_sample.pt"
+    model = GraphNeuralNetSklearn(
+        model_nme="demo",
+        input_dim=2,
+        k_neighbors=1,
+        epochs=1,
+        use_approx_knn=False,
+        graph_cache_path=str(cache_path),
+    )
+    model.graph_hash_sample_rows = 32
+    meta = model._graph_cache_meta(X)
+
+    assert meta["n_samples"] == 200
+    assert meta["hash_sample_rows"] == 32

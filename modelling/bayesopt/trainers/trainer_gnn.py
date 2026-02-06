@@ -24,7 +24,26 @@ class GNNTrainer(TrainerBase):
     def __init__(self, context: "BayesOptModel") -> None:
         super().__init__(context, 'GNN', 'GNN')
         self.model: Optional[GraphNeuralNetSklearn] = None
-        self.enable_distributed_optuna = bool(context.config.use_gnn_ddp)
+        try:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except (TypeError, ValueError):
+            world_size = 1
+        gpu_enabled = bool(context.use_gpu)
+        requested_ddp = bool(context.config.use_gnn_ddp)
+        supports_ddp = bool(getattr(GraphNeuralNetSklearn, "SUPPORTS_MULTI_PROCESS_DDP", False))
+        self._runtime_use_ddp = requested_ddp and supports_ddp and gpu_enabled
+        if requested_ddp and not gpu_enabled:
+            _log(
+                "[GNNTrainer] use_gnn_ddp=true but use_gpu=false; forcing CPU single-process mode.",
+                flush=True,
+            )
+        if requested_ddp and world_size > 1 and not supports_ddp:
+            _log(
+                "[GNNTrainer] use_gnn_ddp=true but GNN multi-process DDP is unsupported; "
+                "falling back to single-process training on rank0.",
+                flush=True,
+            )
+        self.enable_distributed_optuna = bool(self._runtime_use_ddp and world_size > 1)
 
     def _maybe_cleanup_gpu(self, model: Optional[GraphNeuralNetSklearn]) -> None:
         if not bool(getattr(self.ctx.config, "gnn_cleanup_per_fold", False)):
@@ -61,7 +80,8 @@ class GNNTrainer(TrainerBase):
             tweedie_power=tw_power,
             weight_decay=float(params.get("weight_decay", 0.0)),
             use_data_parallel=bool(self.ctx.config.use_gnn_data_parallel),
-            use_ddp=bool(self.ctx.config.use_gnn_ddp),
+            use_ddp=bool(self._runtime_use_ddp),
+            use_gpu=self.ctx.use_gpu,
             use_approx_knn=bool(self.ctx.config.gnn_use_approx_knn),
             approx_knn_threshold=int(self.ctx.config.gnn_approx_knn_threshold),
             graph_cache_path=self.ctx.config.gnn_graph_cache,
@@ -70,6 +90,7 @@ class GNNTrainer(TrainerBase):
             knn_gpu_mem_overhead=float(
                 self.ctx.config.gnn_knn_gpu_mem_overhead),
             loss_name=loss_name,
+            distribution=getattr(self.ctx, "distribution", None),
         )
         return self._apply_dataloader_overrides(model)
 

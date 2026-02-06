@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 from ins_pricing.utils.io import IOUtils
-from ins_pricing.utils.losses import normalize_loss_name
+from ins_pricing.utils.losses import normalize_distribution_name, normalize_loss_name
 from ins_pricing.exceptions import ConfigurationError, DataValidationError
 from ins_pricing.utils import get_logger, log_print
 
@@ -89,6 +89,7 @@ class BayesOptConfig:
         task_type: Either 'regression' or 'classification'
         binary_resp_nme: Column name for binary response (optional)
         cate_list: List of categorical feature column names
+        distribution: Optional target distribution override (regression)
         loss_name: Regression loss ('auto', 'tweedie', 'poisson', 'gamma', 'mse', 'mae')
         prop_test: Proportion of data for validation (0.0-1.0)
         rand_seed: Random seed for reproducibility
@@ -138,6 +139,7 @@ class BayesOptConfig:
     task_type: str = 'regression'
     binary_resp_nme: Optional[str] = None
     cate_list: Optional[List[str]] = None
+    distribution: Optional[str] = None
     loss_name: str = "auto"
 
     # Training configuration
@@ -248,6 +250,15 @@ class BayesOptConfig:
                     errors.append("dataloader_workers must be >= 0 when provided.")
             except (TypeError, ValueError):
                 errors.append("dataloader_workers must be an integer when provided.")
+        # Validate distribution
+        try:
+            normalized_distribution = normalize_distribution_name(
+                self.distribution, self.task_type
+            )
+            self.distribution = None if normalized_distribution == "auto" else normalized_distribution
+        except ValueError as exc:
+            errors.append(str(exc))
+
         # Validate loss_name
         try:
             normalized_loss = normalize_loss_name(self.loss_name, self.task_type)

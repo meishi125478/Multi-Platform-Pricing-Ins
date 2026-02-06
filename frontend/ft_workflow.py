@@ -1,6 +1,6 @@
 """
 FT-Transformer Two-Step Workflow Helper
-Automates the FT → XGB/ResN two-step training process.
+Automates the FT -> XGB/ResN two-step training process.
 """
 
 import json

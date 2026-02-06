@@ -40,6 +40,34 @@ model = BayesOptModel(train_data, test_data, config=config)
 python ins_pricing/cli/BayesOpt_entry.py --config-json config_template.json
 ```
 
+## Loss and Distribution Mapping
+
+You can configure either `loss_name`, `distribution`, or both.
+
+Resolution order:
+1. If `distribution` is set, it takes precedence and is mapped to the corresponding `loss_name`.
+2. If `distribution` is not set, use `loss_name` directly.
+3. If both are unset/`auto`, keep legacy auto behavior (infer from `model_nme`).
+
+| task_type | distribution (accepted values) | resolved loss_name | xgboost objective | tweedie power |
+| --- | --- | --- | --- | --- |
+| regression | `tweedie` | `tweedie` | `reg:tweedie` | tuned in `[1.0, 2.0]` when enabled |
+| regression | `poisson` | `poisson` | `count:poisson` | `1.0` |
+| regression | `gamma` | `gamma` | `reg:gamma` | `2.0` |
+| regression | `gaussian`, `normal`, `mse` | `mse` | `reg:squarederror` | not used |
+| regression | `laplace`, `laplacian`, `mae` | `mae` | `reg:absoluteerror` | not used |
+| classification | `bernoulli`, `binomial`, `logistic`, `binary` | `logloss` | `binary:logistic` | not used |
+
+Example:
+
+```json
+{
+  "task_type": "regression",
+  "distribution": "poisson",
+  "loss_name": "auto"
+}
+```
+
 ## FT roles
 
 - `model`: FT is a prediction model (writes `pred_ft`).

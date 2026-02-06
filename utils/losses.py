@@ -22,6 +22,47 @@ LOSS_ALIASES = {
 REGRESSION_LOSSES = {"tweedie", "poisson", "gamma", "mse", "mae"}
 CLASSIFICATION_LOSSES = {"logloss", "bce"}
 
+REGRESSION_DISTRIBUTION_TO_LOSS = {
+    "tweedie": "tweedie",
+    "poisson": "poisson",
+    "gamma": "gamma",
+    "gaussian": "mse",
+    "laplace": "mae",
+}
+CLASSIFICATION_DISTRIBUTION_TO_LOSS = {
+    "bernoulli": "logloss",
+}
+
+DISTRIBUTION_ALIASES = {
+    # Common "auto" aliases.
+    "": "auto",
+    "auto": "auto",
+    "none": "auto",
+    "infer": "auto",
+    "automatic": "auto",
+    "default": "auto",
+    # Regression distributions.
+    "normal": "gaussian",
+    "gauss": "gaussian",
+    "poisson": "poisson",
+    "gamma": "gamma",
+    "tweedie": "tweedie",
+    "compound_poisson_gamma": "tweedie",
+    "compound-poisson-gamma": "tweedie",
+    "laplacian": "laplace",
+    "double_exponential": "laplace",
+    "double-exponential": "laplace",
+    # Allow directly using supported loss names as distribution aliases.
+    "mse": "gaussian",
+    "mae": "laplace",
+    # Classification distributions.
+    "bernoulli": "bernoulli",
+    "binomial": "bernoulli",
+    "logistic": "bernoulli",
+    "classification": "bernoulli",
+    "binary": "bernoulli",
+}
+
 
 def normalize_loss_name(loss_name: Optional[str], task_type: str) -> str:
     """Normalize the loss name and validate against supported values."""
@@ -44,6 +85,38 @@ def normalize_loss_name(loss_name: Optional[str], task_type: str) -> str:
     return name
 
 
+def normalize_distribution_name(distribution_name: Optional[str], task_type: str) -> str:
+    """Normalize and validate configured distribution name."""
+    name = str(distribution_name or "auto").strip().lower()
+    if not name:
+        return "auto"
+    name = DISTRIBUTION_ALIASES.get(name, name)
+    if name == "auto":
+        return "auto"
+    if task_type == "classification":
+        if name not in CLASSIFICATION_DISTRIBUTION_TO_LOSS:
+            raise ValueError(
+                f"Unsupported classification distribution '{distribution_name}'. "
+                f"Supported: {sorted(CLASSIFICATION_DISTRIBUTION_TO_LOSS)}"
+            )
+    else:
+        if name not in REGRESSION_DISTRIBUTION_TO_LOSS:
+            raise ValueError(
+                f"Unsupported regression distribution '{distribution_name}'. "
+                f"Supported: {sorted(REGRESSION_DISTRIBUTION_TO_LOSS)}"
+            )
+    return name
+
+
+def resolve_loss_from_distribution(distribution_name: str, task_type: str) -> str:
+    """Map normalized distribution name to supported loss name."""
+    if distribution_name == "auto":
+        return "auto"
+    if task_type == "classification":
+        return CLASSIFICATION_DISTRIBUTION_TO_LOSS[distribution_name]
+    return REGRESSION_DISTRIBUTION_TO_LOSS[distribution_name]
+
+
 def infer_loss_name_from_model_name(model_name: str) -> str:
     """Preserve legacy heuristic for loss selection based on model name."""
     name = str(model_name or "")
@@ -52,6 +125,25 @@ def infer_loss_name_from_model_name(model_name: str) -> str:
     if "s" in name:
         return "gamma"
     return "tweedie"
+
+
+def resolve_effective_loss_name(
+    loss_name: Optional[str],
+    *,
+    task_type: str,
+    model_name: str = "",
+    distribution: Optional[str] = None,
+) -> str:
+    """Resolve final loss name with precedence: distribution > explicit loss > auto."""
+    normalized_distribution = normalize_distribution_name(distribution, task_type)
+    if normalized_distribution != "auto":
+        return resolve_loss_from_distribution(normalized_distribution, task_type)
+    normalized_loss = normalize_loss_name(loss_name, task_type)
+    if task_type == "classification":
+        return "logloss" if normalized_loss == "auto" else normalized_loss
+    if normalized_loss == "auto":
+        return infer_loss_name_from_model_name(model_name)
+    return normalized_loss
 
 
 def resolve_tweedie_power(loss_name: str, default: float = 1.5) -> Optional[float]:

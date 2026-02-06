@@ -7,16 +7,20 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import TensorDataset
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
+from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    resolve_training_device,
+    setup_ddp_if_requested,
+    wrap_model_for_parallel,
+)
 from ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin import TorchTrainerMixin
 from ins_pricing.utils import EPS, get_logger, log_print
 from ins_pricing.utils.losses import (
-    infer_loss_name_from_model_name,
-    normalize_loss_name,
+    normalize_distribution_name,
+    resolve_effective_loss_name,
     resolve_tweedie_power,
 )
 
@@ -154,15 +158,18 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
                  weight_decay: float = 1e-4,
                  use_data_parallel: bool = True,
                  use_ddp: bool = False,
-                 loss_name: Optional[str] = None):
+                 use_gpu: bool = True,
+                 loss_name: Optional[str] = None,
+                 distribution: Optional[str] = None):
         super(ResNetSklearn, self).__init__()
 
-        self.use_ddp = use_ddp
-        self.is_ddp_enabled, self.local_rank, self.rank, self.world_size = (
-            False, 0, 0, 1)
-
-        if self.use_ddp:
-            self.is_ddp_enabled, self.local_rank, self.rank, self.world_size = DistributedUtils.setup_ddp()
+        self.use_gpu = bool(use_gpu)
+        self.use_ddp = bool(use_ddp and self.use_gpu)
+        if use_ddp and not self.use_gpu:
+            _log(">>> ResNet DDP requested with use_gpu=false; forcing CPU single-process mode.")
+        self.is_ddp_enabled, self.local_rank, self.rank, self.world_size = setup_ddp_if_requested(
+            self.use_ddp
+        )
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -181,26 +188,25 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
         self.loss_curve_path: Optional[str] = None
         self.training_history: Dict[str, List[float]] = {
             "train": [], "val": []}
-        self.use_data_parallel = bool(use_data_parallel)
+        self.use_data_parallel = bool(use_data_parallel and self.use_gpu)
+        self.device = resolve_training_device(
+            is_ddp_enabled=self.is_ddp_enabled,
+            local_rank=self.local_rank,
+            use_gpu=self.use_gpu,
+        )
 
-        # Device selection: cuda > mps > cpu
-        if self.is_ddp_enabled:
-            self.device = torch.device(f'cuda:{self.local_rank}')
-        elif torch.cuda.is_available():
-            self.device = torch.device('cuda')
-        elif torch.backends.mps.is_available():
-            self.device = torch.device('mps')
-        else:
-            self.device = torch.device('cpu')
-
-        resolved_loss = normalize_loss_name(loss_name, self.task_type)
+        resolved_distribution = normalize_distribution_name(distribution, self.task_type)
+        self.distribution = None if resolved_distribution == "auto" else resolved_distribution
         if self.task_type == 'classification':
             self.loss_name = "logloss"
             self.tw_power = None
         else:
-            if resolved_loss == "auto":
-                resolved_loss = infer_loss_name_from_model_name(self.model_nme)
-            self.loss_name = resolved_loss
+            self.loss_name = resolve_effective_loss_name(
+                loss_name,
+                task_type=self.task_type,
+                model_name=self.model_nme,
+                distribution=self.distribution,
+            )
             if self.loss_name == "tweedie":
                 self.tw_power = float(tweedie_power) if tweedie_power is not None else 1.5
             else:
@@ -218,23 +224,15 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
             task_type=self.task_type
         )
 
-        # ===== Multi-GPU: DataParallel vs DistributedDataParallel =====
-        if self.is_ddp_enabled:
-            core = core.to(self.device)
-            core = DDP(core, device_ids=[
-                       self.local_rank], output_device=self.local_rank)
-            self.use_data_parallel = False
-        elif use_data_parallel and (self.device.type == 'cuda') and (torch.cuda.device_count() > 1):
-            if self.use_ddp and not self.is_ddp_enabled:
-                _log(
-                    ">>> DDP requested but not initialized; falling back to DataParallel.")
-            core = nn.DataParallel(core, device_ids=list(
-                range(torch.cuda.device_count())))
-            # DataParallel scatters inputs, but the primary device remains cuda:0.
-            self.device = torch.device('cuda')
-            self.use_data_parallel = True
-        else:
-            self.use_data_parallel = False
+        core, self.use_data_parallel, self.device = wrap_model_for_parallel(
+            core,
+            device=self.device,
+            use_data_parallel=self.use_data_parallel,
+            use_ddp_requested=self.use_ddp,
+            is_ddp_enabled=self.is_ddp_enabled,
+            local_rank=self.local_rank,
+            fallback_log=_log,
+        )
 
         self.resnet = core.to(self.device)
 

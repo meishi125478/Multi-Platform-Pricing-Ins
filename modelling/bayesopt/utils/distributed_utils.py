@@ -8,14 +8,13 @@ This module contains:
 
 from __future__ import annotations
 
-import gc
 import os
 from datetime import timedelta
 from typing import Optional
 
 import torch
 import torch.distributed as dist
-from ins_pricing.utils import get_logger, log_print
+from ins_pricing.utils import GPUMemoryManager, get_logger, log_print
 
 _logger = get_logger("ins_pricing.modelling.bayesopt.utils.distributed_utils")
 
@@ -156,38 +155,27 @@ class TrainingUtils:
     """General training utilities including CUDA management."""
 
     @staticmethod
-    def free_cuda() -> None:
+    def free_cuda(*, synchronize: bool = True, empty_cache: bool = True) -> None:
         """Release CUDA memory and clear cache.
 
-        This performs aggressive cleanup:
-        1. Move all PyTorch models to CPU
-        2. Run garbage collection
-        3. Clear CUDA cache
+        This performs lightweight cleanup only (gc + CUDA cache management)
+        to avoid global object scans that can severely degrade performance.
         """
-        _log(">>> Moving all models to CPU...")
-        for obj in gc.get_objects():
-            try:
-                if hasattr(obj, "to") and callable(obj.to):
-                    obj.to("cpu")
-            except Exception:
-                pass
-
-        _log(">>> Releasing tensor/optimizer/DataLoader references...")
-        gc.collect()
-
-        _log(">>> Clearing CUDA cache...")
+        _log(">>> Running lightweight CUDA cleanup...")
+        GPUMemoryManager.clean(
+            synchronize=synchronize,
+            empty_cache=empty_cache,
+        )
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
             _log(">>> CUDA memory released.")
         else:
             _log(">>> CUDA not available; cleanup skipped.")
 
 
 # Backward compatibility function wrapper
-def free_cuda():
+def free_cuda(*, synchronize: bool = True, empty_cache: bool = True):
     """Legacy function wrapper for CUDA memory cleanup.
 
     This function calls TrainingUtils.free_cuda() for backward compatibility.
     """
-    TrainingUtils.free_cuda()
+    TrainingUtils.free_cuda(synchronize=synchronize, empty_cache=empty_cache)

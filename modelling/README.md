@@ -22,43 +22,35 @@ This directory contains reusable training tooling and frameworks centered on Bay
 
 ## Loss functions
 
-Configure the regression/classification loss with `loss_name` in the BayesOpt config.
+Loss resolution priority:
+1. `distribution` (if set) overrides `loss_name`
+2. `loss_name` (if set and not `auto`)
+3. legacy auto inference (from `model_nme`) when both are `auto`/unset
 
-Supported `loss_name` values:
-- `auto` (default): legacy behavior based on model name
-- `tweedie`: Tweedie deviance
-- `poisson`: Poisson deviance
-- `gamma`: Gamma deviance
-- `mse`: mean squared error
-- `mae`: mean absolute error
+| distribution | resolved loss_name | notes |
+| --- | --- | --- |
+| `tweedie` | `tweedie` | Tweedie power can be tuned |
+| `poisson` | `poisson` | Tweedie power fixed at `1.0` |
+| `gamma` | `gamma` | Tweedie power fixed at `2.0` |
+| `gaussian`, `normal`, `mse` | `mse` | L2 regression |
+| `laplace`, `laplacian`, `mae` | `mae` | L1 regression |
+| `bernoulli`, `binomial`, `logistic`, `binary` | `logloss` | classification only |
 
-Mapping summary:
-- Tweedie deviance -> `tweedie`
-- Poisson deviance -> `poisson`
-- Gamma deviance -> `gamma`
-- Mean squared error -> `mse`
-- Mean absolute error -> `mae`
-- Classification log loss -> `logloss` (classification only)
-- Classification BCE -> `bce` (classification only)
+Supported explicit `loss_name` values:
+- Regression: `auto`, `tweedie`, `poisson`, `gamma`, `mse`, `mae`
+- Classification: `auto`, `logloss`, `bce`
 
-Classification tasks:
-- `loss_name` can be `auto`, `logloss`, or `bce`.
-- Training uses `BCEWithLogits` for torch models; evaluation uses log loss.
-
-Where to set `loss_name`:
+Example:
 
 ```json
 {
   "task_type": "regression",
-  "loss_name": "mse"
+  "distribution": "poisson",
+  "loss_name": "auto"
 }
 ```
 
-Behavior notes:
-- When `loss_name` is `mse` or `mae`, tuning does not sample Tweedie power.
-- When `loss_name` is `poisson` or `gamma`, power is fixed (1.0 / 2.0).
-- When `loss_name` is `tweedie`, power is sampled as usual.
-- XGBoost objective is selected from the loss name.
+Detailed BayesOpt-level behavior is documented in `ins_pricing/modelling/bayesopt/README.md`.
 
 ## Notes
 

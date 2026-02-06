@@ -13,6 +13,7 @@ _LOG_PATH: Optional[Path] = None
 _LOG_FILE: Optional[TextIO] = None
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
+_DEFAULT_HANDLER_FLAG = "_ins_pricing_default_handler"
 
 
 class _TeeStream:
@@ -126,6 +127,18 @@ def configure_run_logging(
         )
     else:
         root.setLevel(level)
+
+    # Avoid duplicate logs: remove ins_pricing package fallback handler once
+    # root logger is configured with timestamped output.
+    package_logger = logging.getLogger("ins_pricing")
+    for handler in list(package_logger.handlers):
+        if getattr(handler, _DEFAULT_HANDLER_FLAG, False):
+            package_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+    package_logger.propagate = True
 
     if announce:
         print(f"[ins_pricing] log saved to {log_path}", flush=True)

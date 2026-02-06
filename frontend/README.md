@@ -123,10 +123,10 @@ demo.launch(
 5. Configuration will display in the **"Current Configuration"** panel
 
 **Important**: The `runner.mode` field in the config determines which task runs:
-- `"mode": "entry"` → Training
-- `"mode": "explain"` → Model explanation
-- `"mode": "incremental"` → Incremental training
-- `"mode": "watchdog"` → Watchdog monitoring
+- `"mode": "entry"` -> Training
+- `"mode": "explain"` -> Model explanation
+- `"mode": "incremental"` -> Incremental training
+- `"mode": "watchdog"` -> Watchdog monitoring
 
 #### Option B: Manual Parameter Entry
 
@@ -333,11 +333,11 @@ Refer to configuration files in the `examples/` directory:
 
 ## FAQ
 
-### Q: How do I access the frontend interface?
+### Q: How do I access the frontend interface->
 
 A: After launching, the browser will open automatically, or manually navigate to `http://localhost:7860`
 
-### Q: Which task mode will run?
+### Q: Which task mode will run->
 
 A: The task mode is determined by `config.runner.mode` in your configuration file:
 - `"entry"` = Training
@@ -345,23 +345,23 @@ A: The task mode is determined by `config.runner.mode` in your configuration fil
 - `"incremental"` = Incremental training
 - `"watchdog"` = Watchdog mode
 
-### Q: Can I interrupt the task?
+### Q: Can I interrupt the task->
 
 A: The current version does not support interruption. Tasks must complete once started.
 
-### Q: How do I run explanation after training?
+### Q: How do I run explanation after training->
 
 A: First, run training with a config file. Then, load an explain config that points to the same output directory, and set `runner.mode` to `"explain"`.
 
-### Q: What if logs don't display?
+### Q: What if logs don't display->
 
 A: Check that the configuration is correct and data paths exist. Check the console for error messages.
 
-### Q: Can I run multiple tasks simultaneously?
+### Q: Can I run multiple tasks simultaneously->
 
 A: Not recommended. Wait for the current task to complete before starting a new one.
 
-### Q: How do I run on a remote server?
+### Q: How do I run on a remote server->
 
 A: Set `server_name="0.0.0.0"` when launching, then access via server IP and port.
 
@@ -369,11 +369,11 @@ A: Set `server_name="0.0.0.0"` when launching, then access via server IP and por
 demo.launch(server_name="0.0.0.0", server_port=7860)
 ```
 
-### Q: Where are configuration files saved?
+### Q: Where are configuration files saved->
 
 A: By default, saved in the current working directory. You can specify a full path in "Save Filename".
 
-### Q: How do I run plotting tasks?
+### Q: How do I run plotting tasks->
 
 A: Plotting tasks (oneway, lift, double-lift) can be run by using config files with plotting enabled. See `config_plot.json` example or manually run the plotting notebooks in `examples/`.
 
@@ -390,16 +390,16 @@ A: Plotting tasks (oneway, lift, double-lift) can be run by using config files w
 
 ```
 ins_pricing/frontend/
-├── __init__.py           # Package initialization
-├── app.py                # Main application entry
-├── config_builder.py     # Configuration builder
-├── runner.py             # Unified task runner
-├── requirements.txt      # Dependencies
-├── README.md            # This document
-├── Quick Start Guide        # Quick start guide
-├── example_config.json  # Example configuration
-├── start_app.bat        # Windows launcher
-└── start_app.sh         # Linux/Mac launcher
+- __init__.py           # Package initialization
+- app.py                # Main application entry
+- config_builder.py     # Configuration builder
+- runner.py             # Unified task runner
+- requirements.txt      # Dependencies
+- README.md             # This document
+- Quick Start Guide     # Quick start guide
+- example_config.json   # Example configuration
+- start_app.bat         # Windows launcher
+- start_app.sh          # Linux/Mac launcher
 ```
 
 ### Extending Functionality
@@ -485,7 +485,7 @@ Training will start automatically and logs will update in real-time!
 
 #### FT Two-Step Workflow
 
-For advanced FT-Transformer → XGB/ResN training:
+For advanced FT-Transformer -> XGB/ResN training:
 
 1. **Prepare Base Config**: Create or load a base configuration
 2. **Go to FT Two-Step Workflow tab**
@@ -501,7 +501,7 @@ For advanced FT-Transformer → XGB/ResN training:
 
 #### Open Results Folder
 
-- In the **Run Task** tab, click **"📁 Open Results Folder"**
+- In the **Run Task** tab, click **"Open Results Folder"**
 - Automatically opens the output directory in your file explorer
 - Works on Windows, macOS, and Linux
 
@@ -534,8 +534,8 @@ Save this as `my_first_config.json` and upload it!
 - **Check Logs**: Training logs update in real-time - watch for errors or progress indicators
 - **GPU Usage**: Toggle "Use GPU" checkbox in Training Settings to enable/disable GPU acceleration
 - **Model Selection**: Specify which models to train in "Model Keys" (xgb, resn, ft, gnn)
-- **Open Results**: Use the "📁 Open Results Folder" button to quickly access output files
-- **FT Workflow**: Use the dedicated FT tab for automated two-step FT → XGB/ResN training
+- **Open Results**: Use the "Open Results Folder" button to quickly access output files
+- **FT Workflow**: Use the dedicated FT tab for automated two-step FT -> XGB/ResN training
 
 ### Troubleshooting
 

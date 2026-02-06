@@ -22,8 +22,7 @@ from ins_pricing.production.preprocess import (
 )
 from ins_pricing.production.scoring import batch_score
 from ins_pricing.utils.losses import (
-    infer_loss_name_from_model_name,
-    normalize_loss_name,
+    resolve_effective_loss_name,
     resolve_tweedie_power,
 )
 from ins_pricing.utils import get_logger, load_dataset
@@ -111,9 +110,17 @@ class PredictorRegistry:
 _DEFAULT_REGISTRY = PredictorRegistry()
 
 
-def _default_tweedie_power(model_name: str, task_type: str) -> Optional[float]:
+def _default_tweedie_power(
+    model_name: str,
+    task_type: str,
+    loss_name: Optional[str] = None,
+) -> Optional[float]:
     if task_type == "classification":
         return None
+    if loss_name:
+        resolved = resolve_tweedie_power(str(loss_name), default=1.5)
+        if resolved is not None:
+            return resolved
     if "f" in model_name:
         return 1.0
     if "s" in model_name:
@@ -122,12 +129,12 @@ def _default_tweedie_power(model_name: str, task_type: str) -> Optional[float]:
 
 
 def _resolve_loss_name(cfg: Dict[str, Any], model_name: str, task_type: str) -> str:
-    normalized = normalize_loss_name(cfg.get("loss_name"), task_type)
-    if task_type == "classification":
-        return "logloss" if normalized == "auto" else normalized
-    if normalized == "auto":
-        return infer_loss_name_from_model_name(model_name)
-    return normalized
+    return resolve_effective_loss_name(
+        cfg.get("loss_name"),
+        task_type=task_type,
+        model_name=model_name,
+        distribution=cfg.get("distribution"),
+    )
 
 
 def _resolve_value(
@@ -231,12 +238,13 @@ def _build_resn_model(
     epochs: int,
     resn_weight_decay: float,
     loss_name: str,
+    distribution: Optional[str],
     params: Dict[str, Any],
 ) -> ResNetSklearn:
     from ins_pricing.modelling.bayesopt.models.model_resn import ResNetSklearn
     if loss_name == "tweedie":
         power = params.get(
-            "tw_power", _default_tweedie_power(model_name, task_type))
+            "tw_power", _default_tweedie_power(model_name, task_type, loss_name))
         power = float(power) if power is not None else None
     else:
         power = resolve_tweedie_power(loss_name, default=1.5)
@@ -259,6 +267,7 @@ def _build_resn_model(
         use_data_parallel=False,
         use_ddp=False,
         loss_name=loss_name,
+        distribution=distribution,
     )
 
 
@@ -270,10 +279,11 @@ def _build_gnn_model(
     epochs: int,
     cfg: Dict[str, Any],
     loss_name: str,
+    distribution: Optional[str],
     params: Dict[str, Any],
 ) -> GraphNeuralNetSklearn:
     from ins_pricing.modelling.bayesopt.models.model_gnn import GraphNeuralNetSklearn
-    base_tw = _default_tweedie_power(model_name, task_type)
+    base_tw = _default_tweedie_power(model_name, task_type, loss_name)
     if loss_name == "tweedie":
         tw_power = params.get("tw_power", base_tw)
         tw_power = float(tw_power) if tw_power is not None else None
@@ -301,7 +311,44 @@ def _build_gnn_model(
         knn_gpu_mem_ratio=cfg.get("gnn_knn_gpu_mem_ratio", 0.9),
         knn_gpu_mem_overhead=cfg.get("gnn_knn_gpu_mem_overhead", 2.0),
         loss_name=loss_name,
+        distribution=distribution,
     )
+
+
+def _load_ft_model_from_payload(
+    *,
+    payload: Any,
+    cfg: Dict[str, Any],
+    model_name: str,
+    task_type: str,
+    device: Optional[Any],
+) -> Any:
+    if isinstance(payload, dict):
+        if "state_dict" in payload and "model_config" in payload:
+            state_dict = payload.get("state_dict")
+            model_config = payload.get("model_config", {})
+            if not model_config.get("loss_name"):
+                model_config = dict(model_config)
+                model_config["loss_name"] = _resolve_loss_name(
+                    cfg, model_name, task_type
+                )
+            if "distribution" not in model_config:
+                model_config = dict(model_config)
+                model_config["distribution"] = cfg.get("distribution")
+            from ins_pricing.modelling.bayesopt.checkpoints import rebuild_ft_model_from_checkpoint
+
+            model = rebuild_ft_model_from_checkpoint(
+                state_dict=state_dict,
+                model_config=model_config,
+            )
+            _move_to_device(model, device=device)
+            return model
+        if "model" in payload:
+            model = payload.get("model")
+            _move_to_device(model, device=device)
+            return model
+    _move_to_device(payload, device=device)
+    return payload
 
 
 def load_saved_model(
@@ -327,73 +374,13 @@ def load_saved_model(
     if model_key == "ft":
         payload = _torch_load(
             model_path, map_location="cpu", weights_only=False)
-        if isinstance(payload, dict):
-            if "state_dict" in payload and "model_config" in payload:
-                # New format: state_dict + model_config (DDP-safe)
-                state_dict = payload.get("state_dict")
-                model_config = payload.get("model_config", {})
-
-                from ins_pricing.modelling.bayesopt.models import FTTransformerSklearn
-                from ins_pricing.modelling.bayesopt.models.model_ft_components import FTTransformerCore
-
-                # Reconstruct model from config
-                resolved_loss = model_config.get("loss_name")
-                if not resolved_loss:
-                    resolved_loss = _resolve_loss_name(
-                        cfg, model_name, task_type)
-                model = FTTransformerSklearn(
-                    model_nme=model_config.get("model_nme", ""),
-                    num_cols=model_config.get("num_cols", []),
-                    cat_cols=model_config.get("cat_cols", []),
-                    d_model=model_config.get("d_model", 64),
-                    n_heads=model_config.get("n_heads", 8),
-                    n_layers=model_config.get("n_layers", 4),
-                    dropout=model_config.get("dropout", 0.1),
-                    task_type=model_config.get("task_type", "regression"),
-                    loss_name=resolved_loss,
-                    tweedie_power=model_config.get("tw_power", 1.5),
-                    num_numeric_tokens=model_config.get("num_numeric_tokens"),
-                    use_data_parallel=False,
-                    use_ddp=False,
-                )
-                # Restore internal state
-                model.num_geo = model_config.get("num_geo", 0)
-                model.cat_cardinalities = model_config.get("cat_cardinalities")
-                model.cat_categories = {k: pd.Index(
-                    v) for k, v in model_config.get("cat_categories", {}).items()}
-                if model_config.get("_num_mean") is not None:
-                    model._num_mean = np.array(
-                        model_config["_num_mean"], dtype=np.float32)
-                if model_config.get("_num_std") is not None:
-                    model._num_std = np.array(
-                        model_config["_num_std"], dtype=np.float32)
-
-                # Build the model architecture and load weights
-                if model.cat_cardinalities is not None:
-                    core = FTTransformerCore(
-                        num_numeric=len(model.num_cols),
-                        cat_cardinalities=model.cat_cardinalities,
-                        d_model=model.d_model,
-                        n_heads=model.n_heads,
-                        n_layers=model.n_layers,
-                        dropout=model.dropout,
-                        task_type=model.task_type,
-                        num_geo=model.num_geo,
-                        num_numeric_tokens=model.num_numeric_tokens,
-                    )
-                    model.ft = core
-                    model.ft.load_state_dict(state_dict)
-
-                _move_to_device(model, device=device)
-                return model
-            elif "model" in payload:
-                # Legacy format: full model object
-                model = payload.get("model")
-                _move_to_device(model, device=device)
-                return model
-        # Very old format: direct model object
-        _move_to_device(payload, device=device)
-        return payload
+        return _load_ft_model_from_payload(
+            payload=payload,
+            cfg=cfg,
+            model_name=model_name,
+            task_type=task_type,
+            device=device,
+        )
 
     if model_key == "resn":
         if input_dim is None:
@@ -417,6 +404,7 @@ def load_saved_model(
             epochs=int(cfg.get("epochs", 50)),
             resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
             loss_name=loss_name,
+            distribution=cfg.get("distribution"),
             params=params,
         )
         model.resnet.load_state_dict(state_dict)
@@ -439,6 +427,7 @@ def load_saved_model(
             epochs=int(cfg.get("epochs", 50)),
             cfg=cfg,
             loss_name=loss_name,
+            distribution=cfg.get("distribution"),
             params=params,
         )
         model.set_params(dict(params))

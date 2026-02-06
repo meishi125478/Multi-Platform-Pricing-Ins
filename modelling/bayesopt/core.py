@@ -19,8 +19,8 @@ from ins_pricing.modelling.bayesopt.trainers import FTTrainer, GLMTrainer, GNNTr
 from ins_pricing.utils import EPS, infer_factor_and_cate_list, set_global_seed, get_logger, log_print
 from ins_pricing.utils.io import IOUtils
 from ins_pricing.utils.losses import (
-    infer_loss_name_from_model_name,
-    normalize_loss_name,
+    normalize_distribution_name,
+    resolve_effective_loss_name,
     resolve_tweedie_power,
     resolve_xgb_objective,
 )
@@ -129,7 +129,8 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                  resn_cleanup_synchronize: bool = False,
                  gnn_cleanup_per_fold: bool = False,
                  gnn_cleanup_synchronize: bool = False,
-                 optuna_cleanup_synchronize: bool = False):
+                 optuna_cleanup_synchronize: bool = False,
+                 distribution: Optional[str] = None):
         """Orchestrate BayesOpt training across multiple trainers.
 
         Args:
@@ -144,6 +145,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             weight_nme: Sample weight column name.
             factor_nmes: Feature column list.
             task_type: "regression" or "classification".
+            distribution: Optional distribution override (regression only).
             binary_resp_nme: Optional binary target for lift curves.
             cate_list: Categorical feature list.
             prop_test: Validation split ratio in CV.
@@ -241,6 +243,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 weight_nme=weight_nme,
                 factor_nmes=list(inferred_factors),
                 binary_resp_nme=binary_resp_nme,
+                distribution=distribution,
                 cate_list=list(inferred_cats) if inferred_cats else None,
                 prop_test=prop_test,
                 rand_seed=rand_seed,
@@ -330,14 +333,19 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type
-        normalized_loss = normalize_loss_name(getattr(cfg, "loss_name", None), self.task_type)
-        if self.task_type == "classification":
-            self.loss_name = "logloss" if normalized_loss == "auto" else normalized_loss
-        else:
-            if normalized_loss == "auto":
-                self.loss_name = infer_loss_name_from_model_name(self.model_nme)
-            else:
-                self.loss_name = normalized_loss
+        normalized_distribution = normalize_distribution_name(
+            getattr(cfg, "distribution", None),
+            self.task_type,
+        )
+        self.distribution = None if normalized_distribution == "auto" else normalized_distribution
+        self.loss_name = resolve_effective_loss_name(
+            getattr(cfg, "loss_name", None),
+            task_type=self.task_type,
+            model_name=self.model_nme,
+            distribution=self.distribution,
+        )
+        if hasattr(self.config, "distribution"):
+            self.config.distribution = self.distribution
         self.resp_nme = cfg.resp_nme
         self.weight_nme = cfg.weight_nme
         self.factor_nmes = cfg.factor_nmes
@@ -547,6 +555,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 task_type=self.task_type,
                 tweedie_power=tw_power,
                 loss_name=self.loss_name,
+                distribution=self.distribution,
                 use_data_parallel=False,
                 use_ddp=False,
                 use_approx_knn=self.config.gnn_use_approx_knn,

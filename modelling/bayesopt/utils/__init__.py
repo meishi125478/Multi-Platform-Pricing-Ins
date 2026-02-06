@@ -33,6 +33,11 @@ from ins_pricing.modelling.bayesopt.utils.distributed_utils import (
 from ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin import (
     TorchTrainerMixin,
 )
+from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    setup_ddp_if_requested,
+    resolve_training_device,
+    wrap_model_for_parallel,
+)
 
 # Metrics and device helpers (shared utilities)
 from ins_pricing.modelling.bayesopt.utils.metrics_and_devices import (
@@ -59,6 +64,9 @@ __all__ = [
     'free_cuda',
     # PyTorch
     'TorchTrainerMixin',
+    'setup_ddp_if_requested',
+    'resolve_training_device',
+    'wrap_model_for_parallel',
     # Utilities
     'get_logger',
     'MetricFactory',

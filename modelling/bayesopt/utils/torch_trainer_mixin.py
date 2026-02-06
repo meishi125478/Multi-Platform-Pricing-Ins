@@ -260,12 +260,22 @@ class TorchTrainerMixin:
                 return max(0, int(override))
             except (TypeError, ValueError):
                 pass
-        if getattr(self, "is_ddp_enabled", False):
-            return 0
         profile = profile or self._resolve_resource_profile()
         if profile == "memory_saving":
             return 0
         worker_cap = min(int(max_workers), os.cpu_count() or 1)
+        if getattr(self, "is_ddp_enabled", False):
+            world_size = getattr(self, "world_size", None)
+            if not world_size:
+                if dist.is_initialized():
+                    world_size = dist.get_world_size()
+                else:
+                    try:
+                        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+                    except (TypeError, ValueError):
+                        world_size = 1
+            world_size = max(1, int(world_size))
+            worker_cap = max(1, worker_cap // world_size)
         if self._device_type() == "mps":
             worker_cap = min(worker_cap, 2)
         return worker_cap

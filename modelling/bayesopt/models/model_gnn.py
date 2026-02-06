@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,14 +18,20 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
+from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    resolve_training_device,
+    setup_ddp_if_requested,
+    wrap_model_for_parallel,
+)
 from ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin import TorchTrainerMixin
-from ins_pricing.utils import EPS, get_logger, log_print
+from ins_pricing.utils import DeviceManager, EPS, get_logger, log_print
 from ins_pricing.utils.io import IOUtils
 from ins_pricing.utils.losses import (
-    infer_loss_name_from_model_name,
-    normalize_loss_name,
+    normalize_distribution_name,
+    resolve_effective_loss_name,
     resolve_tweedie_power,
 )
+from ins_pricing.utils.torch_compat import torch_load
 
 try:
     from torch_geometric.nn import knn_graph
@@ -112,19 +119,23 @@ class SimpleGNN(nn.Module):
 
 
 class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
+    SUPPORTS_MULTI_PROCESS_DDP = False
+
     def __init__(self, model_nme: str, input_dim: int, hidden_dim: int = 64,
                  num_layers: int = 2, k_neighbors: int = 10, dropout: float = 0.1,
                  learning_rate: float = 1e-3, epochs: int = 100, patience: int = 10,
                  task_type: str = 'regression', tweedie_power: float = 1.5,
                  weight_decay: float = 0.0,
                  use_data_parallel: bool = False, use_ddp: bool = False,
+                 use_gpu: bool = True,
                  use_approx_knn: bool = True, approx_knn_threshold: int = 50000,
                  graph_cache_path: Optional[str] = None,
                  max_gpu_knn_nodes: Optional[int] = None,
                  knn_gpu_mem_ratio: float = 0.9,
                  knn_gpu_mem_overhead: float = 2.0,
                  knn_cpu_jobs: Optional[int] = -1,
-                 loss_name: Optional[str] = None) -> None:
+                 loss_name: Optional[str] = None,
+                 distribution: Optional[str] = None) -> None:
         super().__init__()
         self.model_nme = model_nme
         self.input_dim = input_dim
@@ -137,10 +148,23 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self.epochs = epochs
         self.patience = patience
         self.task_type = task_type
+        self.use_gpu = bool(use_gpu)
         self.use_approx_knn = use_approx_knn
         self.approx_knn_threshold = approx_knn_threshold
         self.graph_cache_path = Path(
             graph_cache_path) if graph_cache_path else None
+        self.graph_hash_sample_rows = max(
+            32,
+            int(os.environ.get("BAYESOPT_GNN_GRAPH_HASH_SAMPLE_ROWS", "2048")),
+        )
+        self.graph_cache_lock_timeout = max(
+            1.0,
+            float(os.environ.get("BAYESOPT_GNN_GRAPH_LOCK_TIMEOUT_SECONDS", "30")),
+        )
+        self.graph_cache_lock_poll = max(
+            0.01,
+            float(os.environ.get("BAYESOPT_GNN_GRAPH_LOCK_POLL_SECONDS", "0.1")),
+        )
         self.max_gpu_knn_nodes = max_gpu_knn_nodes
         self.knn_gpu_mem_ratio = max(0.0, min(1.0, knn_gpu_mem_ratio))
         self.knn_gpu_mem_overhead = max(1.0, knn_gpu_mem_overhead)
@@ -154,14 +178,18 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self._adj_cache_key: Optional[Tuple[Any, ...]] = None
         self._adj_cache_tensor: Optional[torch.Tensor] = None
 
-        resolved_loss = normalize_loss_name(loss_name, self.task_type)
+        resolved_distribution = normalize_distribution_name(distribution, self.task_type)
+        self.distribution = None if resolved_distribution == "auto" else resolved_distribution
         if self.task_type == 'classification':
             self.loss_name = "logloss"
             self.tw_power = None
         else:
-            if resolved_loss == "auto":
-                resolved_loss = infer_loss_name_from_model_name(self.model_nme)
-            self.loss_name = resolved_loss
+            self.loss_name = resolve_effective_loss_name(
+                loss_name,
+                task_type=self.task_type,
+                model_name=self.model_nme,
+                distribution=self.distribution,
+            )
             if self.loss_name == "tweedie":
                 self.tw_power = float(tweedie_power) if tweedie_power is not None else 1.5
             else:
@@ -172,7 +200,13 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self.data_parallel_enabled = False
         self._ddp_disabled = False
 
-        if use_ddp:
+        requested_ddp = bool(use_ddp and self.use_gpu)
+        if use_ddp and not self.use_gpu:
+            _log(
+                "[GNN] DDP requested with use_gpu=false; forcing CPU single-process mode.",
+                flush=True,
+            )
+        if requested_ddp:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
             if world_size > 1:
                 _log(
@@ -180,33 +214,36 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                     flush=True,
                 )
                 self._ddp_disabled = True
-                use_ddp = False
+                requested_ddp = False
 
         # DDP only works with CUDA; fall back to single process if init fails.
-        if use_ddp and torch.cuda.is_available():
-            ddp_ok, local_rank, _, _ = DistributedUtils.setup_ddp()
+        if requested_ddp and torch.cuda.is_available():
+            ddp_ok, local_rank, _, _ = setup_ddp_if_requested(True)
             if ddp_ok:
                 self.ddp_enabled = True
                 self.local_rank = local_rank
-                self.device = torch.device(f'cuda:{local_rank}')
-            else:
-                self.device = torch.device('cuda')
-        elif torch.cuda.is_available():
-            if self._ddp_disabled:
-                self.device = torch.device(f'cuda:{self.local_rank}')
-            else:
-                self.device = torch.device('cuda')
-        elif torch.backends.mps.is_available():
-            self.device = torch.device('mps')
-            global _GNN_MPS_WARNED
-            if not _GNN_MPS_WARNED:
-                _log(
-                    "[GNN] Using MPS backend; will fall back to CPU on unsupported ops.",
-                    flush=True,
+                self.device = resolve_training_device(
+                    is_ddp_enabled=True, local_rank=self.local_rank, use_gpu=self.use_gpu
                 )
-                _GNN_MPS_WARNED = True
-        else:
-            self.device = torch.device('cpu')
+        if not self.ddp_enabled:
+            if self.use_gpu and torch.cuda.is_available():
+                if self._ddp_disabled:
+                    self.device = torch.device(f'cuda:{self.local_rank}')
+                else:
+                    self.device = resolve_training_device(
+                        is_ddp_enabled=False, local_rank=self.local_rank, use_gpu=self.use_gpu
+                    )
+            elif self.use_gpu and DeviceManager.is_mps_available():
+                self.device = torch.device('mps')
+                global _GNN_MPS_WARNED
+                if not _GNN_MPS_WARNED:
+                    _log(
+                        "[GNN] Using MPS backend; will fall back to CPU on unsupported ops.",
+                        flush=True,
+                    )
+                    _GNN_MPS_WARNED = True
+            else:
+                self.device = torch.device('cpu')
         self.use_pyg_knn = self.device.type == 'cuda' and _PYG_AVAILABLE
 
         self.gnn = SimpleGNN(
@@ -218,19 +255,16 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         ).to(self.device)
 
         # DataParallel copies the full graph to each GPU and splits features; good for medium graphs.
-        if (not self.ddp_enabled) and use_data_parallel and (self.device.type == 'cuda') and (torch.cuda.device_count() > 1):
-            self.data_parallel_enabled = True
-            self.gnn = nn.DataParallel(
-                self.gnn, device_ids=list(range(torch.cuda.device_count())))
-            self.device = torch.device('cuda')
-
-        if self.ddp_enabled:
-            self.gnn = DDP(
-                self.gnn,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=False
-            )
+        self.gnn, self.data_parallel_enabled, self.device = wrap_model_for_parallel(
+            self.gnn,
+            device=self.device,
+            use_data_parallel=bool(use_data_parallel and self.use_gpu),
+            use_ddp_requested=bool(requested_ddp),
+            is_ddp_enabled=self.ddp_enabled,
+            local_rank=self.local_rank,
+            ddp_find_unused_parameters=False,
+            fallback_log=_log,
+        )
 
     @staticmethod
     def _validate_vector(arr, name: str, n_rows: int) -> None:
@@ -299,11 +333,23 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                 return fn(*args, **kwargs)
             raise
 
+    def _sample_for_hash(self, X_df: pd.DataFrame) -> pd.DataFrame:
+        n_rows = int(X_df.shape[0])
+        sample_rows = min(n_rows, int(self.graph_hash_sample_rows))
+        if sample_rows >= n_rows:
+            return X_df
+        sample_idx = np.linspace(0, n_rows - 1, num=sample_rows, dtype=np.int64)
+        return X_df.iloc[sample_idx]
+
     def _graph_cache_meta(self, X_df: pd.DataFrame) -> Dict[str, Any]:
-        row_hash = pd.util.hash_pandas_object(X_df, index=False).values
-        idx_hash = pd.util.hash_pandas_object(X_df.index, index=False).values
-        col_sig = ",".join(map(str, X_df.columns))
+        sample_df = self._sample_for_hash(X_df)
+        row_hash = pd.util.hash_pandas_object(sample_df, index=False).values
+        idx_hash = pd.util.hash_pandas_object(sample_df.index, index=False).values
+        col_sig = ",".join(
+            f"{col}:{dtype}" for col, dtype in zip(X_df.columns, X_df.dtypes)
+        )
         hasher = hashlib.sha256()
+        hasher.update(np.asarray(X_df.shape, dtype=np.int64).tobytes())
         hasher.update(row_hash.tobytes())
         hasher.update(idx_hash.tobytes())
         hasher.update(col_sig.encode("utf-8", errors="ignore"))
@@ -323,6 +369,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         return {
             "n_samples": int(X_df.shape[0]),
             "n_features": int(X_df.shape[1]),
+            "hash_sample_rows": int(sample_df.shape[0]),
             "hash": hasher.hexdigest(),
             "knn_config": knn_config,
             "adj_format": adj_format,
@@ -344,6 +391,66 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self._adj_cache_key = None
         self._adj_cache_tensor = None
 
+    @contextmanager
+    def _graph_cache_write_lock(self):
+        if not self.graph_cache_path:
+            yield
+            return
+        lock_path = Path(str(self.graph_cache_path) + ".lock")
+        fd: Optional[int] = None
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except FileExistsError:
+                if (time.time() - start) >= self.graph_cache_lock_timeout:
+                    _log(
+                        f"[GNN] Timeout waiting for graph cache lock: {lock_path}. "
+                        "Continue without lock."
+                    )
+                    yield
+                    return
+                time.sleep(self.graph_cache_lock_poll)
+            except Exception:
+                yield
+                return
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    def _save_graph_cache(self, adj_norm: torch.Tensor, meta_expected: Dict[str, Any]) -> None:
+        if not self.graph_cache_path:
+            return
+        tmp_path = Path(
+            f"{self.graph_cache_path}.tmp.{os.getpid()}.{time.time_ns()}"
+        )
+        try:
+            IOUtils.ensure_parent_dir(str(self.graph_cache_path))
+            with self._graph_cache_write_lock():
+                torch.save({"adj": adj_norm.cpu(), "meta": meta_expected}, tmp_path)
+                os.replace(tmp_path, self.graph_cache_path)
+        except Exception as exc:
+            _log(
+                f"[GNN] Failed to cache graph to {self.graph_cache_path}: {exc}")
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
     def _load_cached_adj(self,
                          X_df: pd.DataFrame,
                          meta_expected: Optional[Dict[str, Any]] = None) -> Optional[torch.Tensor]:
@@ -351,7 +458,11 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             if meta_expected is None:
                 meta_expected = self._graph_cache_meta(X_df)
             try:
-                payload = torch.load(self.graph_cache_path, map_location="cpu")
+                payload = torch_load(
+                    self.graph_cache_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
             except Exception as exc:
                 _log(
                     f"[GNN] Failed to load cached graph from {self.graph_cache_path}: {exc}")
@@ -594,12 +705,9 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             edge_index = self._build_edge_index_cpu(X_np)
         adj_norm = self._normalized_adj(edge_index, X_df.shape[0])
         if self.graph_cache_path:
-            try:
-                IOUtils.ensure_parent_dir(str(self.graph_cache_path))
-                torch.save({"adj": adj_norm.cpu(), "meta": meta_expected}, self.graph_cache_path)
-            except Exception as exc:
-                _log(
-                    f"[GNN] Failed to cache graph to {self.graph_cache_path}: {exc}")
+            if meta_expected is None:
+                meta_expected = self._graph_cache_meta(X_df)
+            self._save_graph_cache(adj_norm, meta_expected)
             self._adj_cache_meta = meta_expected
             self._adj_cache_key = None
         else:

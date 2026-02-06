@@ -18,7 +18,7 @@ from __future__ import annotations
 import gc
 import os
 from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import torch
@@ -176,13 +176,34 @@ class DeviceManager:
 
     _logger = get_logger("ins_pricing.device")
     _cached_device: Optional[Any] = None  # torch.device when available
+    _cached_key: Optional[Tuple[bool, str]] = None
 
     @classmethod
-    def get_best_device(cls, prefer_cuda: bool = True) -> Any:
+    def _resolve_local_rank(cls, local_rank: Optional[int] = None) -> Optional[int]:
+        if local_rank is not None:
+            try:
+                return int(local_rank)
+            except (TypeError, ValueError):
+                return None
+        raw = os.environ.get("LOCAL_RANK")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def get_best_device(
+        cls,
+        prefer_cuda: bool = True,
+        local_rank: Optional[int] = None,
+    ) -> Any:
         """Get the best available device.
 
         Args:
             prefer_cuda: If True, prefer CUDA over MPS
+            local_rank: Optional CUDA local rank override
 
         Returns:
             Best available torch.device
@@ -190,18 +211,37 @@ class DeviceManager:
         if not TORCH_AVAILABLE:
             return None
 
-        if cls._cached_device is not None:
+        if prefer_cuda and torch.cuda.is_available():
+            rank = cls._resolve_local_rank(local_rank)
+            device_count = max(1, int(torch.cuda.device_count()))
+            if rank is None:
+                try:
+                    rank = int(torch.cuda.current_device())
+                except Exception:
+                    rank = 0
+            if rank < 0 or rank >= device_count:
+                cls._logger.warning(
+                    f"Invalid CUDA rank {rank}; falling back to cuda:0 "
+                    f"(device_count={device_count})."
+                )
+                rank = 0
+            device = torch.device(f"cuda:{rank}")
+            cls._logger.debug(f"Selected device: {device}")
+            return device
+
+        cache_key = (bool(prefer_cuda), "non-cuda")
+        if cls._cached_device is not None and cls._cached_key == cache_key:
             return cls._cached_device
 
-        if prefer_cuda and torch.cuda.is_available():
-            cls._cached_device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            cls._cached_device = torch.device("mps")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
         else:
-            cls._cached_device = torch.device("cpu")
+            device = torch.device("cpu")
 
-        cls._logger.debug(f"Selected device: {cls._cached_device}")
-        return cls._cached_device
+        cls._cached_key = cache_key
+        cls._cached_device = device
+        cls._logger.debug(f"Selected device: {device}")
+        return device
 
     @classmethod
     def move_to_device(cls, model_obj: Any, device: Optional[Any] = None) -> None:
@@ -219,6 +259,11 @@ class DeviceManager:
         device = device or cls.get_best_device()
         if device is None:
             return
+        if TORCH_AVAILABLE and hasattr(device, "type") and device.type == "cuda":
+            try:
+                torch.cuda.set_device(device)
+            except Exception:
+                pass
 
         # Update device attribute if present
         if hasattr(model_obj, "device"):
@@ -255,6 +300,7 @@ class DeviceManager:
     def reset_cache(cls) -> None:
         """Reset cached device selection."""
         cls._cached_device = None
+        cls._cached_key = None
 
     @classmethod
     def is_cuda_available(cls) -> bool:
