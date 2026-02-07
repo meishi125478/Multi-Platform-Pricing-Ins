@@ -13,6 +13,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     dist = None  # type: ignore
 
+from ins_pricing.modelling.bayesopt.artifacts import best_params_csv_path
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.utils import ensure_parent_dir, get_logger, log_print
 
@@ -108,16 +109,47 @@ class TrainerOptunaMixin:
     def _optuna_cleanup_sync(self) -> bool:
         return bool(getattr(self.config, "optuna_cleanup_synchronize", False))
 
-    def tune(self, max_evals: int, objective_fn=None) -> None:
-        if objective_fn is None:
-            objective_fn = self.cross_val
+    def _best_params_csv_path(self) -> str:
+        path = best_params_csv_path(
+            self.output.result_dir,
+            self.ctx.model_nme,
+            self.label,
+        )
+        ensure_parent_dir(str(path))
+        return str(path)
 
-        if self._should_use_distributed_optuna():
-            self._distributed_tune(max_evals, objective_fn)
-            return
+    def _persist_best_params_csv(self, params: Dict[str, Any]) -> None:
+        pd.DataFrame(params, index=[0]).to_csv(
+            self._best_params_csv_path(), index=False
+        )
 
-        total_trials = max(1, int(max_evals))
-        progress_counter = {"count": 0}
+    def _create_study(self) -> optuna.study.Study:
+        """Create or load an Optuna study and cache study name."""
+        storage_url = self._resolve_optuna_storage_url()
+        study_name = self._resolve_optuna_study_name()
+        study_kwargs: Dict[str, Any] = {
+            "direction": "minimize",
+            "sampler": optuna.samplers.TPESampler(seed=self.ctx.rand_seed),
+        }
+        if storage_url:
+            study_kwargs.update(
+                storage=storage_url,
+                study_name=study_name,
+                load_if_exists=True,
+            )
+        study = optuna.create_study(**study_kwargs)
+        self.study_name = getattr(study, "study_name", None)
+        return study
+
+    def _make_objective_wrapper(
+        self,
+        objective_fn: Callable[[optuna.trial.Trial], float],
+        total_trials: int,
+        progress_counter: Dict[str, int],
+        *,
+        barrier_on_end: bool = False,
+    ) -> Callable[[optuna.trial.Trial], float]:
+        """Create objective wrapper with OOM handling and cleanup/logging."""
 
         def objective_wrapper(trial: optuna.trial.Trial) -> float:
             should_log = DistributedUtils.is_main_process()
@@ -147,23 +179,14 @@ class TrainerOptunaMixin:
                         f"[Optuna][{self.label}] Trial {progress_counter['count']}/{total_trials} finished "
                         f"(status={state_repr})."
                     )
+                if barrier_on_end:
+                    self._dist_barrier("trial_end")
             return result
 
-        storage_url = self._resolve_optuna_storage_url()
-        study_name = self._resolve_optuna_study_name()
-        study_kwargs: Dict[str, Any] = {
-            "direction": "minimize",
-            "sampler": optuna.samplers.TPESampler(seed=self.ctx.rand_seed),
-        }
-        if storage_url:
-            study_kwargs.update(
-                storage=storage_url,
-                study_name=study_name,
-                load_if_exists=True,
-            )
+        return objective_wrapper
 
-        study = optuna.create_study(**study_kwargs)
-        self.study_name = getattr(study, "study_name", None)
+    def _make_checkpoint_callback(self) -> Callable[[optuna.study.Study, Any], None]:
+        """Create callback that persists current best params."""
 
         def checkpoint_callback(check_study: optuna.study.Study, _trial) -> None:
             try:
@@ -173,14 +196,21 @@ class TrainerOptunaMixin:
                 best_params = getattr(best, "params", None)
                 if not best_params:
                     return
-                params_path = self.output.result_path(
-                    f'{self.ctx.model_nme}_bestparams_{self.label.lower()}.csv'
-                )
-                pd.DataFrame(best_params, index=[0]).to_csv(
-                    params_path, index=False)
+                self._persist_best_params_csv(best_params)
             except Exception:
                 return
 
+        return checkpoint_callback
+
+    def _run_study_and_extract(
+        self,
+        study: optuna.study.Study,
+        objective_wrapper: Callable[[optuna.trial.Trial], float],
+        checkpoint_callback: Callable[[optuna.study.Study, Any], None],
+        total_trials: int,
+        progress_counter: Dict[str, int],
+    ) -> None:
+        """Run study optimization and populate best params/trial artifacts."""
         completed_states = (
             optuna.trial.TrialState.COMPLETE,
             optuna.trial.TrialState.PRUNED,
@@ -195,14 +225,32 @@ class TrainerOptunaMixin:
                 n_trials=remaining,
                 callbacks=[checkpoint_callback],
             )
+
         self.best_params = study.best_params
         self.best_trial = study.best_trial
+        self._persist_best_params_csv(self.best_params)
 
-        params_path = self.output.result_path(
-            f'{self.ctx.model_nme}_bestparams_{self.label.lower()}.csv'
+    def tune(self, max_evals: int, objective_fn=None) -> None:
+        if objective_fn is None:
+            objective_fn = self.cross_val
+
+        if self._should_use_distributed_optuna():
+            self._distributed_tune(max_evals, objective_fn)
+            return
+
+        total_trials = max(1, int(max_evals))
+        progress_counter = {"count": 0}
+        study = self._create_study()
+        objective_wrapper = self._make_objective_wrapper(
+            objective_fn, total_trials, progress_counter, barrier_on_end=False)
+        checkpoint_callback = self._make_checkpoint_callback()
+        self._run_study_and_extract(
+            study,
+            objective_wrapper,
+            checkpoint_callback,
+            total_trials,
+            progress_counter,
         )
-        pd.DataFrame(self.best_params, index=[0]).to_csv(
-            params_path, index=False)
 
     def _should_use_distributed_optuna(self) -> bool:
         if not self.enable_distributed_optuna:
@@ -285,18 +333,30 @@ class TrainerOptunaMixin:
                     self._clean_gpu(synchronize=self._optuna_cleanup_sync())
                     self._dist_barrier("worker_end")
 
+    def _fallback_to_single_process(
+        self,
+        max_evals: int,
+        objective_fn: Callable[[optuna.trial.Trial], float],
+        reason: str,
+    ) -> None:
+        _log(
+            f"[Optuna][{self.label}] {reason}. Fallback to single-process.",
+            flush=True,
+        )
+        prev = self.enable_distributed_optuna
+        self.enable_distributed_optuna = False
+        try:
+            self.tune(max_evals, objective_fn)
+        finally:
+            self.enable_distributed_optuna = prev
+
     def _distributed_tune(self, max_evals: int, objective_fn: Callable[[optuna.trial.Trial], float]) -> None:
         if dist is None:
-            _log(
-                f"[Optuna][{self.label}] torch.distributed unavailable. Fallback to single-process.",
-                flush=True,
+            self._fallback_to_single_process(
+                max_evals,
+                objective_fn,
+                "torch.distributed unavailable",
             )
-            prev = self.enable_distributed_optuna
-            self.enable_distributed_optuna = False
-            try:
-                self.tune(max_evals, objective_fn)
-            finally:
-                self.enable_distributed_optuna = prev
             return
         DistributedUtils.setup_ddp()
         if not dist.is_initialized():
@@ -307,16 +367,11 @@ class TrainerOptunaMixin:
                     flush=True,
                 )
                 return
-            _log(
-                f"[Optuna][{self.label}] DDP init failed. Fallback to single-process.",
-                flush=True,
+            self._fallback_to_single_process(
+                max_evals,
+                objective_fn,
+                "DDP init failed",
             )
-            prev = self.enable_distributed_optuna
-            self.enable_distributed_optuna = False
-            try:
-                self.tune(max_evals, objective_fn)
-            finally:
-                self.enable_distributed_optuna = prev
             return
         if not self._distributed_is_main():
             self._distributed_worker_loop(objective_fn)
@@ -324,91 +379,18 @@ class TrainerOptunaMixin:
 
         total_trials = max(1, int(max_evals))
         progress_counter = {"count": 0}
-
-        def objective_wrapper(trial: optuna.trial.Trial) -> float:
-            should_log = True
-            if should_log:
-                current_idx = progress_counter["count"] + 1
-                _log(
-                    f"[Optuna][{self.label}] Trial {current_idx}/{total_trials} started "
-                    f"(trial_id={trial.number})."
-                )
-            try:
-                result = objective_fn(trial)
-            except RuntimeError as exc:
-                if "out of memory" in str(exc).lower():
-                    _log(
-                        f"[Optuna][{self.label}] OOM detected. Pruning trial and clearing CUDA cache."
-                    )
-                    self._clean_gpu(synchronize=True)
-                    raise optuna.TrialPruned() from exc
-                raise
-            finally:
-                self._clean_gpu(synchronize=self._optuna_cleanup_sync())
-                if should_log:
-                    progress_counter["count"] = progress_counter["count"] + 1
-                    trial_state = getattr(trial, "state", None)
-                    state_repr = getattr(trial_state, "name", "OK")
-                    _log(
-                        f"[Optuna][{self.label}] Trial {progress_counter['count']}/{total_trials} finished "
-                        f"(status={state_repr})."
-                    )
-                self._dist_barrier("trial_end")
-            return result
-
-        storage_url = self._resolve_optuna_storage_url()
-        study_name = self._resolve_optuna_study_name()
-        study_kwargs: Dict[str, Any] = {
-            "direction": "minimize",
-            "sampler": optuna.samplers.TPESampler(seed=self.ctx.rand_seed),
-        }
-        if storage_url:
-            study_kwargs.update(
-                storage=storage_url,
-                study_name=study_name,
-                load_if_exists=True,
-            )
-        study = optuna.create_study(**study_kwargs)
-        self.study_name = getattr(study, "study_name", None)
-
-        def checkpoint_callback(check_study: optuna.study.Study, _trial) -> None:
-            try:
-                best = getattr(check_study, "best_trial", None)
-                if best is None:
-                    return
-                best_params = getattr(best, "params", None)
-                if not best_params:
-                    return
-                params_path = self.output.result_path(
-                    f'{self.ctx.model_nme}_bestparams_{self.label.lower()}.csv'
-                )
-                pd.DataFrame(best_params, index=[0]).to_csv(
-                    params_path, index=False)
-            except Exception:
-                return
-
-        completed_states = (
-            optuna.trial.TrialState.COMPLETE,
-            optuna.trial.TrialState.PRUNED,
-            optuna.trial.TrialState.FAIL,
-        )
-        completed = len(study.get_trials(states=completed_states))
-        progress_counter["count"] = completed
-        remaining = max(0, total_trials - completed)
+        study = self._create_study()
+        objective_wrapper = self._make_objective_wrapper(
+            objective_fn, total_trials, progress_counter, barrier_on_end=True)
+        checkpoint_callback = self._make_checkpoint_callback()
         try:
-            if remaining > 0:
-                study.optimize(
-                    objective_wrapper,
-                    n_trials=remaining,
-                    callbacks=[checkpoint_callback],
-                )
-            self.best_params = study.best_params
-            self.best_trial = study.best_trial
-            params_path = self.output.result_path(
-                f'{self.ctx.model_nme}_bestparams_{self.label.lower()}.csv'
+            self._run_study_and_extract(
+                study,
+                objective_wrapper,
+                checkpoint_callback,
+                total_trials,
+                progress_counter,
             )
-            pd.DataFrame(self.best_params, index=[0]).to_csv(
-                params_path, index=False)
         finally:
             self._distributed_send_command(
                 {"type": "STOP", "best_params": self.best_params})

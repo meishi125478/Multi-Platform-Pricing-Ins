@@ -10,18 +10,25 @@ Usage:
         resp_nme="claim",
         weight_nme="exposure",
         factor_nmes=["age", "gender"],
-        distributed=DistributedConfig(use_ft_ddp=True),
-        gnn=GNNConfig(use_approx_knn=False),
+        use_ft_ddp=True,
+        gnn_use_approx_knn=False,
     )
+    # Nested components are immutable views backed by flat fields.
+    assert config.distributed.use_ft_ddp is True
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
-@dataclass
+def _value_or_default(d: Dict[str, Any], key: str, default: Any) -> Any:
+    value = d.get(key, default)
+    return default if value is None else value
+
+
+@dataclass(frozen=True)
 class DistributedConfig:
     """Configuration for distributed training (DDP/DataParallel).
 
@@ -45,16 +52,16 @@ class DistributedConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "DistributedConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            use_resn_data_parallel=bool(d.get("use_resn_data_parallel", False)),
-            use_ft_data_parallel=bool(d.get("use_ft_data_parallel", False)),
-            use_gnn_data_parallel=bool(d.get("use_gnn_data_parallel", False)),
-            use_resn_ddp=bool(d.get("use_resn_ddp", False)),
-            use_ft_ddp=bool(d.get("use_ft_ddp", False)),
-            use_gnn_ddp=bool(d.get("use_gnn_ddp", False)),
+            use_resn_data_parallel=bool(_value_or_default(d, "use_resn_data_parallel", False)),
+            use_ft_data_parallel=bool(_value_or_default(d, "use_ft_data_parallel", False)),
+            use_gnn_data_parallel=bool(_value_or_default(d, "use_gnn_data_parallel", False)),
+            use_resn_ddp=bool(_value_or_default(d, "use_resn_ddp", False)),
+            use_ft_ddp=bool(_value_or_default(d, "use_ft_ddp", False)),
+            use_gnn_ddp=bool(_value_or_default(d, "use_gnn_ddp", False)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GNNConfig:
     """Configuration for Graph Neural Network training.
 
@@ -78,16 +85,16 @@ class GNNConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "GNNConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            use_approx_knn=bool(d.get("gnn_use_approx_knn", True)),
-            approx_knn_threshold=int(d.get("gnn_approx_knn_threshold", 50000)),
+            use_approx_knn=bool(_value_or_default(d, "gnn_use_approx_knn", True)),
+            approx_knn_threshold=int(_value_or_default(d, "gnn_approx_knn_threshold", 50000)),
             graph_cache=d.get("gnn_graph_cache"),
-            max_gpu_knn_nodes=int(d.get("gnn_max_gpu_knn_nodes", 200000)),
-            knn_gpu_mem_ratio=float(d.get("gnn_knn_gpu_mem_ratio", 0.9)),
-            knn_gpu_mem_overhead=float(d.get("gnn_knn_gpu_mem_overhead", 2.0)),
+            max_gpu_knn_nodes=int(_value_or_default(d, "gnn_max_gpu_knn_nodes", 200000)),
+            knn_gpu_mem_ratio=float(_value_or_default(d, "gnn_knn_gpu_mem_ratio", 0.9)),
+            knn_gpu_mem_overhead=float(_value_or_default(d, "gnn_knn_gpu_mem_overhead", 2.0)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class GeoTokenConfig:
     """Configuration for geographic token embeddings.
 
@@ -114,16 +121,16 @@ class GeoTokenConfig:
         """Create from a flat dictionary with prefixed keys."""
         return cls(
             feature_nmes=d.get("geo_feature_nmes"),
-            hidden_dim=int(d.get("geo_token_hidden_dim", 32)),
-            layers=int(d.get("geo_token_layers", 2)),
-            dropout=float(d.get("geo_token_dropout", 0.1)),
-            k_neighbors=int(d.get("geo_token_k_neighbors", 10)),
-            learning_rate=float(d.get("geo_token_learning_rate", 1e-3)),
-            epochs=int(d.get("geo_token_epochs", 50)),
+            hidden_dim=int(_value_or_default(d, "geo_token_hidden_dim", 32)),
+            layers=int(_value_or_default(d, "geo_token_layers", 2)),
+            dropout=float(_value_or_default(d, "geo_token_dropout", 0.1)),
+            k_neighbors=int(_value_or_default(d, "geo_token_k_neighbors", 10)),
+            learning_rate=float(_value_or_default(d, "geo_token_learning_rate", 1e-3)),
+            epochs=int(_value_or_default(d, "geo_token_epochs", 50)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class RegionConfig:
     """Configuration for region/geographic effects.
 
@@ -143,11 +150,11 @@ class RegionConfig:
         return cls(
             province_col=d.get("region_province_col"),
             city_col=d.get("region_city_col"),
-            effect_alpha=float(d.get("region_effect_alpha", 50.0)),
+            effect_alpha=float(_value_or_default(d, "region_effect_alpha", 50.0)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class FTTransformerConfig:
     """Configuration for FT-Transformer model.
 
@@ -165,13 +172,13 @@ class FTTransformerConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "FTTransformerConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            role=str(d.get("ft_role", "model")),
-            feature_prefix=str(d.get("ft_feature_prefix", "ft_emb")),
+            role=str(_value_or_default(d, "ft_role", "model")),
+            feature_prefix=str(_value_or_default(d, "ft_feature_prefix", "ft_emb")),
             num_numeric_tokens=d.get("ft_num_numeric_tokens"),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class XGBoostConfig:
     """Configuration for XGBoost model.
 
@@ -195,16 +202,16 @@ class XGBoostConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "XGBoostConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            max_depth_max=int(d.get("xgb_max_depth_max", 25)),
-            n_estimators_max=int(d.get("xgb_n_estimators_max", 500)),
+            max_depth_max=int(_value_or_default(d, "xgb_max_depth_max", 25)),
+            n_estimators_max=int(_value_or_default(d, "xgb_n_estimators_max", 500)),
             gpu_id=d.get("xgb_gpu_id"),
-            cleanup_per_fold=bool(d.get("xgb_cleanup_per_fold", False)),
-            cleanup_synchronize=bool(d.get("xgb_cleanup_synchronize", False)),
-            use_dmatrix=bool(d.get("xgb_use_dmatrix", True)),
+            cleanup_per_fold=bool(_value_or_default(d, "xgb_cleanup_per_fold", False)),
+            cleanup_synchronize=bool(_value_or_default(d, "xgb_cleanup_synchronize", False)),
+            use_dmatrix=bool(_value_or_default(d, "xgb_use_dmatrix", True)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class CVConfig:
     """Configuration for cross-validation.
 
@@ -226,15 +233,15 @@ class CVConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "CVConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            strategy=str(d.get("cv_strategy", "random")),
+            strategy=str(_value_or_default(d, "cv_strategy", "random")),
             splits=d.get("cv_splits"),
             group_col=d.get("cv_group_col"),
             time_col=d.get("cv_time_col"),
-            time_ascending=bool(d.get("cv_time_ascending", True)),
+            time_ascending=bool(_value_or_default(d, "cv_time_ascending", True)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class FTOOFConfig:
     """Configuration for FT-Transformer out-of-fold predictions.
 
@@ -254,11 +261,11 @@ class FTOOFConfig:
         return cls(
             folds=d.get("ft_oof_folds"),
             strategy=d.get("ft_oof_strategy"),
-            shuffle=bool(d.get("ft_oof_shuffle", True)),
+            shuffle=bool(_value_or_default(d, "ft_oof_shuffle", True)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class OutputConfig:
     """Configuration for output and caching.
 
@@ -294,16 +301,16 @@ class OutputConfig:
             optuna_storage=d.get("optuna_storage"),
             optuna_study_prefix=d.get("optuna_study_prefix"),
             best_params_files=d.get("best_params_files"),
-            save_preprocess=bool(d.get("save_preprocess", False)),
+            save_preprocess=bool(_value_or_default(d, "save_preprocess", False)),
             preprocess_artifact_path=d.get("preprocess_artifact_path"),
-            plot_path_style=str(d.get("plot_path_style", "nested")),
-            cache_predictions=bool(d.get("cache_predictions", False)),
+            plot_path_style=str(_value_or_default(d, "plot_path_style", "nested")),
+            cache_predictions=bool(_value_or_default(d, "cache_predictions", False)),
             prediction_cache_dir=d.get("prediction_cache_dir"),
-            prediction_cache_format=str(d.get("prediction_cache_format", "parquet")),
+            prediction_cache_format=str(_value_or_default(d, "prediction_cache_format", "parquet")),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class EnsembleConfig:
     """Configuration for ensemble training.
 
@@ -321,13 +328,13 @@ class EnsembleConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "EnsembleConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            final_ensemble=bool(d.get("final_ensemble", False)),
-            final_ensemble_k=int(d.get("final_ensemble_k", 3)),
-            final_refit=bool(d.get("final_refit", True)),
+            final_ensemble=bool(_value_or_default(d, "final_ensemble", False)),
+            final_ensemble_k=int(_value_or_default(d, "final_ensemble_k", 3)),
+            final_refit=bool(_value_or_default(d, "final_refit", True)),
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrainingConfig:
     """Core training configuration.
 
@@ -353,11 +360,11 @@ class TrainingConfig:
     def from_flat_dict(cls, d: Dict[str, Any]) -> "TrainingConfig":
         """Create from a flat dictionary with prefixed keys."""
         return cls(
-            prop_test=float(d.get("prop_test", 0.25)),
+            prop_test=float(_value_or_default(d, "prop_test", 0.25)),
             rand_seed=d.get("rand_seed"),
-            epochs=int(d.get("epochs", 100)),
-            use_gpu=bool(d.get("use_gpu", True)),
-            reuse_best_params=bool(d.get("reuse_best_params", False)),
-            resn_weight_decay=float(d.get("resn_weight_decay", 1e-4)),
+            epochs=int(_value_or_default(d, "epochs", 100)),
+            use_gpu=bool(_value_or_default(d, "use_gpu", True)),
+            reuse_best_params=bool(_value_or_default(d, "reuse_best_params", False)),
+            resn_weight_decay=float(_value_or_default(d, "resn_weight_decay", 1e-4)),
             bo_sample_limit=d.get("bo_sample_limit"),
         )

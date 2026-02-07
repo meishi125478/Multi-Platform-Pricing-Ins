@@ -26,7 +26,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.cuda.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -45,10 +44,7 @@ except Exception as exc:
 try:
     from ins_pricing.modelling.plotting.diagnostics import plot_loss_curve as plot_loss_curve_common
 except Exception:
-    try:
-        from ins_pricing.plotting.diagnostics import plot_loss_curve as plot_loss_curve_common
-    except Exception:
-        plot_loss_curve_common = None
+    plot_loss_curve_common = None
 
 # Import from other utils modules
 from ins_pricing.utils import (
@@ -66,6 +62,7 @@ from ins_pricing.utils.losses import (
     resolve_tweedie_power,
 )
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
+from ins_pricing.modelling.bayesopt.utils.torch_runtime import create_autocast_context
 
 _logger = get_logger("ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin")
 
@@ -495,7 +492,7 @@ class TorchTrainerMixin:
                     is_ddp_model and not is_update_step) else nullcontext
 
                 with sync_cm():
-                    with autocast(enabled=(device_type == 'cuda')):
+                    with create_autocast_context(device_type):
                         y_pred, y_true, w = forward_fn(batch)
                         weighted_loss = self._compute_weighted_loss(
                             y_pred, y_true, w, apply_softplus=apply_softplus)
@@ -538,7 +535,7 @@ class TorchTrainerMixin:
 
                 if should_compute_val:
                     model.eval()
-                    with torch.no_grad(), autocast(enabled=(device_type == 'cuda')):
+                    with torch.no_grad(), create_autocast_context(device_type):
                         val_result = val_forward_fn()
                         if isinstance(val_result, tuple) and len(val_result) == 3:
                             y_val_pred, y_val_true, w_val = val_result

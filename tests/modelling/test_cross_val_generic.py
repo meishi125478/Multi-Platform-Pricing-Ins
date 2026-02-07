@@ -9,7 +9,7 @@ pytest.importorskip("optuna")
 pytest.importorskip("statsmodels")
 pytest.importorskip("xgboost")
 
-from ins_pricing.bayesopt.trainers import TrainerBase
+from ins_pricing.modelling.bayesopt.trainers import TrainerBase
 
 
 class DummyTrainer(TrainerBase):

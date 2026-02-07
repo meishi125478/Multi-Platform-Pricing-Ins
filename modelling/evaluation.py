@@ -7,7 +7,7 @@ import numpy as np
 
 from ins_pricing.production.monitoring import (
     classification_metrics,
-    regression_metrics,
+    metrics_report as _shared_metrics_report,
 )
 
 
@@ -112,7 +112,7 @@ def metrics_report(
 ) -> Dict[str, float]:
     if str(task_type) == "classification":
         return classification_metrics(y_true, y_pred, threshold=threshold)
-    return regression_metrics(y_true, y_pred, weight=weight)
+    return _shared_metrics_report(y_true, y_pred, task_type="regression", weight=weight)
 
 
 __all__ = [

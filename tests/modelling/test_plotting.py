@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -20,7 +18,7 @@ def test_plotting_outputs(tmp_path, monkeypatch):
     monkeypatch.setenv("MPLCONFIGDIR", str(mpl_cfg))
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_dir))
 
-    from ins_pricing.BayesOpt import BayesOptModel
+    from ins_pricing.modelling.bayesopt import BayesOptConfig, BayesOptModel
     import matplotlib.pyplot as plt
 
     monkeypatch.setattr(plt, "show", lambda *args, **kwargs: None)
@@ -35,9 +33,7 @@ def test_plotting_outputs(tmp_path, monkeypatch):
     )
     test = pd.DataFrame({"x1": rng.normal(size=20)})
 
-    model = BayesOptModel(
-        train,
-        test,
+    config = BayesOptConfig(
         model_nme="demo",
         resp_nme="y",
         weight_nme="w",
@@ -46,6 +42,7 @@ def test_plotting_outputs(tmp_path, monkeypatch):
         use_gpu=False,
         output_dir=str(tmp_path),
     )
+    model = BayesOptModel(train, test, config=config)
 
     for df in (model.train_data, model.test_data):
         df["pred_xgb"] = rng.normal(size=len(df))
@@ -61,3 +58,30 @@ def test_plotting_outputs(tmp_path, monkeypatch):
 
     assert lift_path.exists()
     assert dlift_path.exists()
+
+
+def test_use_gpu_enables_mps_backend(tmp_path, monkeypatch):
+    from ins_pricing.modelling.bayesopt import BayesOptConfig, BayesOptModel
+    import ins_pricing.modelling.bayesopt.core as core_mod
+
+    monkeypatch.setattr(core_mod.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        core_mod.DeviceManager,
+        "is_mps_available",
+        classmethod(lambda cls: True),
+    )
+
+    train = pd.DataFrame({"x1": [1.0, 2.0, 3.0], "y": [1.0, 2.0, 3.0], "w": [1.0, 1.0, 1.0]})
+    test = pd.DataFrame({"x1": [4.0, 5.0]})
+    config = BayesOptConfig(
+        model_nme="demo_mps",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x1"],
+        task_type="regression",
+        use_gpu=True,
+        output_dir=str(tmp_path),
+    )
+    model = BayesOptModel(train, test, config=config)
+
+    assert model.use_gpu is True

@@ -19,7 +19,7 @@ def _configure_matplotlib(tmp_path, monkeypatch):
 def test_plotting_library_outputs(tmp_path, monkeypatch):
     _configure_matplotlib(tmp_path, monkeypatch)
 
-    from ins_pricing.plotting import curves, diagnostics, geo, importance
+    from ins_pricing.modelling.plotting import curves, diagnostics, geo, importance
 
     rng = np.random.default_rng(42)
     n = 80
@@ -114,7 +114,7 @@ def test_geo_plotting_on_map_optional(tmp_path, monkeypatch):
     _configure_matplotlib(tmp_path, monkeypatch)
     pytest.importorskip("contextily")
 
-    from ins_pricing.plotting import geo
+    from ins_pricing.modelling.plotting import geo
 
     rng = np.random.default_rng(7)
     n = 60

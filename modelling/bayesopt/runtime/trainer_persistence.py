@@ -7,7 +7,8 @@ import joblib
 import torch
 
 from ins_pricing.modelling.bayesopt.checkpoints import (
-    rebuild_ft_model_from_checkpoint,
+    rebuild_ft_model_from_payload,
+    rebuild_resn_model_from_payload,
     serialize_ft_model_config,
 )
 from ins_pricing.utils import DeviceManager, get_logger, log_print
@@ -38,22 +39,15 @@ class TrainerPersistenceMixin:
         }
 
     def _load_ft_checkpoint_payload(self, loaded: Dict[str, Any], path: str) -> None:
-        if "state_dict" in loaded and "model_config" in loaded:
-            model = rebuild_ft_model_from_checkpoint(
-                state_dict=loaded.get("state_dict"),
-                model_config=loaded.get("model_config", {}),
-            )
-            self.best_params = loaded.get("best_params", {})
+        model, best_params, kind = rebuild_ft_model_from_payload(payload=loaded)
+        if kind == "raw":
+            _log(f"[load] Warning: Unknown model format in {path}")
+            return
+        if best_params is not None:
+            self.best_params = best_params
+        if model is not None:
             self._move_to_device(model)
-            self.model = model
-            return
-        if "model" in loaded:
-            loaded_model = loaded.get("model")
-            if loaded_model is not None:
-                self._move_to_device(loaded_model)
-            self.model = loaded_model
-            return
-        _log(f"[load] Warning: Unknown model format in {path}")
+        self.model = model
 
     def save(self) -> None:
         if self.model is None:
@@ -98,7 +92,28 @@ class TrainerPersistenceMixin:
                 self.model = loaded
         else:
             if self.label == 'ResNet' or self.label == 'ResNetClassifier':
-                pass
+                payload = torch_load(path, map_location='cpu', weights_only=False)
+                model_builder = getattr(self, "_build_model", None)
+                if not callable(model_builder):
+                    _log(
+                        f"[load] Warning: {self.label} checkpoint found but model builder is unavailable."
+                    )
+                    return
+                params_fallback = (
+                    dict(self.best_params)
+                    if isinstance(self.best_params, dict)
+                    else None
+                )
+                resn_loaded, resolved_params = rebuild_resn_model_from_payload(
+                    payload=payload,
+                    model_builder=model_builder,
+                    params_fallback=params_fallback,
+                    require_params=False,
+                )
+                self.best_params = resolved_params
+                if resn_loaded is not None:
+                    self._move_to_device(resn_loaded)
+                self.model = resn_loaded
             else:
                 loaded = torch_load(path, map_location='cpu', weights_only=False)
                 if isinstance(loaded, dict):

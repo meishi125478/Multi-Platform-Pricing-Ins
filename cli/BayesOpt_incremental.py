@@ -1,4 +1,4 @@
-"""Incremental training harness built on top of ``ins_pricing.bayesopt``.
+"""Incremental training harness built on top of ``ins_pricing.modelling.bayesopt``.
 
 This utility lets you append new observations to an existing dataset,
 reuse previously tuned hyperparameters and retrain a subset of models
@@ -45,6 +45,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ins_pricing.modelling.bayesopt.artifacts import (
+    best_params_csv_path,
+    load_best_params_csv,
+)
 from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
 
 setup_sys_path()
@@ -52,7 +56,7 @@ _imports = resolve_imports()
 
 ropt = _imports.bayesopt
 if ropt is None:  # pragma: no cover
-    raise ImportError("Failed to resolve ins_pricing.bayesopt for incremental CLI.")
+    raise ImportError("Failed to resolve ins_pricing.modelling.bayesopt for incremental CLI.")
 
 PLOT_MODEL_LABELS = _imports.PLOT_MODEL_LABELS
 PYTORCH_TRAINERS = _imports.PYTORCH_TRAINERS
@@ -249,13 +253,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _plot_curves_for_model(model: ropt.BayesOptModel, trained: List[str], cfg: Dict[str, Any]) -> None:
     plot_cfg = cfg.get("plot", {})
-    legacy_flags = {
-        "glm": cfg.get("plot_lift_glm", False),
-        "xgb": cfg.get("plot_lift_xgb", False),
-        "resn": cfg.get("plot_lift_resn", False),
-        "ft": cfg.get("plot_lift_ft", False),
-    }
-    plot_enabled = plot_cfg.get("enable", any(legacy_flags.values()))
+    plot_enabled = bool(plot_cfg.get("enable", False))
     if not plot_enabled:
         return
 
@@ -265,9 +263,7 @@ def _plot_curves_for_model(model: ropt.BayesOptModel, trained: List[str], cfg: D
 
     lift_models = plot_cfg.get("lift_models")
     if lift_models is None:
-        lift_models = [m for m, flag in legacy_flags.items() if flag]
-        if not lift_models:
-            lift_models = available
+        lift_models = available
     lift_models = dedupe_preserve_order([m for m in lift_models if m in available])
 
     if oneway_enabled:
@@ -346,16 +342,13 @@ def _infer_format_from_path(path: Path) -> str:
 
 
 def _load_best_params(model: ropt.BayesOptModel, trainer, silent: bool = False) -> Optional[Dict[str, Any]]:
-    label = trainer.label.lower()
+    label = str(trainer.label).lower()
     result_dir = Path(model.output_manager.result_dir)
-    path = result_dir / f"{model.model_nme}_bestparams_{label}.csv"
-    if not path.exists():
+    path = best_params_csv_path(result_dir, model.model_nme, trainer.label)
+    params_raw = load_best_params_csv(result_dir, model.model_nme, trainer.label)
+    if params_raw is None:
         if not silent:
             _log(f"No historical params found for {model.model_nme}/{label} at {path}.")
-        return None
-    try:
-        params_raw = ropt.IOUtils.load_params_file(str(path))
-    except Exception:
         return None
     return {
         key: _coerce_scalar(val)
@@ -594,95 +587,93 @@ class IncrementalUpdateRunner:
         merged = merged.copy(deep=True)
         merged.fillna(0, inplace=True)
         train_df, test_df = self._prepare_splits(merged)
-        model = ropt.BayesOptModel(
-            train_df,
-            test_df,
-            model_name,
-            self.cfg["target"],
-            self.cfg["weight"],
-            self.cfg["feature_list"],
-            task_type=self.cfg.get("task_type", "regression"),
-            binary_resp_nme=self.binary_resp,
-            cate_list=self.cfg.get("categorical_features"),
-            prop_test=self.prop_test,
-            rand_seed=self.rand_seed,
-            epochs=self.epochs,
-            use_gpu=bool(self.cfg.get("use_gpu", True)),
-            use_resn_data_parallel=self.cfg.get("use_resn_data_parallel", False),
-            use_ft_data_parallel=self.cfg.get("use_ft_data_parallel", True),
-            use_gnn_data_parallel=self.cfg.get("use_gnn_data_parallel", False),
-            use_resn_ddp=self.cfg.get("use_resn_ddp", False),
-            use_ft_ddp=self.cfg.get("use_ft_ddp", False),
-            use_gnn_ddp=self.cfg.get("use_gnn_ddp", False),
-            output_dir=str(self.output_root) if self.output_root else None,
-            xgb_max_depth_max=self.xgb_max_depth_max,
-            xgb_n_estimators_max=self.xgb_n_estimators_max,
-            xgb_gpu_id=self.xgb_gpu_id,
-            xgb_cleanup_per_fold=self.xgb_cleanup_per_fold,
-            xgb_cleanup_synchronize=self.xgb_cleanup_synchronize,
-            xgb_use_dmatrix=self.xgb_use_dmatrix,
-            ft_cleanup_per_fold=self.ft_cleanup_per_fold,
-            ft_cleanup_synchronize=self.ft_cleanup_synchronize,
-            resn_cleanup_per_fold=self.resn_cleanup_per_fold,
-            resn_cleanup_synchronize=self.resn_cleanup_synchronize,
-            gnn_cleanup_per_fold=self.gnn_cleanup_per_fold,
-            gnn_cleanup_synchronize=self.gnn_cleanup_synchronize,
-            optuna_cleanup_synchronize=self.optuna_cleanup_synchronize,
-            resn_weight_decay=self.cfg.get("resn_weight_decay"),
-            final_ensemble=bool(self.cfg.get("final_ensemble", False)),
-            final_ensemble_k=int(self.cfg.get("final_ensemble_k", 3)),
-            final_refit=bool(self.cfg.get("final_refit", True)),
-            optuna_storage=self.optuna_storage,
-            optuna_study_prefix=self.optuna_study_prefix,
-            best_params_files=self.best_params_files,
-            reuse_best_params=self.reuse_best_params,
-            gnn_use_approx_knn=self.cfg.get("gnn_use_approx_knn", True),
-            gnn_approx_knn_threshold=self.cfg.get("gnn_approx_knn_threshold", 50000),
-            gnn_graph_cache=self.cfg.get("gnn_graph_cache"),
-            gnn_max_gpu_knn_nodes=self.cfg.get("gnn_max_gpu_knn_nodes", 200000),
-            gnn_knn_gpu_mem_ratio=self.cfg.get("gnn_knn_gpu_mem_ratio", 0.9),
-            gnn_knn_gpu_mem_overhead=self.cfg.get("gnn_knn_gpu_mem_overhead", 2.0),
-            region_province_col=self.cfg.get("region_province_col"),
-            region_city_col=self.cfg.get("region_city_col"),
-            region_effect_alpha=self.cfg.get("region_effect_alpha"),
-            geo_feature_nmes=self.cfg.get("geo_feature_nmes"),
-            geo_token_hidden_dim=self.cfg.get("geo_token_hidden_dim"),
-            geo_token_layers=self.cfg.get("geo_token_layers"),
-            geo_token_dropout=self.cfg.get("geo_token_dropout"),
-            geo_token_k_neighbors=self.cfg.get("geo_token_k_neighbors"),
-            geo_token_learning_rate=self.cfg.get("geo_token_learning_rate"),
-            geo_token_epochs=self.cfg.get("geo_token_epochs"),
-            ft_role=str(self.cfg.get("ft_role", "model")),
-            ft_feature_prefix=str(self.cfg.get("ft_feature_prefix", "ft_emb")),
-            ft_num_numeric_tokens=self.cfg.get("ft_num_numeric_tokens"),
-            infer_categorical_max_unique=int(self.cfg.get("infer_categorical_max_unique", 50)),
-            infer_categorical_max_ratio=float(self.cfg.get("infer_categorical_max_ratio", 0.05)),
-            cv_strategy=self.cv_strategy or self.split_strategy,
-            cv_group_col=self.cv_group_col or self.split_group_col,
-            cv_time_col=self.cv_time_col or self.split_time_col,
-            cv_time_ascending=self.cv_time_ascending,
-            cv_splits=self.cv_splits,
-            ft_oof_folds=self.ft_oof_folds,
-            ft_oof_strategy=self.ft_oof_strategy,
-            ft_oof_shuffle=self.ft_oof_shuffle,
-            save_preprocess=self.save_preprocess,
-            preprocess_artifact_path=self.preprocess_artifact_path,
-            plot_path_style=self.plot_path_style,
-            bo_sample_limit=self.bo_sample_limit,
-            cache_predictions=self.cache_predictions,
-            prediction_cache_dir=self.prediction_cache_dir,
-            prediction_cache_format=self.prediction_cache_format,
-        )
+        config_fields = getattr(ropt.BayesOptConfig, "__dataclass_fields__", {})
+        allowed_config_keys = set(config_fields.keys())
+        config_payload = {
+            k: v for k, v in self.cfg.items() if k in allowed_config_keys
+        }
+        config_payload.update({
+            "model_nme": model_name,
+            "resp_nme": self.cfg["target"],
+            "weight_nme": self.cfg["weight"],
+            "factor_nmes": self.cfg["feature_list"],
+            "task_type": self.cfg.get("task_type", "regression"),
+            "binary_resp_nme": self.binary_resp,
+            "cate_list": self.cfg.get("categorical_features"),
+            "prop_test": self.prop_test,
+            "rand_seed": self.rand_seed,
+            "epochs": self.epochs,
+            "use_gpu": bool(self.cfg.get("use_gpu", True)),
+            "use_resn_data_parallel": self.cfg.get("use_resn_data_parallel", False),
+            "use_ft_data_parallel": self.cfg.get("use_ft_data_parallel", True),
+            "use_gnn_data_parallel": self.cfg.get("use_gnn_data_parallel", False),
+            "use_resn_ddp": self.cfg.get("use_resn_ddp", False),
+            "use_ft_ddp": self.cfg.get("use_ft_ddp", False),
+            "use_gnn_ddp": self.cfg.get("use_gnn_ddp", False),
+            "output_dir": str(self.output_root) if self.output_root else None,
+            "xgb_max_depth_max": self.xgb_max_depth_max,
+            "xgb_n_estimators_max": self.xgb_n_estimators_max,
+            "xgb_gpu_id": self.xgb_gpu_id,
+            "xgb_cleanup_per_fold": self.xgb_cleanup_per_fold,
+            "xgb_cleanup_synchronize": self.xgb_cleanup_synchronize,
+            "xgb_use_dmatrix": self.xgb_use_dmatrix,
+            "ft_cleanup_per_fold": self.ft_cleanup_per_fold,
+            "ft_cleanup_synchronize": self.ft_cleanup_synchronize,
+            "resn_cleanup_per_fold": self.resn_cleanup_per_fold,
+            "resn_cleanup_synchronize": self.resn_cleanup_synchronize,
+            "gnn_cleanup_per_fold": self.gnn_cleanup_per_fold,
+            "gnn_cleanup_synchronize": self.gnn_cleanup_synchronize,
+            "optuna_cleanup_synchronize": self.optuna_cleanup_synchronize,
+            "resn_weight_decay": self.cfg.get("resn_weight_decay"),
+            "final_ensemble": bool(self.cfg.get("final_ensemble", False)),
+            "final_ensemble_k": int(self.cfg.get("final_ensemble_k", 3)),
+            "final_refit": bool(self.cfg.get("final_refit", True)),
+            "optuna_storage": self.optuna_storage,
+            "optuna_study_prefix": self.optuna_study_prefix,
+            "best_params_files": self.best_params_files,
+            "reuse_best_params": self.reuse_best_params,
+            "gnn_use_approx_knn": self.cfg.get("gnn_use_approx_knn", True),
+            "gnn_approx_knn_threshold": self.cfg.get("gnn_approx_knn_threshold", 50000),
+            "gnn_graph_cache": self.cfg.get("gnn_graph_cache"),
+            "gnn_max_gpu_knn_nodes": self.cfg.get("gnn_max_gpu_knn_nodes", 200000),
+            "gnn_knn_gpu_mem_ratio": self.cfg.get("gnn_knn_gpu_mem_ratio", 0.9),
+            "gnn_knn_gpu_mem_overhead": self.cfg.get("gnn_knn_gpu_mem_overhead", 2.0),
+            "region_province_col": self.cfg.get("region_province_col"),
+            "region_city_col": self.cfg.get("region_city_col"),
+            "region_effect_alpha": self.cfg.get("region_effect_alpha"),
+            "geo_feature_nmes": self.cfg.get("geo_feature_nmes"),
+            "geo_token_hidden_dim": self.cfg.get("geo_token_hidden_dim"),
+            "geo_token_layers": self.cfg.get("geo_token_layers"),
+            "geo_token_dropout": self.cfg.get("geo_token_dropout"),
+            "geo_token_k_neighbors": self.cfg.get("geo_token_k_neighbors"),
+            "geo_token_learning_rate": self.cfg.get("geo_token_learning_rate"),
+            "geo_token_epochs": self.cfg.get("geo_token_epochs"),
+            "ft_role": str(self.cfg.get("ft_role", "model")),
+            "ft_feature_prefix": str(self.cfg.get("ft_feature_prefix", "ft_emb")),
+            "ft_num_numeric_tokens": self.cfg.get("ft_num_numeric_tokens"),
+            "cv_strategy": self.cv_strategy or self.split_strategy,
+            "cv_group_col": self.cv_group_col or self.split_group_col,
+            "cv_time_col": self.cv_time_col or self.split_time_col,
+            "cv_time_ascending": self.cv_time_ascending,
+            "cv_splits": self.cv_splits,
+            "ft_oof_folds": self.ft_oof_folds,
+            "ft_oof_strategy": self.ft_oof_strategy,
+            "ft_oof_shuffle": self.ft_oof_shuffle,
+            "save_preprocess": self.save_preprocess,
+            "preprocess_artifact_path": self.preprocess_artifact_path,
+            "plot_path_style": self.plot_path_style,
+            "bo_sample_limit": self.bo_sample_limit,
+            "cache_predictions": self.cache_predictions,
+            "prediction_cache_dir": self.prediction_cache_dir,
+            "prediction_cache_format": self.prediction_cache_format,
+        })
+        config_payload = {k: v for k, v in config_payload.items() if v is not None}
+        config = ropt.BayesOptConfig.from_flat_dict(config_payload)
+        model = ropt.BayesOptModel(train_df, test_df, config=config)
 
         if self.plot_requested and not self.args.dry_run:
             plot_cfg = self.cfg.get("plot", {})
-            legacy_flags = {
-                "glm": self.cfg.get("plot_lift_glm", False),
-                "xgb": self.cfg.get("plot_lift_xgb", False),
-                "resn": self.cfg.get("plot_lift_resn", False),
-                "ft": self.cfg.get("plot_lift_ft", False),
-            }
-            plot_enabled = plot_cfg.get("enable", any(legacy_flags.values()))
+            plot_enabled = bool(plot_cfg.get("enable", False))
             if plot_enabled and plot_cfg.get("pre_oneway", False) and plot_cfg.get("oneway", True):
                 n_bins = int(plot_cfg.get("n_bins", 10))
                 model.plot_oneway(n_bins=n_bins, plot_subdir="oneway/pre")

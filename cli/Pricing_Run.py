@@ -22,10 +22,7 @@ def _ensure_repo_root() -> None:
 
 _ensure_repo_root()
 
-try:
-    from ins_pricing.cli.utils.notebook_utils import run_from_config, run_from_config_cli  # type: ignore
-except Exception:  # pragma: no cover
-    from utils.notebook_utils import run_from_config, run_from_config_cli  # type: ignore
+from ins_pricing.cli.utils.notebook_utils import run_from_config, run_from_config_cli  # type: ignore
 
 
 def run(config_json: str | Path) -> None:

@@ -28,8 +28,28 @@ class FTTrainer(TrainerBase):
         else:
             super().__init__(context, 'FTTransformer', 'FTTransformer')
         self.model: Optional[FTTransformerSklearn] = None
-        self.enable_distributed_optuna = bool(context.config.use_ft_ddp and context.use_gpu)
+        dist_cfg = getattr(context.config, "distributed", context.config)
+        self.enable_distributed_optuna = bool(
+            getattr(dist_cfg, "use_ft_ddp", False) and context.use_gpu
+        )
         self._cv_geo_warned = False
+
+    def _dist_cfg(self):
+        return getattr(self.ctx.config, "distributed", self.ctx.config)
+
+    def _use_ft_data_parallel(self) -> bool:
+        cfg = self._dist_cfg()
+        return bool(getattr(cfg, "use_ft_data_parallel", False))
+
+    def _use_ft_ddp(self) -> bool:
+        cfg = self._dist_cfg()
+        return bool(getattr(cfg, "use_ft_ddp", False))
+
+    def _geo_feature_names(self) -> List[str]:
+        geo_cfg = getattr(self.ctx.config, "geo_token", None)
+        if geo_cfg is not None and hasattr(geo_cfg, "feature_nmes"):
+            return list(getattr(geo_cfg, "feature_nmes") or [])
+        return list(getattr(self.ctx.config, "geo_feature_nmes", []) or [])
 
     def _maybe_cleanup_gpu(self, model: Optional[FTTransformerSklearn]) -> None:
         if not bool(getattr(self.ctx.config, "ft_cleanup_per_fold", False)):
@@ -41,7 +61,11 @@ class FTTrainer(TrainerBase):
         self._clean_gpu(synchronize=synchronize)
 
     def _resolve_numeric_tokens(self) -> int:
-        requested = getattr(self.ctx.config, "ft_num_numeric_tokens", None)
+        ft_cfg = getattr(self.ctx.config, "ft_transformer", None)
+        if ft_cfg is not None and hasattr(ft_cfg, "num_numeric_tokens"):
+            requested = getattr(ft_cfg, "num_numeric_tokens")
+        else:
+            requested = getattr(self.ctx.config, "ft_num_numeric_tokens", None)
         return FTTransformerSklearn.resolve_numeric_token_count(
             self.ctx.num_features,
             self.ctx.cate_list,
@@ -72,7 +96,7 @@ class FTTrainer(TrainerBase):
                                     X_train: pd.DataFrame,
                                     X_val: pd.DataFrame,
                                     geo_params: Optional[Dict[str, Any]] = None):
-        if not self.ctx.config.geo_feature_nmes:
+        if not self._geo_feature_names():
             return None
         orig_train = self.ctx.train_data
         orig_test = self.ctx.test_data
@@ -133,7 +157,7 @@ class FTTrainer(TrainerBase):
         X_train = X_all.iloc[train_idx]
         X_val = X_all.iloc[val_idx]
         geo_train = geo_val = None
-        if self.ctx.config.geo_feature_nmes:
+        if self._geo_feature_names():
             built = self._build_geo_tokens_for_split(X_train, X_val, params)
             if built is not None:
                 geo_train, geo_val, _, _ = built
@@ -178,8 +202,8 @@ class FTTrainer(TrainerBase):
             epochs=self.ctx.epochs,
             patience=5,
             weight_decay=float(params.get("weight_decay", 0.0)),
-            use_data_parallel=self.ctx.config.use_ft_data_parallel,
-            use_ddp=self.ctx.config.use_ft_ddp,
+            use_data_parallel=self._use_ft_data_parallel(),
+            use_ddp=self._use_ft_ddp(),
             use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=num_numeric_tokens,
             loss_name=loss_name,
@@ -220,7 +244,7 @@ class FTTrainer(TrainerBase):
             param_space["tw_power"] = lambda t: t.suggest_float(
                 'tw_power', 1.0, 2.0)
         geo_enabled = bool(
-            self.ctx.geo_token_cols or self.ctx.config.geo_feature_nmes)
+            self.ctx.geo_token_cols or self._geo_feature_names())
         if geo_enabled:
             # Only tune GNN-related hyperparams when geo tokens are enabled.
             param_space.update({
@@ -283,8 +307,8 @@ class FTTrainer(TrainerBase):
                 learning_rate=params["learning_rate"],
                 patience=5,
                 weight_decay=float(params.get("weight_decay", 0.0)),
-                use_data_parallel=self.ctx.config.use_ft_data_parallel,
-                use_ddp=self.ctx.config.use_ft_ddp,
+                use_data_parallel=self._use_ft_data_parallel(),
+                use_ddp=self._use_ft_ddp(),
                 use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=num_numeric_tokens,
                 loss_name=loss_name,
@@ -375,8 +399,8 @@ class FTTrainer(TrainerBase):
                 num_cols=self.ctx.num_features,
                 cat_cols=self.ctx.cate_list,
                 task_type=self.ctx.task_type,
-                use_data_parallel=self.ctx.config.use_ft_data_parallel,
-                use_ddp=self.ctx.config.use_ft_ddp,
+                use_data_parallel=self._use_ft_data_parallel(),
+                use_ddp=self._use_ft_ddp(),
                 use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
@@ -410,8 +434,8 @@ class FTTrainer(TrainerBase):
             num_cols=self.ctx.num_features,
             cat_cols=self.ctx.cate_list,
             task_type=self.ctx.task_type,
-            use_data_parallel=self.ctx.config.use_ft_data_parallel,
-            use_ddp=self.ctx.config.use_ft_ddp,
+            use_data_parallel=self._use_ft_data_parallel(),
+            use_ddp=self._use_ft_ddp(),
             use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             weight_decay=float(resolved_params.get("weight_decay", 0.0)),
@@ -487,8 +511,8 @@ class FTTrainer(TrainerBase):
                 num_cols=self.ctx.num_features,
                 cat_cols=self.ctx.cate_list,
                 task_type=self.ctx.task_type,
-                use_data_parallel=self.ctx.config.use_ft_data_parallel,
-                use_ddp=self.ctx.config.use_ft_ddp,
+                use_data_parallel=self._use_ft_data_parallel(),
+                use_ddp=self._use_ft_ddp(),
                 use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=self._resolve_numeric_tokens(),
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
@@ -601,8 +625,8 @@ class FTTrainer(TrainerBase):
             num_cols=self.ctx.num_features,
             cat_cols=self.ctx.cate_list,
             task_type=self.ctx.task_type,
-            use_data_parallel=self.ctx.config.use_ft_data_parallel,
-            use_ddp=self.ctx.config.use_ft_ddp,
+            use_data_parallel=self._use_ft_data_parallel(),
+            use_ddp=self._use_ft_ddp(),
             use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             loss_name=loss_name,
@@ -768,8 +792,8 @@ class FTTrainer(TrainerBase):
             num_cols=self.ctx.num_features,
             cat_cols=self.ctx.cate_list,
             task_type=self.ctx.task_type,
-            use_data_parallel=self.ctx.config.use_ft_data_parallel,
-            use_ddp=self.ctx.config.use_ft_ddp,
+            use_data_parallel=self._use_ft_data_parallel(),
+            use_ddp=self._use_ft_ddp(),
             use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=self._resolve_numeric_tokens(),
             loss_name=loss_name,

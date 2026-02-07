@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -102,7 +102,138 @@ def rebuild_ft_model_from_checkpoint(
     return model
 
 
+def _merge_model_config(
+    base_config: Dict[str, Any],
+    overrides: Optional[Dict[str, Any]],
+    *,
+    fill_missing_only: bool,
+) -> Dict[str, Any]:
+    merged = dict(base_config or {})
+    if not overrides:
+        return merged
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if fill_missing_only and key in merged and merged.get(key) not in (None, ""):
+            continue
+        merged[key] = value
+    return merged
+
+
+def rebuild_ft_model_from_payload(
+    *,
+    payload: Any,
+    model_config_overrides: Optional[Dict[str, Any]] = None,
+    fill_missing_model_config: bool = True,
+) -> Tuple[Any, Optional[Dict[str, Any]], str]:
+    if not isinstance(payload, dict):
+        return payload, None, "raw"
+    if "state_dict" in payload and "model_config" in payload:
+        model_config = _merge_model_config(
+            payload.get("model_config", {}),
+            model_config_overrides,
+            fill_missing_only=fill_missing_model_config,
+        )
+        model = rebuild_ft_model_from_checkpoint(
+            state_dict=payload.get("state_dict"),
+            model_config=model_config,
+        )
+        best_params = payload.get("best_params")
+        best = dict(best_params) if isinstance(best_params, dict) else None
+        return model, best, "state_dict"
+    if "model" in payload:
+        best_params = payload.get("best_params")
+        best = dict(best_params) if isinstance(best_params, dict) else None
+        return payload.get("model"), best, "model"
+    return payload, None, "raw"
+
+
+def rebuild_resn_model_from_payload(
+    *,
+    payload: Any,
+    model_builder: Callable[[Dict[str, Any]], Any],
+    params_fallback: Optional[Dict[str, Any]] = None,
+    require_params: bool = True,
+) -> Tuple[Any, Dict[str, Any]]:
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload.get("state_dict")
+        params = payload.get("best_params")
+    else:
+        state_dict = payload
+        params = None
+
+    resolved_params: Optional[Dict[str, Any]] = None
+    if isinstance(params, dict) and params:
+        resolved_params = dict(params)
+    elif isinstance(params_fallback, dict):
+        resolved_params = dict(params_fallback)
+    elif isinstance(params, dict) and not require_params:
+        resolved_params = dict(params)
+    if require_params and not resolved_params:
+        raise RuntimeError("Best params not found for resn")
+    if resolved_params is None:
+        resolved_params = {}
+
+    model = model_builder(resolved_params)
+    model.resnet.load_state_dict(state_dict)
+    return model, resolved_params
+
+
+def _load_state_dict_with_policy(
+    module: Any,
+    state_dict: Any,
+    *,
+    strict: bool,
+    allow_non_strict_fallback: bool,
+) -> Optional[str]:
+    if module is None or state_dict is None:
+        return None
+    if not strict:
+        module.load_state_dict(state_dict, strict=False)
+        return None
+    try:
+        module.load_state_dict(state_dict, strict=True)
+        return None
+    except RuntimeError as exc:
+        if allow_non_strict_fallback and (
+            "Missing key" in str(exc) or "Unexpected key" in str(exc)
+        ):
+            module.load_state_dict(state_dict, strict=False)
+            return str(exc)
+        raise
+
+
+def rebuild_gnn_model_from_payload(
+    *,
+    payload: Any,
+    model_builder: Callable[[Dict[str, Any]], Any],
+    strict: bool = True,
+    allow_non_strict_fallback: bool = False,
+) -> Tuple[Any, Dict[str, Any], Optional[str]]:
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid GNN checkpoint payload.")
+    params_raw = payload.get("best_params")
+    params = dict(params_raw) if isinstance(params_raw, dict) else {}
+    state_dict = payload.get("state_dict")
+
+    model = model_builder(params)
+    if params and hasattr(model, "set_params"):
+        model.set_params(dict(params))
+
+    base_gnn = getattr(model, "_unwrap_gnn", lambda: None)()
+    warning = _load_state_dict_with_policy(
+        base_gnn,
+        state_dict,
+        strict=strict,
+        allow_non_strict_fallback=allow_non_strict_fallback,
+    )
+    return model, params, warning
+
+
 __all__ = [
     "serialize_ft_model_config",
     "rebuild_ft_model_from_checkpoint",
+    "rebuild_ft_model_from_payload",
+    "rebuild_resn_model_from_payload",
+    "rebuild_gnn_model_from_payload",
 ]

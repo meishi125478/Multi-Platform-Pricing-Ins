@@ -36,7 +36,7 @@ _imports = resolve_imports()
 
 ropt = _imports.bayesopt
 if ropt is None:  # pragma: no cover
-    raise ImportError("Failed to resolve ins_pricing.bayesopt for explain CLI.")
+    raise ImportError("Failed to resolve ins_pricing.modelling.bayesopt for explain CLI.")
 
 build_model_names = _imports.build_model_names
 dedupe_preserve_order = _imports.dedupe_preserve_order
@@ -513,7 +513,7 @@ def explain_from_config(args: argparse.Namespace) -> None:
             "plot_path_style": plot_path_style or "nested",
         })
         config_payload = {k: v for k, v in config_payload.items() if v is not None}
-        config = ropt.BayesOptConfig(**config_payload)
+        config = ropt.BayesOptConfig.from_flat_dict(config_payload)
         model = ropt.BayesOptModel(train_df, test_df, config=config)
 
         output_overrides = resolve_explain_output_overrides(

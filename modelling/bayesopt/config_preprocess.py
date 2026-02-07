@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +11,19 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
+from ins_pricing.modelling.bayesopt.config_components import (
+    CVConfig,
+    DistributedConfig,
+    EnsembleConfig,
+    FTOOFConfig,
+    FTTransformerConfig,
+    GNNConfig,
+    GeoTokenConfig,
+    OutputConfig,
+    RegionConfig,
+    TrainingConfig,
+    XGBoostConfig,
+)
 from ins_pricing.utils.io import IOUtils
 from ins_pricing.utils.losses import normalize_distribution_name, normalize_loss_name
 from ins_pricing.exceptions import ConfigurationError, DataValidationError
@@ -230,9 +243,119 @@ class BayesOptConfig:
     prediction_cache_format: str = "parquet"
     dataloader_workers: Optional[int] = None
 
+    # Nested configuration views (synced from flat fields in __post_init__).
+    _distributed: DistributedConfig = field(default_factory=DistributedConfig, init=False, repr=False)
+    _gnn: GNNConfig = field(default_factory=GNNConfig, init=False, repr=False)
+    _geo_token: GeoTokenConfig = field(default_factory=GeoTokenConfig, init=False, repr=False)
+    _region: RegionConfig = field(default_factory=RegionConfig, init=False, repr=False)
+    _ft_transformer: FTTransformerConfig = field(default_factory=FTTransformerConfig, init=False, repr=False)
+    _xgboost: XGBoostConfig = field(default_factory=XGBoostConfig, init=False, repr=False)
+    _cv: CVConfig = field(default_factory=CVConfig, init=False, repr=False)
+    _ft_oof: FTOOFConfig = field(default_factory=FTOOFConfig, init=False, repr=False)
+    _output: OutputConfig = field(default_factory=OutputConfig, init=False, repr=False)
+    _ensemble: EnsembleConfig = field(default_factory=EnsembleConfig, init=False, repr=False)
+    _training: TrainingConfig = field(default_factory=TrainingConfig, init=False, repr=False)
+    _is_initialized: bool = field(default=False, init=False, repr=False)
+    _sync_in_progress: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self) -> None:
-        """Validate configuration after initialization."""
+        """Synchronize nested config views and validate values."""
+        self._sync_nested_components()
         self._validate()
+        object.__setattr__(self, "_is_initialized", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep nested config views in sync when flat fields are mutated."""
+        object.__setattr__(self, name, value)
+        if name.startswith("_"):
+            return
+        if not getattr(self, "_is_initialized", False):
+            return
+        if getattr(self, "_sync_in_progress", False):
+            return
+        spec = self.__dataclass_fields__.get(name)
+        if spec is None or not getattr(spec, "init", True):
+            return
+        self._sync_nested_components()
+
+    @classmethod
+    def from_flat_dict(cls, d: Dict[str, Any]) -> "BayesOptConfig":
+        """Build config from a flat dict while ignoring unknown/None values."""
+        fields = getattr(cls, "__dataclass_fields__", {})
+        payload: Dict[str, Any] = {}
+        for key, value in d.items():
+            spec = fields.get(key)
+            if spec is None or not getattr(spec, "init", True):
+                continue
+            if value is not None:
+                payload[key] = value
+        return cls(**payload)
+
+    def _sync_nested_components(self) -> None:
+        object.__setattr__(self, "_sync_in_progress", True)
+        flat = {
+            key: getattr(self, key)
+            for key, spec in self.__dataclass_fields__.items()
+            if getattr(spec, "init", True)
+        }
+        try:
+            object.__setattr__(self, "_distributed", DistributedConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_gnn", GNNConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_geo_token", GeoTokenConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_region", RegionConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_ft_transformer", FTTransformerConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_xgboost", XGBoostConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_cv", CVConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_ft_oof", FTOOFConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_output", OutputConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_ensemble", EnsembleConfig.from_flat_dict(flat))
+            object.__setattr__(self, "_training", TrainingConfig.from_flat_dict(flat))
+        finally:
+            object.__setattr__(self, "_sync_in_progress", False)
+
+    @property
+    def distributed(self) -> DistributedConfig:
+        return self._distributed
+
+    @property
+    def gnn(self) -> GNNConfig:
+        return self._gnn
+
+    @property
+    def geo_token(self) -> GeoTokenConfig:
+        return self._geo_token
+
+    @property
+    def region(self) -> RegionConfig:
+        return self._region
+
+    @property
+    def ft_transformer(self) -> FTTransformerConfig:
+        return self._ft_transformer
+
+    @property
+    def xgboost(self) -> XGBoostConfig:
+        return self._xgboost
+
+    @property
+    def cv(self) -> CVConfig:
+        return self._cv
+
+    @property
+    def ft_oof(self) -> FTOOFConfig:
+        return self._ft_oof
+
+    @property
+    def output(self) -> OutputConfig:
+        return self._output
+
+    @property
+    def ensemble(self) -> EnsembleConfig:
+        return self._ensemble
+
+    @property
+    def training(self) -> TrainingConfig:
+        return self._training
 
     def _validate(self) -> None:
         """Validate configuration values and raise errors for invalid combinations."""
@@ -465,7 +588,7 @@ class DatasetPreprocessor:
             if col not in self.train_data.columns
         ]
         if missing_train:
-            raise DataValidationError(
+            raise KeyError(
                 f"Train data missing required columns: {missing_train}. "
                 f"Available columns (first 50): {list(self.train_data.columns)[:50]}"
             )

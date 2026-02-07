@@ -209,10 +209,14 @@ def _weighted_mean(values: np.ndarray, weight: Optional[np.ndarray]) -> float:
     return float(np.sum(values * weight) / total)
 
 
-def rmse(y_true, y_pred, sample_weight=None) -> float:
+def mse(y_true, y_pred, sample_weight=None) -> float:
     y_t, y_p, w = _align(y_true, y_pred, sample_weight)
     err = (y_t - y_p) ** 2
-    return float(np.sqrt(_weighted_mean(err, w)))
+    return _weighted_mean(err, w)
+
+
+def rmse(y_true, y_pred, sample_weight=None) -> float:
+    return float(np.sqrt(mse(y_true, y_pred, sample_weight)))
 
 
 def mae(y_true, y_pred, sample_weight=None) -> float:

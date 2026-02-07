@@ -4,19 +4,23 @@ from dataclasses import asdict
 from datetime import datetime
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import GroupKFold, ShuffleSplit, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
+from ins_pricing.modelling.bayesopt.artifacts import (
+    best_params_csv_path,
+    load_best_params_csv,
+)
 from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig, DatasetPreprocessor, OutputManager, VersionManager
 from ins_pricing.modelling.bayesopt.model_explain_mixin import BayesOptExplainMixin
 from ins_pricing.modelling.bayesopt.model_plotting_mixin import BayesOptPlottingMixin
 from ins_pricing.modelling.bayesopt.models import GraphNeuralNetSklearn
 from ins_pricing.modelling.bayesopt.trainers import FTTrainer, GLMTrainer, GNNTrainer, ResNetTrainer, XGBTrainer
-from ins_pricing.utils import EPS, infer_factor_and_cate_list, set_global_seed, get_logger, log_print
+from ins_pricing.modelling.bayesopt.trainers.cv_utils import CVStrategyResolver
+from ins_pricing.utils import EPS, DeviceManager, set_global_seed, get_logger, log_print
 from ins_pricing.utils.io import IOUtils
 from ins_pricing.utils.losses import (
     normalize_distribution_name,
@@ -32,146 +36,42 @@ def _log(*args, **kwargs) -> None:
     log_print(_logger, *args, **kwargs)
 
 
-class _CVSplitter:
-    """Wrapper to carry optional groups or time order for CV splits."""
+class _ResolvedCVSplitter:
+    """Adapter exposing a sklearn-like split() API via CVStrategyResolver."""
 
     def __init__(
         self,
-        splitter,
+        resolver: CVStrategyResolver,
         *,
-        groups: Optional[pd.Series] = None,
-        order: Optional[np.ndarray] = None,
+        n_splits: int,
+        val_ratio: float,
     ) -> None:
-        self._splitter = splitter
-        self._groups = groups
-        self._order = order
+        self._resolver = resolver
+        self._n_splits = max(2, int(n_splits))
+        self._val_ratio = float(val_ratio)
 
-    def split(self, X, y=None, groups=None):
-        if self._order is not None:
-            order = np.asarray(self._order)
-            X_ord = X.iloc[order] if hasattr(X, "iloc") else X[order]
-            for tr_idx, val_idx in self._splitter.split(X_ord, y=y):
-                yield order[tr_idx], order[val_idx]
-            return
-        use_groups = groups if groups is not None else self._groups
-        for tr_idx, val_idx in self._splitter.split(X, y=y, groups=use_groups):
+    def split(self, X, y=None, groups=None):  # pylint: disable=unused-argument
+        split_iter, _ = self._resolver.create_cv_splitter(
+            X_all=X,
+            y_all=y,
+            n_splits=self._n_splits,
+            val_ratio=self._val_ratio,
+        )
+        for tr_idx, val_idx in split_iter:
             yield tr_idx, val_idx
 
 # BayesOpt orchestration and SHAP utilities
 # =============================================================================
 class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
-    def __init__(self, train_data, test_data,
-                 config: Optional[BayesOptConfig] = None,
-                 # Backward compatibility: individual parameters (DEPRECATED)
-                 model_nme=None, resp_nme=None, weight_nme=None,
-                 factor_nmes: Optional[List[str]] = None, task_type='regression',
-                 binary_resp_nme=None,
-                 cate_list=None, prop_test=0.25, rand_seed=None,
-                 epochs=100, use_gpu=True,
-                 use_resn_data_parallel: bool = False, use_ft_data_parallel: bool = False,
-                 use_gnn_data_parallel: bool = False,
-                 use_resn_ddp: bool = False, use_ft_ddp: bool = False,
-                 use_gnn_ddp: bool = False,
-                 output_dir: Optional[str] = None,
-                 gnn_use_approx_knn: bool = True,
-                 gnn_approx_knn_threshold: int = 50000,
-                 gnn_graph_cache: Optional[str] = None,
-                 gnn_max_gpu_knn_nodes: Optional[int] = 200000,
-                 gnn_knn_gpu_mem_ratio: float = 0.9,
-                 gnn_knn_gpu_mem_overhead: float = 2.0,
-                 ft_role: str = "model",
-                 ft_feature_prefix: str = "ft_emb",
-                 ft_num_numeric_tokens: Optional[int] = None,
-                 infer_categorical_max_unique: int = 50,
-                 infer_categorical_max_ratio: float = 0.05,
-                 reuse_best_params: bool = False,
-                 xgb_max_depth_max: int = 25,
-                 xgb_n_estimators_max: int = 500,
-                 resn_weight_decay: Optional[float] = None,
-                 final_ensemble: bool = False,
-                 final_ensemble_k: int = 3,
-                 final_refit: bool = True,
-                 optuna_storage: Optional[str] = None,
-                 optuna_study_prefix: Optional[str] = None,
-                 best_params_files: Optional[Dict[str, str]] = None,
-                 cv_strategy: Optional[str] = None,
-                 cv_splits: Optional[int] = None,
-                 cv_group_col: Optional[str] = None,
-                 cv_time_col: Optional[str] = None,
-                 cv_time_ascending: bool = True,
-                 ft_oof_folds: Optional[int] = None,
-                 ft_oof_strategy: Optional[str] = None,
-                 ft_oof_shuffle: bool = True,
-                 save_preprocess: bool = False,
-                 preprocess_artifact_path: Optional[str] = None,
-                 plot_path_style: Optional[str] = None,
-                 bo_sample_limit: Optional[int] = None,
-                 cache_predictions: bool = False,
-                 prediction_cache_dir: Optional[str] = None,
-                 prediction_cache_format: Optional[str] = None,
-                 region_province_col: Optional[str] = None,
-                 region_city_col: Optional[str] = None,
-                 region_effect_alpha: Optional[float] = None,
-                 geo_feature_nmes: Optional[List[str]] = None,
-                 geo_token_hidden_dim: Optional[int] = None,
-                 geo_token_layers: Optional[int] = None,
-                 geo_token_dropout: Optional[float] = None,
-                 geo_token_k_neighbors: Optional[int] = None,
-                 geo_token_learning_rate: Optional[float] = None,
-                 geo_token_epochs: Optional[int] = None,
-                 xgb_gpu_id: Optional[int] = None,
-                 xgb_cleanup_per_fold: bool = False,
-                 xgb_cleanup_synchronize: bool = False,
-                 xgb_use_dmatrix: bool = True,
-                 ft_cleanup_per_fold: bool = False,
-                 ft_cleanup_synchronize: bool = False,
-                 resn_cleanup_per_fold: bool = False,
-                 resn_cleanup_synchronize: bool = False,
-                 gnn_cleanup_per_fold: bool = False,
-                 gnn_cleanup_synchronize: bool = False,
-                 optuna_cleanup_synchronize: bool = False,
-                 distribution: Optional[str] = None):
+    def __init__(self, train_data, test_data, config: BayesOptConfig):
         """Orchestrate BayesOpt training across multiple trainers.
 
         Args:
             train_data: Training DataFrame.
             test_data: Test DataFrame.
-            config: BayesOptConfig instance with all configuration (RECOMMENDED).
-                If provided, all other parameters are ignored.
-
-            # DEPRECATED: Individual parameters (use config instead)
-            model_nme: Model name prefix used in outputs.
-            resp_nme: Target column name.
-            weight_nme: Sample weight column name.
-            factor_nmes: Feature column list.
-            task_type: "regression" or "classification".
-            distribution: Optional distribution override (regression only).
-            binary_resp_nme: Optional binary target for lift curves.
-            cate_list: Categorical feature list.
-            prop_test: Validation split ratio in CV.
-            rand_seed: Random seed.
-            epochs: NN training epochs.
-            use_gpu: Prefer GPU when available.
-            use_resn_data_parallel: Enable DataParallel for ResNet.
-            use_ft_data_parallel: Enable DataParallel for FTTransformer.
-            use_gnn_data_parallel: Enable DataParallel for GNN.
-            use_resn_ddp: Enable DDP for ResNet.
-            use_ft_ddp: Enable DDP for FTTransformer.
-            use_gnn_ddp: Enable DDP for GNN.
-            output_dir: Output root for models/results/plots.
-            gnn_use_approx_knn: Use approximate kNN when available.
-            gnn_approx_knn_threshold: Row threshold to switch to approximate kNN.
-            gnn_graph_cache: Optional adjacency cache path.
-            gnn_max_gpu_knn_nodes: Force CPU kNN above this node count to avoid OOM.
-            gnn_knn_gpu_mem_ratio: Fraction of free GPU memory for kNN.
-            gnn_knn_gpu_mem_overhead: Temporary memory multiplier for GPU kNN.
-            ft_num_numeric_tokens: Number of numeric tokens for FT (None = auto).
-            final_ensemble: Enable k-fold model averaging at the final stage.
-            final_ensemble_k: Number of folds for averaging.
-            final_refit: Refit on full data using best stopping point.
+            config: BayesOptConfig instance with all configuration.
 
         Examples:
-            # New style (recommended):
             config = BayesOptConfig(
                 model_nme="my_model",
                 resp_nme="target",
@@ -179,157 +79,12 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 factor_nmes=["feat1", "feat2"]
             )
             model = BayesOptModel(train_df, test_df, config=config)
-
-            # Old style (deprecated, for backward compatibility):
-            model = BayesOptModel(
-                train_df, test_df,
-                model_nme="my_model",
-                resp_nme="target",
-                weight_nme="weight",
-                factor_nmes=["feat1", "feat2"]
-            )
         """
-        # Detect which API is being used
-        if config is not None:
-            # New API: config object provided
-            if isinstance(config, BayesOptConfig):
-                cfg = config
-            else:
-                raise TypeError(
-                    f"config must be a BayesOptConfig instance, got {type(config).__name__}"
-                )
-        else:
-            # Old API: individual parameters (backward compatibility)
-            # Show deprecation warning
-            import warnings
-            warnings.warn(
-                "Passing individual parameters to BayesOptModel.__init__ is deprecated. "
-                "Use the 'config' parameter with a BayesOptConfig instance instead:\n"
-                "  config = BayesOptConfig(model_nme=..., resp_nme=..., ...)\n"
-                "  model = BayesOptModel(train_data, test_data, config=config)\n"
-                "Individual parameters will be removed in v0.4.0.",
-                DeprecationWarning,
-                stacklevel=2
+        if not isinstance(config, BayesOptConfig):
+            raise TypeError(
+                f"config must be a BayesOptConfig instance, got {type(config).__name__}"
             )
-
-            # Validate required parameters
-            if model_nme is None:
-                raise ValueError("model_nme is required when not using config parameter")
-            if resp_nme is None:
-                raise ValueError("resp_nme is required when not using config parameter")
-            if weight_nme is None:
-                raise ValueError("weight_nme is required when not using config parameter")
-
-            # Infer categorical features if needed
-            # Only use user-specified categorical list for one-hot; do not auto-infer.
-            user_cate_list = [] if cate_list is None else list(cate_list)
-            inferred_factors, inferred_cats = infer_factor_and_cate_list(
-                train_df=train_data,
-                test_df=test_data,
-                resp_nme=resp_nme,
-                weight_nme=weight_nme,
-                binary_resp_nme=binary_resp_nme,
-                factor_nmes=factor_nmes,
-                cate_list=user_cate_list,
-                infer_categorical_max_unique=int(infer_categorical_max_unique),
-                infer_categorical_max_ratio=float(infer_categorical_max_ratio),
-            )
-
-            # Construct config from individual parameters
-            cfg = BayesOptConfig(
-                model_nme=model_nme,
-                task_type=task_type,
-                resp_nme=resp_nme,
-                weight_nme=weight_nme,
-                factor_nmes=list(inferred_factors),
-                binary_resp_nme=binary_resp_nme,
-                distribution=distribution,
-                cate_list=list(inferred_cats) if inferred_cats else None,
-                prop_test=prop_test,
-                rand_seed=rand_seed,
-                epochs=epochs,
-                use_gpu=use_gpu,
-                xgb_max_depth_max=int(xgb_max_depth_max),
-                xgb_n_estimators_max=int(xgb_n_estimators_max),
-                xgb_gpu_id=int(xgb_gpu_id) if xgb_gpu_id is not None else None,
-                xgb_cleanup_per_fold=bool(xgb_cleanup_per_fold),
-                xgb_cleanup_synchronize=bool(xgb_cleanup_synchronize),
-                xgb_use_dmatrix=bool(xgb_use_dmatrix),
-                ft_cleanup_per_fold=bool(ft_cleanup_per_fold),
-                ft_cleanup_synchronize=bool(ft_cleanup_synchronize),
-                resn_cleanup_per_fold=bool(resn_cleanup_per_fold),
-                resn_cleanup_synchronize=bool(resn_cleanup_synchronize),
-                gnn_cleanup_per_fold=bool(gnn_cleanup_per_fold),
-                gnn_cleanup_synchronize=bool(gnn_cleanup_synchronize),
-                optuna_cleanup_synchronize=bool(optuna_cleanup_synchronize),
-                use_resn_data_parallel=use_resn_data_parallel,
-                use_ft_data_parallel=use_ft_data_parallel,
-                use_resn_ddp=use_resn_ddp,
-                use_gnn_data_parallel=use_gnn_data_parallel,
-                use_ft_ddp=use_ft_ddp,
-                use_gnn_ddp=use_gnn_ddp,
-                gnn_use_approx_knn=gnn_use_approx_knn,
-                gnn_approx_knn_threshold=gnn_approx_knn_threshold,
-                gnn_graph_cache=gnn_graph_cache,
-                gnn_max_gpu_knn_nodes=gnn_max_gpu_knn_nodes,
-                gnn_knn_gpu_mem_ratio=gnn_knn_gpu_mem_ratio,
-                gnn_knn_gpu_mem_overhead=gnn_knn_gpu_mem_overhead,
-                output_dir=output_dir,
-                optuna_storage=optuna_storage,
-                optuna_study_prefix=optuna_study_prefix,
-                best_params_files=best_params_files,
-                ft_role=str(ft_role or "model"),
-                ft_feature_prefix=str(ft_feature_prefix or "ft_emb"),
-                ft_num_numeric_tokens=ft_num_numeric_tokens,
-                reuse_best_params=bool(reuse_best_params),
-                resn_weight_decay=float(resn_weight_decay)
-                if resn_weight_decay is not None
-                else 1e-4,
-                final_ensemble=bool(final_ensemble),
-                final_ensemble_k=int(final_ensemble_k),
-                final_refit=bool(final_refit),
-                cv_strategy=str(cv_strategy or "random"),
-                cv_splits=cv_splits,
-                cv_group_col=cv_group_col,
-                cv_time_col=cv_time_col,
-                cv_time_ascending=bool(cv_time_ascending),
-                ft_oof_folds=ft_oof_folds,
-                ft_oof_strategy=ft_oof_strategy,
-                ft_oof_shuffle=bool(ft_oof_shuffle),
-                save_preprocess=bool(save_preprocess),
-                preprocess_artifact_path=preprocess_artifact_path,
-                plot_path_style=str(plot_path_style or "nested"),
-                bo_sample_limit=bo_sample_limit,
-                cache_predictions=bool(cache_predictions),
-                prediction_cache_dir=prediction_cache_dir,
-                prediction_cache_format=str(prediction_cache_format or "parquet"),
-                region_province_col=region_province_col,
-                region_city_col=region_city_col,
-                region_effect_alpha=float(region_effect_alpha)
-                if region_effect_alpha is not None
-                else 50.0,
-                geo_feature_nmes=list(geo_feature_nmes)
-                if geo_feature_nmes is not None
-                else None,
-                geo_token_hidden_dim=int(geo_token_hidden_dim)
-                if geo_token_hidden_dim is not None
-                else 32,
-                geo_token_layers=int(geo_token_layers)
-                if geo_token_layers is not None
-                else 2,
-                geo_token_dropout=float(geo_token_dropout)
-                if geo_token_dropout is not None
-                else 0.1,
-                geo_token_k_neighbors=int(geo_token_k_neighbors)
-                if geo_token_k_neighbors is not None
-                else 10,
-                geo_token_learning_rate=float(geo_token_learning_rate)
-                if geo_token_learning_rate is not None
-                else 1e-3,
-                geo_token_epochs=int(geo_token_epochs)
-                if geo_token_epochs is not None
-                else 50,
-            )
+        cfg = config
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type
@@ -356,7 +111,10 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         self.rand_seed = cfg.rand_seed if cfg.rand_seed is not None else np.random.randint(
             1, 10000)
         set_global_seed(int(self.rand_seed))
-        self.use_gpu = bool(cfg.use_gpu and torch.cuda.is_available())
+        self.use_gpu = bool(
+            cfg.use_gpu
+            and (torch.cuda.is_available() or DeviceManager.is_mps_available())
+        )
         self.output_manager = OutputManager(
             cfg.output_dir or os.getcwd(), self.model_nme)
 
@@ -409,65 +167,25 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             'gnn': GNNTrainer(self),
         }
         self._prepare_geo_tokens()
-        self.xgb_best = None
-        self.resn_best = None
-        self.gnn_best = None
-        self.glm_best = None
-        self.ft_best = None
-        self.best_xgb_params = None
-        self.best_resn_params = None
-        self.best_gnn_params = None
-        self.best_ft_params = None
-        self.best_xgb_trial = None
-        self.best_resn_trial = None
-        self.best_gnn_trial = None
-        self.best_ft_trial = None
-        self.best_glm_params = None
-        self.best_glm_trial = None
-        self.xgb_load = None
-        self.resn_load = None
-        self.gnn_load = None
-        self.ft_load = None
         self.version_manager = VersionManager(self.output_manager)
 
-    def _build_cv_splitter(self) -> _CVSplitter:
-        strategy = str(getattr(self.config, "cv_strategy", "random") or "random").strip().lower()
+    def _build_cv_splitter(self) -> _ResolvedCVSplitter:
         val_ratio = float(self.prop_test) if self.prop_test is not None else 0.25
         if not (0.0 < val_ratio < 1.0):
             val_ratio = 0.25
         cv_splits = getattr(self.config, "cv_splits", None)
         if cv_splits is None:
             cv_splits = max(2, int(round(1 / val_ratio)))
-        cv_splits = max(2, int(cv_splits))
-
-        if strategy in {"group", "grouped"}:
-            group_col = getattr(self.config, "cv_group_col", None)
-            if not group_col:
-                raise ValueError("cv_group_col is required for group cv_strategy.")
-            if group_col not in self.train_data.columns:
-                raise KeyError(f"cv_group_col '{group_col}' not in train_data.")
-            groups = self.train_data[group_col]
-            splitter = GroupKFold(n_splits=cv_splits)
-            return _CVSplitter(splitter, groups=groups)
-
-        if strategy in {"time", "timeseries", "temporal"}:
-            time_col = getattr(self.config, "cv_time_col", None)
-            if not time_col:
-                raise ValueError("cv_time_col is required for time cv_strategy.")
-            if time_col not in self.train_data.columns:
-                raise KeyError(f"cv_time_col '{time_col}' not in train_data.")
-            ascending = bool(getattr(self.config, "cv_time_ascending", True))
-            order_index = self.train_data[time_col].sort_values(ascending=ascending).index
-            order = self.train_data.index.get_indexer(order_index)
-            splitter = TimeSeriesSplit(n_splits=cv_splits)
-            return _CVSplitter(splitter, order=order)
-
-        splitter = ShuffleSplit(
-            n_splits=cv_splits,
-            test_size=val_ratio,
-            random_state=self.rand_seed,
+        resolver = CVStrategyResolver(
+            self.config,
+            self.train_data,
+            self.rand_seed,
         )
-        return _CVSplitter(splitter)
+        return _ResolvedCVSplitter(
+            resolver,
+            n_splits=int(cv_splits),
+            val_ratio=val_ratio,
+        )
 
     def default_tweedie_power(self, obj: Optional[str] = None) -> Optional[float]:
         if self.task_type == 'classification':
@@ -486,7 +204,9 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
 
     def _build_geo_tokens(self, params_override: Optional[Dict[str, Any]] = None):
         """Internal builder; allows trial overrides and returns None on failure."""
-        geo_cols = list(self.config.geo_feature_nmes or [])
+        geo_cfg = self.config.geo_token
+        gnn_cfg = self.config.gnn
+        geo_cols = list(geo_cfg.feature_nmes or [])
         if not geo_cols:
             return None
 
@@ -539,18 +259,15 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             geo_gnn = GraphNeuralNetSklearn(
                 model_nme=f"{self.model_nme}_geo",
                 input_dim=len(available),
-                hidden_dim=cfg.get("geo_token_hidden_dim",
-                                   self.config.geo_token_hidden_dim),
-                num_layers=cfg.get("geo_token_layers",
-                                   self.config.geo_token_layers),
-                k_neighbors=cfg.get("geo_token_k_neighbors",
-                                    self.config.geo_token_k_neighbors),
-                dropout=cfg.get("geo_token_dropout",
-                                self.config.geo_token_dropout),
+                hidden_dim=cfg.get("geo_token_hidden_dim", geo_cfg.hidden_dim),
+                num_layers=cfg.get("geo_token_layers", geo_cfg.layers),
+                k_neighbors=cfg.get("geo_token_k_neighbors", geo_cfg.k_neighbors),
+                dropout=cfg.get("geo_token_dropout", geo_cfg.dropout),
                 learning_rate=cfg.get(
-                    "geo_token_learning_rate", self.config.geo_token_learning_rate),
-                epochs=int(cfg.get("geo_token_epochs",
-                           self.config.geo_token_epochs)),
+                    "geo_token_learning_rate",
+                    geo_cfg.learning_rate,
+                ),
+                epochs=int(cfg.get("geo_token_epochs", geo_cfg.epochs)),
                 patience=5,
                 task_type=self.task_type,
                 tweedie_power=tw_power,
@@ -558,12 +275,12 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 distribution=self.distribution,
                 use_data_parallel=False,
                 use_ddp=False,
-                use_approx_knn=self.config.gnn_use_approx_knn,
-                approx_knn_threshold=self.config.gnn_approx_knn_threshold,
+                use_approx_knn=gnn_cfg.use_approx_knn,
+                approx_knn_threshold=gnn_cfg.approx_knn_threshold,
                 graph_cache_path=None,
-                max_gpu_knn_nodes=self.config.gnn_max_gpu_knn_nodes,
-                knn_gpu_mem_ratio=self.config.gnn_knn_gpu_mem_ratio,
-                knn_gpu_mem_overhead=self.config.gnn_knn_gpu_mem_overhead
+                max_gpu_knn_nodes=gnn_cfg.max_gpu_knn_nodes,
+                knn_gpu_mem_ratio=gnn_cfg.knn_gpu_mem_ratio,
+                knn_gpu_mem_overhead=gnn_cfg.knn_gpu_mem_overhead,
             )
             geo_gnn.fit(
                 train_geo,
@@ -604,8 +321,9 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
 
     def _add_region_effect(self) -> None:
         """Partial pooling over province/city to create a smoothed region_effect feature."""
-        prov_col = self.config.region_province_col
-        city_col = self.config.region_city_col
+        region_cfg = self.config.region
+        prov_col = region_cfg.province_col
+        city_col = region_cfg.city_col
         if not prov_col or not city_col:
             return
         for col in [prov_col, city_col]:
@@ -620,7 +338,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             return float((y * w).sum() / denom)
 
         global_mean = safe_mean(self.train_data)
-        alpha = max(float(self.config.region_effect_alpha), 0.0)
+        alpha = max(float(region_cfg.effect_alpha), 0.0)
 
         w_all = self.train_data[self.weight_nme]
         y_all = self.train_data[self.resp_nme]
@@ -746,18 +464,22 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                     f"[Optuna][{trainer.label}] Reusing best_params from versions snapshot.")
                 return
 
-            params_path = self.output_manager.result_path(
-                f'{self.model_nme}_bestparams_{trainer.label.lower()}.csv'
+            params_path = best_params_csv_path(
+                self.output_manager.result_dir,
+                self.model_nme,
+                trainer.label,
             )
-            if os.path.exists(params_path):
-                try:
-                    trainer.best_params = IOUtils.load_params_file(params_path)
-                    trainer.best_trial = None
-                    _log(
-                        f"[Optuna][{trainer.label}] Reusing best_params from {params_path}.")
-                except ValueError:
-                    # Legacy compatibility: ignore empty files and continue tuning.
-                    pass
+            params = load_best_params_csv(
+                self.output_manager.result_dir,
+                self.model_nme,
+                trainer.label,
+            )
+            if params is not None:
+                trainer.best_params = params
+                trainer.best_trial = None
+                _log(
+                    f"[Optuna][{trainer.label}] Reusing best_params from {params_path}."
+                )
 
     # Generic optimization entry point.
     def optimize_model(self, model_key: str, max_evals: int = 100):
@@ -805,10 +527,11 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
 
         if bool(getattr(self.config, "final_ensemble", False)):
             k = int(getattr(self.config, "final_ensemble_k", 3) or 3)
-            if k > 1:
-                if model_key == "ft" and str(self.config.ft_role) != "model":
-                    pass
-                elif hasattr(trainer, "ensemble_predict"):
+            if (
+                k > 1
+                and not (model_key == "ft" and str(self.config.ft_role) != "model")
+            ):
+                if hasattr(trainer, "ensemble_predict"):
                     trainer.ensemble_predict(k)
                 else:
                     _log(
@@ -1000,3 +723,50 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             else:
                 if model_name:
                     _log(f"[load_model] Warning: Unknown model key {key}")
+
+
+def _bind_legacy_trainer_aliases() -> None:
+    """Bind legacy context attributes to trainer-owned state."""
+
+    alias_specs: List[Tuple[str, str, str]] = [
+        ("xgb_best", "xgb", "model"),
+        ("resn_best", "resn", "model"),
+        ("gnn_best", "gnn", "model"),
+        ("glm_best", "glm", "model"),
+        ("ft_best", "ft", "model"),
+        ("best_xgb_params", "xgb", "best_params"),
+        ("best_resn_params", "resn", "best_params"),
+        ("best_gnn_params", "gnn", "best_params"),
+        ("best_glm_params", "glm", "best_params"),
+        ("best_ft_params", "ft", "best_params"),
+        ("best_xgb_trial", "xgb", "best_trial"),
+        ("best_resn_trial", "resn", "best_trial"),
+        ("best_gnn_trial", "gnn", "best_trial"),
+        ("best_glm_trial", "glm", "best_trial"),
+        ("best_ft_trial", "ft", "best_trial"),
+        ("xgb_load", "xgb", "model"),
+        ("resn_load", "resn", "model"),
+        ("gnn_load", "gnn", "model"),
+        ("ft_load", "ft", "model"),
+    ]
+
+    def _make_alias(model_key: str, trainer_attr: str):
+        def _get(self):
+            trainer = getattr(self, "trainers", {}).get(model_key)
+            if trainer is None:
+                return None
+            return getattr(trainer, trainer_attr, None)
+
+        def _set(self, value):
+            trainer = getattr(self, "trainers", {}).get(model_key)
+            if trainer is None:
+                return
+            setattr(trainer, trainer_attr, value)
+
+        return property(_get, _set)
+
+    for alias_name, model_key, trainer_attr in alias_specs:
+        setattr(BayesOptModel, alias_name, _make_alias(model_key, trainer_attr))
+
+
+_bind_legacy_trainer_aliases()

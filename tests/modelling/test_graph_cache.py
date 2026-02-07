@@ -5,7 +5,7 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("sklearn")
 
-from ins_pricing.bayesopt.models import GraphNeuralNetSklearn
+from ins_pricing.modelling.bayesopt.models import GraphNeuralNetSklearn
 
 
 def test_graph_cache_meta_invalidation(tmp_path):

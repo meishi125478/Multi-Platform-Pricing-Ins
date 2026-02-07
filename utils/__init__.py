@@ -72,10 +72,7 @@ from ins_pricing.utils.paths import (
 # =============================================================================
 # Device management (GPU/CPU)
 # =============================================================================
-from ins_pricing.utils.device import (
-    DeviceManager,
-    GPUMemoryManager,
-)
+from ins_pricing.utils.device import DeviceManager, GPUMemoryManager
 
 __all__ = [
     # Logging

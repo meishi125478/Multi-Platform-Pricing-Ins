@@ -29,10 +29,7 @@ _ensure_repo_root()
 try:
     from ins_pricing.cli.utils.run_logging import configure_run_logging  # type: ignore
 except Exception:  # pragma: no cover
-    try:
-        from utils.run_logging import configure_run_logging  # type: ignore
-    except Exception:  # pragma: no cover
-        configure_run_logging = None  # type: ignore
+    configure_run_logging = None  # type: ignore
 
 
 def _split_argv(argv: List[str]) -> tuple[List[str], List[str]]:

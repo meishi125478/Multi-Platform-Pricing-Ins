@@ -161,3 +161,66 @@ def apply_calibration(pred: np.ndarray, factor: float) -> np.ndarray:
     """
     pred = np.asarray(pred, dtype=float)
     return pred * float(factor)
+
+
+def calibrate_multiplicative(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+) -> float:
+    """Legacy alias: multiplicative calibration factor."""
+    return fit_calibration_factor(
+        pred=np.asarray(predicted, dtype=float),
+        actual=np.asarray(actual, dtype=float),
+        weight=None if weights is None else np.asarray(weights, dtype=float),
+    )
+
+
+def calibrate_additive(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+) -> float:
+    """Legacy additive calibration adjustment."""
+    actual_arr = np.asarray(actual, dtype=float).reshape(-1)
+    pred_arr = np.asarray(predicted, dtype=float).reshape(-1)
+    if actual_arr.shape[0] != pred_arr.shape[0]:
+        raise ValueError("actual and predicted must have the same length.")
+    residual = actual_arr - pred_arr
+    if weights is None:
+        return float(np.mean(residual))
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if w.shape[0] != actual_arr.shape[0]:
+        raise ValueError("weights length must match actual/predicted length.")
+    total = float(np.sum(w))
+    if total <= 0:
+        return float(np.mean(residual))
+    return float(np.sum(w * residual) / total)
+
+
+def calibrate_by_segment(
+    df,
+    *,
+    actual_col: str,
+    pred_col: str,
+    segment_col: str,
+    weight_col: Optional[str] = None,
+):
+    """Compute multiplicative calibration factors per segment."""
+    import pandas as pd
+
+    rows = []
+    for segment, group in df.groupby(segment_col, dropna=False):
+        factor = calibrate_multiplicative(
+            actual=group[actual_col].to_numpy(),
+            predicted=group[pred_col].to_numpy(),
+            weights=group[weight_col].to_numpy() if weight_col else None,
+        )
+        rows.append(
+            {
+                segment_col: segment,
+                "calibration_factor": float(factor),
+                "count": int(len(group)),
+            }
+        )
+    return pd.DataFrame(rows)

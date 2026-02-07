@@ -1,8 +1,8 @@
-import numpy as np
+from dataclasses import FrozenInstanceError
 import pandas as pd
 import pytest
 
-from ins_pricing.bayesopt.config_preprocess import BayesOptConfig, DatasetPreprocessor
+from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig, DatasetPreprocessor
 
 
 def _build_config(binary_resp: bool = False) -> BayesOptConfig:
@@ -46,3 +46,21 @@ def test_preprocessor_missing_train_columns_raises():
     cfg = _build_config(binary_resp=False)
     with pytest.raises(KeyError):
         DatasetPreprocessor(train, test, cfg).run()
+
+
+def test_nested_config_views_refresh_from_flat_fields():
+    cfg = _build_config(binary_resp=False)
+    assert cfg.distributed.use_ft_ddp is False
+    assert cfg.gnn.use_approx_knn is True
+
+    cfg.use_ft_ddp = True
+    cfg.gnn_use_approx_knn = False
+
+    assert cfg.distributed.use_ft_ddp is True
+    assert cfg.gnn.use_approx_knn is False
+
+
+def test_nested_config_views_are_immutable():
+    cfg = _build_config(binary_resp=False)
+    with pytest.raises(FrozenInstanceError):
+        cfg.distributed.use_ft_ddp = True

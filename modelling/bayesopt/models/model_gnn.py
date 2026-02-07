@@ -13,12 +13,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from sklearn.neighbors import NearestNeighbors
-from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    create_autocast_context,
+    create_grad_scaler,
     resolve_training_device,
     setup_ddp_if_requested,
     wrap_model_for_parallel,
@@ -754,7 +755,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             lr=self.learning_rate,
             weight_decay=float(getattr(self, "weight_decay", 0.0)),
         )
-        scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+        scaler = create_grad_scaler(self.device.type)
 
         best_loss = float('inf')
         best_state = None
@@ -765,7 +766,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             epoch_start_ts = time.time()
             self.gnn.train()
             optimizer.zero_grad()
-            with autocast(enabled=(self.device.type == 'cuda')):
+            with create_autocast_context(self.device.type):
                 if self.data_parallel_enabled:
                     y_pred = self.gnn(X_train_tensor)
                 else:
@@ -783,7 +784,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                 self.gnn.eval()
                 if self.data_parallel_enabled and adj_val is not None:
                     self._set_adj_buffer(adj_val)
-                with torch.no_grad(), autocast(enabled=(self.device.type == 'cuda')):
+                with torch.no_grad(), create_autocast_context(self.device.type):
                     if self.data_parallel_enabled:
                         y_val_pred = self.gnn(X_val_tensor)
                     else:

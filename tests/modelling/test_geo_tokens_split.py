@@ -8,7 +8,7 @@ pytest.importorskip("optuna")
 pytest.importorskip("xgboost")
 pytest.importorskip("statsmodels")
 
-from ins_pricing.bayesopt.trainers import FTTrainer
+from ins_pricing.modelling.bayesopt.trainers import FTTrainer
 
 
 class DummyCtx:

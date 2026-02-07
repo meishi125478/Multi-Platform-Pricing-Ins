@@ -264,12 +264,30 @@ def run_bayesopt_entry_training(
             cfg.get("ft_feature_prefix", args.ft_feature_prefix))
         ft_num_numeric_tokens = cfg.get("ft_num_numeric_tokens")
 
-        config_fields = getattr(deps.ropt.BayesOptConfig,
-                                "__dataclass_fields__", {})
-        allowed_config_keys = set(config_fields.keys())
-        config_payload = {k: v for k,
-                          v in cfg.items() if k in allowed_config_keys}
+        config_fields = getattr(
+            deps.ropt.BayesOptConfig,
+            "__dataclass_fields__",
+            {},
+        )
+        allowed_config_keys = {
+            key
+            for key, spec in config_fields.items()
+            if getattr(spec, "init", True)
+        }
+        config_payload = {
+            k: v for k, v in cfg.items() if k in allowed_config_keys and v is not None
+        }
         config_payload.update({
+            k: v
+            for k, v in runtime_cfg.items()
+            if k in allowed_config_keys and v is not None
+        })
+        config_payload.update({
+            k: v
+            for k, v in split_cfg.items()
+            if k in allowed_config_keys and v is not None
+        })
+        override_payload = {
             "model_nme": model_name,
             "resp_nme": cfg["target"],
             "weight_nme": cfg["weight"],
@@ -343,22 +361,18 @@ def run_bayesopt_entry_training(
             "save_preprocess": save_preprocess,
             "preprocess_artifact_path": preprocess_artifact_path,
             "plot_path_style": plot_path_style or "nested",
+        }
+        config_payload.update({
+            k: v
+            for k, v in override_payload.items()
+            if k in allowed_config_keys and v is not None
         })
-        config_payload = {
-            k: v for k, v in config_payload.items() if v is not None}
-        config = deps.ropt.BayesOptConfig(**config_payload)
+        config = deps.ropt.BayesOptConfig.from_flat_dict(config_payload)
         model = deps.ropt.BayesOptModel(train_df, test_df, config=config)
 
         if plot_requested:
             plot_cfg = cfg.get("plot", {})
-            legacy_lift_flags = {
-                "glm": cfg.get("plot_lift_glm", False),
-                "xgb": cfg.get("plot_lift_xgb", False),
-                "resn": cfg.get("plot_lift_resn", False),
-                "ft": cfg.get("plot_lift_ft", False),
-            }
-            plot_enabled = plot_cfg.get(
-                "enable", any(legacy_lift_flags.values()))
+            plot_enabled = bool(plot_cfg.get("enable", False))
             if plot_enabled and plot_cfg.get("pre_oneway", False) and plot_cfg.get("oneway", True):
                 n_bins = int(plot_cfg.get("n_bins", 10))
                 model.plot_oneway(n_bins=n_bins, plot_subdir="oneway/pre")

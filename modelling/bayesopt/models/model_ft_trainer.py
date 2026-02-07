@@ -11,12 +11,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    create_autocast_context,
+    create_grad_scaler,
     resolve_training_device,
     setup_ddp_if_requested,
     wrap_model_for_parallel,
@@ -466,7 +467,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             lr=self.learning_rate,
             weight_decay=float(getattr(self, "weight_decay", 0.0)),
         )
-        scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+        scaler = create_grad_scaler(self.device.type)
 
         X_num_val_dev = X_cat_val_dev = y_val_dev = w_val_dev = None
         val_dataloader = None
@@ -640,7 +641,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             lr=self.learning_rate,
             weight_decay=float(getattr(self, "weight_decay", 0.0)),
         )
-        scaler = GradScaler(enabled=(device_type == 'cuda'))
+        scaler = create_grad_scaler(device_type)
 
         train_history: List[float] = []
         val_history: List[float] = []
@@ -670,7 +671,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                 sync_cm = self.ft.no_sync if (
                     is_ddp_model and not is_update_step) else nullcontext
                 with sync_cm():
-                    with autocast(enabled=(device_type == 'cuda')):
+                    with create_autocast_context(device_type):
                         X_num_b, X_cat_b, X_geo_b, num_true_b, num_mask_b, cat_true_b, cat_mask_b = batch
                         X_num_b = X_num_b.to(self.device, non_blocking=True)
                         X_cat_b = X_cat_b.to(self.device, non_blocking=True)
@@ -751,7 +752,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
 
                 if should_compute_val:
                     self.ft.eval()
-                    with torch.no_grad(), autocast(enabled=(device_type == 'cuda')):
+                    with torch.no_grad(), create_autocast_context(device_type):
                         val_bs = min(
                             int(dataloader.batch_size * max(1, accum_steps)), int(X_num_val.shape[0]))
                         total_val = 0.0

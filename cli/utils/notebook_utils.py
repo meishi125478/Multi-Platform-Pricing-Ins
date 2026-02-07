@@ -7,10 +7,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, cast
 
-try:
-    from ins_pricing.cli.utils.cli_config import add_config_json_arg, set_env  # type: ignore
-except Exception:  # pragma: no cover
-    from cli_config import add_config_json_arg, set_env  # type: ignore
+from ins_pricing.cli.utils.cli_config import add_config_json_arg, set_env  # type: ignore
 
 
 def _find_ins_pricing_dir(cwd: Optional[Path] = None) -> Path:
@@ -33,6 +30,13 @@ def _stringify_cmd(cmd: Sequence[object]) -> List[str]:
     return [str(x) for x in cmd]
 
 
+def _resolve_script_path(pkg_dir: Path, script_path: str | Path) -> Path:
+    path = Path(script_path)
+    if path.is_absolute():
+        return path.resolve()
+    return (pkg_dir / path).resolve()
+
+
 def build_bayesopt_entry_cmd(
     config_json: str | Path,
     model_keys: Sequence[str],
@@ -44,19 +48,7 @@ def build_bayesopt_entry_cmd(
 ) -> List[str]:
     """Build a command to run cli/BayesOpt_entry.py (optional torchrun/DDP)."""
     pkg_dir = _find_ins_pricing_dir()
-    entry_script_path = Path(entry_script)
-    if entry_script_path.is_absolute():
-        entry_path = entry_script_path.resolve()
-    else:
-        candidate = pkg_dir / entry_script_path
-        legacy = pkg_dir / "modelling" / entry_script_path
-        entry_path = (
-            candidate.resolve()
-            if candidate.exists()
-            else legacy.resolve()
-            if legacy.exists()
-            else candidate.resolve()
-        )
+    entry_path = _resolve_script_path(pkg_dir, entry_script)
     config_path = Path(config_json)
     if not config_path.is_absolute():
         config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
@@ -88,19 +80,7 @@ def build_incremental_cmd(
 ) -> List[str]:
     """Build a command to run cli/BayesOpt_incremental.py."""
     pkg_dir = _find_ins_pricing_dir()
-    entry_script_path = Path(entry_script)
-    if entry_script_path.is_absolute():
-        entry_path = entry_script_path.resolve()
-    else:
-        candidate = pkg_dir / entry_script_path
-        legacy = pkg_dir / "modelling" / entry_script_path
-        entry_path = (
-            candidate.resolve()
-            if candidate.exists()
-            else legacy.resolve()
-            if legacy.exists()
-            else candidate.resolve()
-        )
+    entry_path = _resolve_script_path(pkg_dir, entry_script)
     config_path = Path(config_json)
     if not config_path.is_absolute():
         config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
@@ -119,19 +99,7 @@ def build_explain_cmd(
 ) -> List[str]:
     """Build a command to run cli/Explain_entry.py."""
     pkg_dir = _find_ins_pricing_dir()
-    entry_script_path = Path(entry_script)
-    if entry_script_path.is_absolute():
-        entry_path = entry_script_path.resolve()
-    else:
-        candidate = pkg_dir / entry_script_path
-        legacy = pkg_dir / "modelling" / entry_script_path
-        entry_path = (
-            candidate.resolve()
-            if candidate.exists()
-            else legacy.resolve()
-            if legacy.exists()
-            else candidate.resolve()
-        )
+    entry_path = _resolve_script_path(pkg_dir, entry_script)
     config_path = Path(config_json)
     if not config_path.is_absolute():
         config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
@@ -153,19 +121,7 @@ def wrap_with_watchdog(
 ) -> List[str]:
     """Wrap a command with watchdog: restart when idle_seconds elapses with no output."""
     pkg_dir = _find_ins_pricing_dir()
-    watchdog_script_path = Path(watchdog_script)
-    if watchdog_script_path.is_absolute():
-        watchdog_path = watchdog_script_path.resolve()
-    else:
-        candidate = pkg_dir / watchdog_script_path
-        legacy = pkg_dir / "modelling" / watchdog_script_path
-        watchdog_path = (
-            candidate.resolve()
-            if candidate.exists()
-            else legacy.resolve()
-            if legacy.exists()
-            else candidate.resolve()
-        )
+    watchdog_path = _resolve_script_path(pkg_dir, watchdog_script)
     wd_cmd: List[object] = [
         sys.executable,
         str(watchdog_path),

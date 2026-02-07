@@ -4,7 +4,7 @@ import pytest
 
 
 def test_permutation_importance_simple():
-    from ins_pricing.explain import permutation_importance
+    from ins_pricing.modelling.explain import permutation_importance
 
     rng = np.random.default_rng(0)
     X = pd.DataFrame(
@@ -34,7 +34,7 @@ def test_permutation_importance_simple():
 
 def test_integrated_gradients_linear():
     torch = pytest.importorskip("torch")
-    from ins_pricing.explain import integrated_gradients_torch
+    from ins_pricing.modelling.explain import integrated_gradients_torch
 
     torch.manual_seed(0)
     model = torch.nn.Linear(3, 1, bias=False)

@@ -8,6 +8,7 @@ import optuna
 import torch
 from sklearn.metrics import log_loss
 
+from ins_pricing.modelling.bayesopt.checkpoints import rebuild_gnn_model_from_payload
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import GraphNeuralNetSklearn
 from ins_pricing.utils import EPS, get_logger, log_print
@@ -28,8 +29,9 @@ class GNNTrainer(TrainerBase):
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
         except (TypeError, ValueError):
             world_size = 1
-        gpu_enabled = bool(context.use_gpu)
-        requested_ddp = bool(context.config.use_gnn_ddp)
+        gpu_enabled = bool(getattr(context, "use_gpu", True))
+        dist_cfg = getattr(context.config, "distributed", context.config)
+        requested_ddp = bool(getattr(dist_cfg, "use_gnn_ddp", False))
         supports_ddp = bool(getattr(GraphNeuralNetSklearn, "SUPPORTS_MULTI_PROCESS_DDP", False))
         self._runtime_use_ddp = requested_ddp and supports_ddp and gpu_enabled
         if requested_ddp and not gpu_enabled:
@@ -45,6 +47,21 @@ class GNNTrainer(TrainerBase):
             )
         self.enable_distributed_optuna = bool(self._runtime_use_ddp and world_size > 1)
 
+    def _dist_cfg(self):
+        return getattr(self.ctx.config, "distributed", self.ctx.config)
+
+    def _geo_feature_names(self) -> List[str]:
+        geo_cfg = getattr(self.ctx.config, "geo_token", None)
+        if geo_cfg is not None and hasattr(geo_cfg, "feature_nmes"):
+            return list(getattr(geo_cfg, "feature_nmes") or [])
+        return list(getattr(self.ctx.config, "geo_feature_nmes", []) or [])
+
+    def _resolve_gnn_setting(self, nested_attr: str, flat_attr: str, default: Any) -> Any:
+        gnn_cfg = getattr(self.ctx.config, "gnn", None)
+        if gnn_cfg is not None and hasattr(gnn_cfg, nested_attr):
+            return getattr(gnn_cfg, nested_attr)
+        return getattr(self.ctx.config, flat_attr, default)
+
     def _maybe_cleanup_gpu(self, model: Optional[GraphNeuralNetSklearn]) -> None:
         if not bool(getattr(self.ctx.config, "gnn_cleanup_per_fold", False)):
             return
@@ -56,6 +73,7 @@ class GNNTrainer(TrainerBase):
 
     def _build_model(self, params: Optional[Dict[str, Any]] = None) -> GraphNeuralNetSklearn:
         params = params or {}
+        dist_cfg = self._dist_cfg()
         base_tw_power = self.ctx.default_tweedie_power()
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
         tw_power = params.get("tw_power")
@@ -79,16 +97,47 @@ class GNNTrainer(TrainerBase):
             task_type=self.ctx.task_type,
             tweedie_power=tw_power,
             weight_decay=float(params.get("weight_decay", 0.0)),
-            use_data_parallel=bool(self.ctx.config.use_gnn_data_parallel),
+            use_data_parallel=bool(getattr(dist_cfg, "use_gnn_data_parallel", False)),
             use_ddp=bool(self._runtime_use_ddp),
             use_gpu=self.ctx.use_gpu,
-            use_approx_knn=bool(self.ctx.config.gnn_use_approx_knn),
-            approx_knn_threshold=int(self.ctx.config.gnn_approx_knn_threshold),
-            graph_cache_path=self.ctx.config.gnn_graph_cache,
-            max_gpu_knn_nodes=self.ctx.config.gnn_max_gpu_knn_nodes,
-            knn_gpu_mem_ratio=float(self.ctx.config.gnn_knn_gpu_mem_ratio),
+            use_approx_knn=bool(
+                self._resolve_gnn_setting(
+                    "use_approx_knn",
+                    "gnn_use_approx_knn",
+                    True,
+                )
+            ),
+            approx_knn_threshold=int(
+                self._resolve_gnn_setting(
+                    "approx_knn_threshold",
+                    "gnn_approx_knn_threshold",
+                    50000,
+                )
+            ),
+            graph_cache_path=self._resolve_gnn_setting(
+                "graph_cache",
+                "gnn_graph_cache",
+                None,
+            ),
+            max_gpu_knn_nodes=self._resolve_gnn_setting(
+                "max_gpu_knn_nodes",
+                "gnn_max_gpu_knn_nodes",
+                200000,
+            ),
+            knn_gpu_mem_ratio=float(
+                self._resolve_gnn_setting(
+                    "knn_gpu_mem_ratio",
+                    "gnn_knn_gpu_mem_ratio",
+                    0.9,
+                )
+            ),
             knn_gpu_mem_overhead=float(
-                self.ctx.config.gnn_knn_gpu_mem_overhead),
+                self._resolve_gnn_setting(
+                    "knn_gpu_mem_overhead",
+                    "gnn_knn_gpu_mem_overhead",
+                    2.0,
+                )
+            ),
             loss_name=loss_name,
             distribution=getattr(self.ctx, "distribution", None),
         )
@@ -254,7 +303,7 @@ class GNNTrainer(TrainerBase):
         self.ctx.gnn_best = self.model
 
         # If geo_feature_nmes is set, refresh geo tokens for FT input.
-        if self.ctx.config.geo_feature_nmes:
+        if self._geo_feature_names():
             self.prepare_geo_tokens(force=True)
 
     def ensemble_predict(self, k: int) -> None:
@@ -312,7 +361,7 @@ class GNNTrainer(TrainerBase):
 
     def prepare_geo_tokens(self, force: bool = False) -> None:
         """Train/update the GNN encoder for geo tokens and inject them into FT input."""
-        geo_cols = list(self.ctx.config.geo_feature_nmes or [])
+        geo_cols = self._geo_feature_names()
         if not geo_cols:
             return
         if (not force) and self.ctx.train_geo_tokens is not None and self.ctx.test_geo_tokens is not None:
@@ -350,24 +399,17 @@ class GNNTrainer(TrainerBase):
             _log(f"[load] Warning: Model file not found: {path}")
             return
         payload = torch_load(path, map_location='cpu', weights_only=False)
-        if not isinstance(payload, dict):
-            raise ValueError(f"Invalid GNN checkpoint: {path}")
-        params = payload.get("best_params") or {}
-        state_dict = payload.get("state_dict")
-        model = self._build_model(params)
-        if params:
-            model.set_params(dict(params))
-        base_gnn = getattr(model, "_unwrap_gnn", lambda: None)()
-        if base_gnn is not None and state_dict is not None:
-            # Use strict=True for better error detection, but handle missing keys gracefully
-            try:
-                base_gnn.load_state_dict(state_dict, strict=True)
-            except RuntimeError as e:
-                if "Missing key" in str(e) or "Unexpected key" in str(e):
-                    _log(f"[GNN load] Warning: State dict mismatch, loading with strict=False: {e}")
-                    base_gnn.load_state_dict(state_dict, strict=False)
-                else:
-                    raise
+        try:
+            model, params, warning = rebuild_gnn_model_from_payload(
+                payload=payload,
+                model_builder=self._build_model,
+                strict=True,
+                allow_non_strict_fallback=True,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid GNN checkpoint: {path}") from exc
+        if warning:
+            _log(f"[GNN load] Warning: State dict mismatch, loading with strict=False: {warning}")
         self.model = model
         self.best_params = dict(params) if isinstance(params, dict) else None
         self.ctx.gnn_best = self.model

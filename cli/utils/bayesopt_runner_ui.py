@@ -154,13 +154,7 @@ def plot_curves_for_model(
     parse_model_pairs,
 ) -> None:
     plot_cfg = cfg.get("plot", {})
-    legacy_lift_flags = {
-        "glm": cfg.get("plot_lift_glm", False),
-        "xgb": cfg.get("plot_lift_xgb", False),
-        "resn": cfg.get("plot_lift_resn", False),
-        "ft": cfg.get("plot_lift_ft", False),
-    }
-    plot_enabled = plot_cfg.get("enable", any(legacy_lift_flags.values()))
+    plot_enabled = bool(plot_cfg.get("enable", False))
     if not plot_enabled:
         return
 
@@ -173,10 +167,7 @@ def plot_curves_for_model(
 
     lift_models = plot_cfg.get("lift_models")
     if lift_models is None:
-        lift_models = [
-            m for m, enabled in legacy_lift_flags.items() if enabled]
-        if not lift_models:
-            lift_models = available_models
+        lift_models = available_models
     lift_models = dedupe_preserve_order(
         [m for m in lift_models if m in available_models]
     )

@@ -6,12 +6,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import TensorDataset
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    create_grad_scaler,
     resolve_training_device,
     setup_ddp_if_requested,
     wrap_model_for_parallel,
@@ -340,7 +340,7 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
             lr=self.learning_rate,
             weight_decay=float(self.weight_decay),
         )
-        self.scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+        self.scaler = create_grad_scaler(self.device.type)
 
         X_val_dev = y_val_dev = w_val_dev = None
         val_dataloader = None

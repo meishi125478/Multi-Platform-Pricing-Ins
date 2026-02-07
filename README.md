@@ -1,6 +1,6 @@
 # ins_pricing
 
-Distribution name: ins_pricing (import package is `ins_pricing`; legacy alias `user_packages` still works).
+Distribution name: ins_pricing (import package is `ins_pricing`).
 
 Reusable modelling and pricing utilities organized as a small toolbox with clear boundaries
 between modelling, production, governance, and reporting.
@@ -25,11 +25,11 @@ between modelling, production, governance, and reporting.
    - Python API: `from ins_pricing.modelling import BayesOptModel`
    - CLI: `python ins_pricing/cli/BayesOpt_entry.py --config-json ...`
 2. Evaluation and visualization
-   - Curves: `from ins_pricing.plotting import curves`
-   - Importance: `from ins_pricing.plotting import importance`
-   - Geo: `from ins_pricing.plotting import geo`
+   - Curves: `from ins_pricing.modelling.plotting import curves`
+   - Importance: `from ins_pricing.modelling.plotting import importance`
+   - Geo: `from ins_pricing.modelling.plotting import geo`
 3. Explainability
-   - `from ins_pricing.explain import permutation_importance, integrated_gradients_torch`
+   - `from ins_pricing.modelling.explain import permutation_importance, integrated_gradients_torch`
 4. Pricing loop
    - `from ins_pricing.pricing import build_factor_table, rate_premium`
 5. Production and governance
@@ -88,12 +88,11 @@ preds = predictor.predict(df)
   CLI usage prefers `python -m ins_pricing.cli.BayesOpt_entry ...` but the
   direct script path (`python ins_pricing/cli/BayesOpt_entry.py ...`) still works.
 
-## Backward-compatible imports
+## Import policy
 
-Legacy import paths continue to work:
+Use canonical import paths only:
 
-- `import user_packages`
-- `import user_packages.bayesopt`
-- `import user_packages.plotting`
-- `import user_packages.explain`
-- `import user_packages.BayesOpt`
+- `ins_pricing.modelling.*`
+- `ins_pricing.pricing.*`
+- `ins_pricing.production.*`
+- `ins_pricing.governance.*`

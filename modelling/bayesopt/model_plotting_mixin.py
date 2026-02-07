@@ -28,16 +28,11 @@ try:
     from ins_pricing.modelling.plotting import curves as plot_curves
     from ins_pricing.modelling.plotting import diagnostics as plot_diagnostics
     from ins_pricing.modelling.plotting.common import PlotStyle, finalize_figure
-except Exception:  # pragma: no cover - optional for legacy imports
-    try:  # best-effort for non-package imports
-        from ins_pricing.plotting import curves as plot_curves
-        from ins_pricing.plotting import diagnostics as plot_diagnostics
-        from ins_pricing.plotting.common import PlotStyle, finalize_figure
-    except Exception:  # pragma: no cover
-        plot_curves = None
-        plot_diagnostics = None
-        PlotStyle = None
-        finalize_figure = None
+except Exception:  # pragma: no cover
+    plot_curves = None
+    plot_diagnostics = None
+    PlotStyle = None
+    finalize_figure = None
 
 
 def _plot_skip(label: str) -> None:

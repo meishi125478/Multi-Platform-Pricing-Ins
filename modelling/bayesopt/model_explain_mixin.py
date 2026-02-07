@@ -11,15 +11,10 @@ try:
     from ins_pricing.modelling.explain import gradients as explain_gradients
     from ins_pricing.modelling.explain import permutation as explain_permutation
     from ins_pricing.modelling.explain import shap_utils as explain_shap
-except Exception:  # pragma: no cover - optional for legacy imports
-    try:  # best-effort for non-package imports
-        from ins_pricing.explain import gradients as explain_gradients
-        from ins_pricing.explain import permutation as explain_permutation
-        from ins_pricing.explain import shap_utils as explain_shap
-    except Exception:  # pragma: no cover
-        explain_gradients = None
-        explain_permutation = None
-        explain_shap = None
+except Exception:  # pragma: no cover
+    explain_gradients = None
+    explain_permutation = None
+    explain_shap = None
 
 
 class BayesOptExplainMixin:

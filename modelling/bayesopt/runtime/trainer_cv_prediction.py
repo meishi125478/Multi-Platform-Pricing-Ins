@@ -126,7 +126,8 @@ class TrainerCVPredictionMixin:
             if self._should_use_distributed_optuna():
                 self._distributed_prepare_trial(params)
         X_all, y_all, w_all = data_provider()
-        cfg_limit = getattr(self.ctx.config, "bo_sample_limit", None)
+        ctx_config = getattr(self.ctx, "config", None)
+        cfg_limit = getattr(ctx_config, "bo_sample_limit", None)
         if cfg_limit is not None:
             cfg_limit = int(cfg_limit)
             if cfg_limit > 0:
@@ -216,33 +217,58 @@ class TrainerCVPredictionMixin:
         predictor = predict_fn or model.predict
         preds_train = predictor(X_train, **(predict_kwargs_train or {}))
         preds_test = predictor(X_test, **(predict_kwargs_test or {}))
-        preds_train = np.asarray(preds_train)
-        preds_test = np.asarray(preds_test)
+        preds_train, preds_test = self._store_predictions(
+            pred_prefix, preds_train, preds_test
+        )
+        self._maybe_cache_predictions(pred_prefix, preds_train, preds_test)
 
-        if preds_train.ndim <= 1 or (preds_train.ndim == 2 and preds_train.shape[1] == 1):
-            col_name = f'pred_{pred_prefix}'
-            self.ctx.train_data[col_name] = preds_train.reshape(-1)
-            self.ctx.test_data[col_name] = preds_test.reshape(-1)
-            self.ctx.train_data[f'w_{col_name}'] = (
-                self.ctx.train_data[col_name] *
-                self.ctx.train_data[self.ctx.weight_nme]
-            )
-            self.ctx.test_data[f'w_{col_name}'] = (
-                self.ctx.test_data[col_name] *
-                self.ctx.test_data[self.ctx.weight_nme]
-            )
-            self._maybe_cache_predictions(pred_prefix, preds_train, preds_test)
-            return
-
-        if preds_train.ndim != 2:
+    def _normalize_prediction_arrays(
+        self,
+        pred_prefix: str,
+        preds_train: Any,
+        preds_test: Any,
+    ) -> Tuple[np.ndarray, np.ndarray, bool]:
+        train_arr = np.asarray(preds_train)
+        test_arr = np.asarray(preds_test)
+        is_scalar = train_arr.ndim <= 1 or (
+            train_arr.ndim == 2 and train_arr.shape[1] == 1
+        )
+        if is_scalar:
+            return train_arr.reshape(-1), test_arr.reshape(-1), False
+        if train_arr.ndim != 2:
             raise ValueError(
-                f"Unexpected prediction shape for '{pred_prefix}': {preds_train.shape}")
-        if preds_test.ndim != 2 or preds_test.shape[1] != preds_train.shape[1]:
+                f"Unexpected prediction shape for '{pred_prefix}': {train_arr.shape}"
+            )
+        if test_arr.ndim != 2 or test_arr.shape[1] != train_arr.shape[1]:
             raise ValueError(
                 f"Train/test prediction dims mismatch for '{pred_prefix}': "
-                f"{preds_train.shape} vs {preds_test.shape}")
-        self._assign_vector_predictions(pred_prefix, preds_train, preds_test)
-        self._maybe_cache_predictions(pred_prefix, preds_train, preds_test)
+                f"{train_arr.shape} vs {test_arr.shape}"
+            )
+        return train_arr, test_arr, True
+
+    def _store_predictions(self,
+                           pred_prefix: str,
+                           preds_train: Any,
+                           preds_test: Any) -> Tuple[np.ndarray, np.ndarray]:
+        train_arr, test_arr, is_vector = self._normalize_prediction_arrays(
+            pred_prefix, preds_train, preds_test
+        )
+        if is_vector:
+            self._assign_vector_predictions(pred_prefix, train_arr, test_arr)
+            return train_arr, test_arr
+
+        col_name = f'pred_{pred_prefix}'
+        self.ctx.train_data[col_name] = train_arr
+        self.ctx.test_data[col_name] = test_arr
+        self.ctx.train_data[f'w_{col_name}'] = (
+            self.ctx.train_data[col_name] *
+            self.ctx.train_data[self.ctx.weight_nme]
+        )
+        self.ctx.test_data[f'w_{col_name}'] = (
+            self.ctx.test_data[col_name] *
+            self.ctx.test_data[self.ctx.weight_nme]
+        )
+        return train_arr, test_arr
 
     def _assign_vector_predictions(self,
                                    pred_prefix: str,
@@ -267,33 +293,9 @@ class TrainerCVPredictionMixin:
                            pred_prefix: str,
                            preds_train,
                            preds_test) -> None:
-        preds_train = np.asarray(preds_train)
-        preds_test = np.asarray(preds_test)
-        if preds_train.ndim <= 1 or (preds_train.ndim == 2 and preds_train.shape[1] == 1):
-            if preds_test.ndim > 1:
-                preds_test = preds_test.reshape(-1)
-            col_name = f'pred_{pred_prefix}'
-            self.ctx.train_data[col_name] = preds_train.reshape(-1)
-            self.ctx.test_data[col_name] = preds_test.reshape(-1)
-            self.ctx.train_data[f'w_{col_name}'] = (
-                self.ctx.train_data[col_name] *
-                self.ctx.train_data[self.ctx.weight_nme]
-            )
-            self.ctx.test_data[f'w_{col_name}'] = (
-                self.ctx.test_data[col_name] *
-                self.ctx.test_data[self.ctx.weight_nme]
-            )
-            self._maybe_cache_predictions(pred_prefix, preds_train, preds_test)
-            return
-
-        if preds_train.ndim != 2:
-            raise ValueError(
-                f"Unexpected prediction shape for '{pred_prefix}': {preds_train.shape}")
-        if preds_test.ndim != 2 or preds_test.shape[1] != preds_train.shape[1]:
-            raise ValueError(
-                f"Train/test prediction dims mismatch for '{pred_prefix}': "
-                f"{preds_train.shape} vs {preds_test.shape}")
-        self._assign_vector_predictions(pred_prefix, preds_train, preds_test)
+        preds_train, preds_test = self._store_predictions(
+            pred_prefix, preds_train, preds_test
+        )
         self._maybe_cache_predictions(pred_prefix, preds_train, preds_test)
 
     def _maybe_cache_predictions(self, pred_prefix: str, preds_train, preds_test) -> None:
@@ -310,7 +312,7 @@ class TrainerCVPredictionMixin:
             target_dir = Path(self.output.result_dir) / "predictions"
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        def _build_frame(preds, split_label: str) -> pd.DataFrame:
+        def _build_frame(preds) -> pd.DataFrame:
             arr = np.asarray(preds)
             if arr.ndim <= 1:
                 return pd.DataFrame({f"pred_{pred_prefix}": arr.reshape(-1)})
@@ -318,7 +320,7 @@ class TrainerCVPredictionMixin:
             return pd.DataFrame(arr, columns=cols)
 
         for split_label, preds in [("train", preds_train), ("test", preds_test)]:
-            frame = _build_frame(preds, split_label)
+            frame = _build_frame(preds)
             filename = f"{self.ctx.model_nme}_{pred_prefix}_{split_label}.{ 'csv' if fmt == 'csv' else 'parquet' }"
             path = target_dir / filename
             try:

@@ -1,25 +1,25 @@
-"""Backward compatibility re-exports for bayesopt utilities.
-
-This module keeps legacy imports working while routing general helpers
-through ins_pricing.utils and leaving bayesopt-specific utilities in place.
-"""
+"""Utilities exposed for the bayesopt training stack."""
 
 from __future__ import annotations
 
-# Constants and simple utilities
-from ins_pricing.modelling.bayesopt.utils.constants import (
+# Preserve package-style submodule imports, e.g.
+# `import ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin as mixin_mod`.
+from ins_pricing.modelling.bayesopt.utils import distributed_utils, torch_runtime, torch_trainer_mixin
+
+# Shared utilities
+from ins_pricing.utils import (
     EPS,
     set_global_seed,
     ensure_parent_dir,
     compute_batch_size,
     tweedie_loss,
     infer_factor_and_cate_list,
-)
-
-# I/O utilities
-from ins_pricing.modelling.bayesopt.utils.io_utils import (
     IOUtils,
     csv_to_dict,
+    get_logger,
+    MetricFactory,
+    GPUMemoryManager,
+    DeviceManager,
 )
 
 # Distributed training
@@ -34,17 +34,11 @@ from ins_pricing.modelling.bayesopt.utils.torch_trainer_mixin import (
     TorchTrainerMixin,
 )
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
+    create_autocast_context,
+    create_grad_scaler,
     setup_ddp_if_requested,
     resolve_training_device,
     wrap_model_for_parallel,
-)
-
-# Metrics and device helpers (shared utilities)
-from ins_pricing.modelling.bayesopt.utils.metrics_and_devices import (
-    get_logger,
-    MetricFactory,
-    GPUMemoryManager,
-    DeviceManager,
 )
 
 __all__ = [
@@ -64,6 +58,8 @@ __all__ = [
     'free_cuda',
     # PyTorch
     'TorchTrainerMixin',
+    'create_autocast_context',
+    'create_grad_scaler',
     'setup_ddp_if_requested',
     'resolve_training_device',
     'wrap_model_for_parallel',
@@ -72,4 +68,8 @@ __all__ = [
     'MetricFactory',
     'GPUMemoryManager',
     'DeviceManager',
+    # Submodules
+    'distributed_utils',
+    'torch_runtime',
+    'torch_trainer_mixin',
 ]

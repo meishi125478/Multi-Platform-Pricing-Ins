@@ -69,7 +69,11 @@ def bin_numeric(
         When use_cache=True, identical distributions will reuse cached bin edges,
         improving performance when the same column is binned multiple times.
     """
-    cache_key = _cache_key(series, bins, method) if use_cache else None
+    method_norm = str(method).strip().lower()
+    if method_norm == "equal_width":
+        method_norm = "uniform"
+
+    cache_key = _cache_key(series, bins, method_norm) if use_cache else None
     bin_edges_full: Optional[np.ndarray] = None
 
     if cache_key is not None:
@@ -80,7 +84,7 @@ def bin_numeric(
         return binned, np.asarray(bin_edges_full[:-1], dtype=float)
 
     # Perform actual binning
-    if method == "quantile":
+    if method_norm == "quantile":
         binned, bin_edges_full = pd.qcut(
             series,
             q=bins,
@@ -88,7 +92,7 @@ def bin_numeric(
             labels=labels,
             retbins=True,
         )
-    elif method == "uniform":
+    elif method_norm == "uniform":
         binned, bin_edges_full = pd.cut(
             series,
             bins=bins,
@@ -152,12 +156,20 @@ def build_factor_table(
     factor_col: str,
     loss_col: str,
     exposure_col: str,
+    method: Optional[str] = None,
+    n_bins: int = 10,
     weight_col: Optional[str] = None,
     base_rate: Optional[float] = None,
     smoothing: float = 0.0,
     min_exposure: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Build a factor table with rate and relativity."""
+    """Build a factor table with rate and relativity.
+
+    Compatibility:
+    - Supports legacy ``method`` and ``n_bins`` parameters.
+    - Numeric methods: ``quantile`` and ``equal_width``/``uniform``.
+    - Categorical method: ``categorical``.
+    """
     if weight_col and weight_col in df.columns:
         weights = df[weight_col].to_numpy(dtype=float, copy=False)
     else:
@@ -170,15 +182,54 @@ def build_factor_table(
         loss = loss * weights
         exposure = exposure * weights
 
-    data = pd.DataFrame(
-        {
-            "factor": df[factor_col],
-            "loss": loss,
-            "exposure": exposure,
-        }
-    )
-    grouped = data.groupby("factor", dropna=False).agg({"loss": "sum", "exposure": "sum"})
-    grouped = grouped.reset_index().rename(columns={"factor": "level"})
+    series = df[factor_col]
+    method_name = (method or "").strip().lower()
+    is_numeric = pd.api.types.is_numeric_dtype(series)
+
+    if not method_name:
+        method_name = "quantile" if is_numeric else "categorical"
+    if method_name == "equal_width":
+        method_name = "uniform"
+
+    if method_name in {"quantile", "uniform"}:
+        if not is_numeric:
+            raise ValueError(f"Method '{method_name}' requires numeric factor column.")
+        bin_col = f"{factor_col}_bin"
+        binned, _ = bin_numeric(series, bins=int(max(1, n_bins)), method=method_name)
+        data = pd.DataFrame(
+            {
+                bin_col: binned,
+                "loss": loss,
+                "exposure": exposure,
+            }
+        )
+        grouped = data.groupby(bin_col, dropna=False).agg(
+            loss=("loss", "sum"),
+            exposure=("exposure", "sum"),
+            claim_count=("loss", "size"),
+        )
+        grouped = grouped.reset_index()
+        grouped["level"] = grouped[bin_col]
+        if len(grouped) > 0 and pd.api.types.is_interval_dtype(grouped[bin_col]):
+            grouped["bin_left"] = grouped[bin_col].apply(lambda x: float(x.left) if pd.notna(x) else np.nan)
+            grouped["bin_right"] = grouped[bin_col].apply(lambda x: float(x.right) if pd.notna(x) else np.nan)
+    elif method_name == "categorical":
+        data = pd.DataFrame(
+            {
+                factor_col: series,
+                "loss": loss,
+                "exposure": exposure,
+            }
+        )
+        grouped = data.groupby(factor_col, dropna=False).agg(
+            loss=("loss", "sum"),
+            exposure=("exposure", "sum"),
+            claim_count=("loss", "size"),
+        )
+        grouped = grouped.reset_index()
+        grouped["level"] = grouped[factor_col]
+    else:
+        raise ValueError("method must be one of: quantile, equal_width, uniform, categorical.")
 
     if base_rate is None:
         total_loss = float(grouped["loss"].sum())
@@ -199,6 +250,9 @@ def build_factor_table(
     grouped["rate"] = rate
     grouped["relativity"] = relativity
     grouped["base_rate"] = float(base_rate)
+    if "claim_count" not in grouped.columns:
+        grouped["claim_count"] = 0
+    grouped["claim_count"] = grouped["claim_count"].astype(int)
 
     if min_exposure is not None:
         low_exposure = grouped["exposure"] < float(min_exposure)
@@ -209,3 +263,77 @@ def build_factor_table(
         grouped["is_low_exposure"] = False
 
     return grouped
+
+
+def apply_credibility_smoothing(
+    factor_table: pd.DataFrame,
+    *,
+    base_relativity: float = 1.0,
+    exposure_col: str = "exposure",
+    credibility_k: float = 100.0,
+) -> pd.DataFrame:
+    """Shrink low-exposure relativities toward the base relativity."""
+    out = factor_table.copy()
+    if "relativity" not in out.columns:
+        raise ValueError("factor_table must include 'relativity'.")
+    exposure = pd.to_numeric(out.get(exposure_col, 0.0), errors="coerce").fillna(0.0)
+    exposure = exposure.clip(lower=0.0)
+    denom = exposure + float(max(credibility_k, 1e-9))
+    credibility = np.where(denom > 0, exposure / denom, 0.0)
+    out["relativity"] = (
+        credibility * pd.to_numeric(out["relativity"], errors="coerce").fillna(base_relativity)
+        + (1.0 - credibility) * float(base_relativity)
+    )
+    return out
+
+
+def apply_neighbor_smoothing(
+    factor_table: pd.DataFrame,
+    *,
+    window: int = 3,
+) -> pd.DataFrame:
+    """Smooth relativities by rolling mean over neighboring bins/levels."""
+    if window <= 1:
+        return factor_table.copy()
+    out = factor_table.copy()
+    if "relativity" not in out.columns:
+        raise ValueError("factor_table must include 'relativity'.")
+    rel = pd.to_numeric(out["relativity"], errors="coerce").fillna(1.0)
+    out["relativity"] = rel.rolling(window=window, center=True, min_periods=1).mean()
+    return out
+
+
+def apply_factors(
+    df: pd.DataFrame,
+    factor_table: pd.DataFrame,
+    *,
+    factor_col: str,
+    default_relativity: float = 1.0,
+) -> pd.DataFrame:
+    """Apply a single factor table to a DataFrame and append relativity column."""
+    out = df.copy()
+    rel_col = f"{factor_col}_relativity"
+
+    bin_col = f"{factor_col}_bin"
+    if bin_col in factor_table.columns:
+        mapping = factor_table.set_index(bin_col)["relativity"]
+        if {"bin_left", "bin_right"}.issubset(factor_table.columns):
+            left = pd.to_numeric(factor_table["bin_left"], errors="coerce").dropna().to_numpy()
+            right = pd.to_numeric(factor_table["bin_right"], errors="coerce").dropna().to_numpy()
+            if left.size > 0 and right.size > 0:
+                edges = np.unique(np.concatenate([left, right]))
+                edges.sort()
+                if edges.size >= 2:
+                    binned = pd.cut(pd.to_numeric(out[factor_col], errors="coerce"), bins=edges, include_lowest=True)
+                    out[rel_col] = binned.map(mapping).fillna(float(default_relativity)).to_numpy(dtype=float)
+                    return out
+        raw_series = out[factor_col]
+        out[rel_col] = raw_series.map(mapping).fillna(float(default_relativity)).to_numpy(dtype=float)
+        return out
+
+    lookup_col = factor_col if factor_col in factor_table.columns else "level"
+    if lookup_col not in factor_table.columns:
+        raise ValueError(f"factor_table must contain '{factor_col}' or 'level' column.")
+    mapping = factor_table.set_index(lookup_col)["relativity"]
+    out[rel_col] = out[factor_col].map(mapping).fillna(float(default_relativity)).to_numpy(dtype=float)
+    return out

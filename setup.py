@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="ins_pricing",
-    version="0.5.5",
+    version="0.5.8",
     description="Reusable modelling, pricing, governance, and reporting utilities.",
     author="meishi125478",
     license="Proprietary",
@@ -17,7 +17,7 @@ setup(
     ],
     extras_require={
         "bayesopt": [
-            "torch>=1.13",
+            "torch>=1.10.1",
             "optuna>=3.0",
             "xgboost>=1.6",
             "scikit-learn>=1.1",
@@ -30,7 +30,7 @@ setup(
             "scikit-learn>=1.1",
         ],
         "explain": [
-            "torch>=1.13",
+            "torch>=1.10.1",
             "shap>=0.41",
             "scikit-learn>=1.1",
         ],
@@ -48,7 +48,7 @@ setup(
             "huggingface_hub<0.24",
         ],
         "all": [
-            "torch>=1.13",
+            "torch>=1.10.1",
             "optuna>=3.0",
             "xgboost>=1.6",
             "scikit-learn>=1.1",

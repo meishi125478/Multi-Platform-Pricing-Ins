@@ -15,16 +15,26 @@ except Exception as exc:  # pragma: no cover - optional dependency
     sm = None  # type: ignore[assignment]
     _SM_IMPORT_ERROR = exc
 
+from ins_pricing.modelling.bayesopt.artifacts import (
+    load_best_params as load_best_params_artifacts,
+)
+from ins_pricing.modelling.bayesopt.checkpoints import (
+    rebuild_ft_model_from_payload,
+    rebuild_gnn_model_from_payload,
+    rebuild_resn_model_from_payload,
+)
 from ins_pricing.production.preprocess import (
     apply_preprocess_artifacts,
     load_preprocess_artifacts,
     prepare_raw_features,
 )
 from ins_pricing.production.scoring import batch_score
+from ins_pricing.utils.device import DeviceManager
 from ins_pricing.utils.losses import (
     resolve_effective_loss_name,
     resolve_tweedie_power,
 )
+from ins_pricing.utils.torch_compat import torch_load
 from ins_pricing.utils import get_logger, load_dataset
 
 _logger = get_logger("ins_pricing.production.inference")
@@ -33,15 +43,6 @@ _logger = get_logger("ins_pricing.production.inference")
 if TYPE_CHECKING:
     from ins_pricing.modelling.bayesopt.models.model_gnn import GraphNeuralNetSklearn
     from ins_pricing.modelling.bayesopt.models.model_resn import ResNetSklearn
-
-
-def _torch_load(*args, **kwargs):
-    from ins_pricing.utils.torch_compat import torch_load
-    return torch_load(*args, **kwargs)
-
-def _get_device_manager():
-    from ins_pricing.utils.device import DeviceManager
-    return DeviceManager
 
 
 def _normalize_device(device: Optional[Any]) -> Optional[Any]:
@@ -185,7 +186,7 @@ def _load_preprocess_from_model_file(
     if model_key in {"xgb", "glm"}:
         payload = joblib.load(model_path)
     else:
-        payload = _torch_load(model_path, map_location="cpu")
+        payload = torch_load(model_path, map_location="cpu")
     if isinstance(payload, dict):
         return payload.get("preprocess_artifacts")
     return None
@@ -193,7 +194,6 @@ def _load_preprocess_from_model_file(
 
 def _move_to_device(model_obj: Any, device: Optional[Any] = None) -> None:
     """Move model to best available device using shared DeviceManager."""
-    DeviceManager = _get_device_manager()
     DeviceManager.move_to_device(model_obj, device=device)
     if hasattr(model_obj, "eval"):
         model_obj.eval()
@@ -204,30 +204,7 @@ def load_best_params(
     model_name: str,
     model_key: str,
 ) -> Optional[Dict[str, Any]]:
-    output_path = Path(output_dir)
-    versions_dir = output_path / "Results" / "versions"
-    if versions_dir.exists():
-        candidates = sorted(versions_dir.glob(f"*_{model_key}_best.json"))
-        if candidates:
-            payload = _load_json(candidates[-1])
-            params = payload.get("best_params")
-            if params:
-                return params
-
-    label_map = {
-        "xgb": "xgboost",
-        "resn": "resnet",
-        "ft": "fttransformer",
-        "glm": "glm",
-        "gnn": "gnn",
-    }
-    label = label_map.get(model_key, model_key)
-    csv_path = output_path / "Results" / f"{model_name}_bestparams_{label}.csv"
-    if csv_path.exists():
-        df = pd.read_csv(csv_path)
-        if not df.empty:
-            return df.iloc[0].to_dict()
-    return None
+    return load_best_params_artifacts(output_dir, model_name, model_key)
 
 
 def _build_resn_model(
@@ -323,32 +300,16 @@ def _load_ft_model_from_payload(
     task_type: str,
     device: Optional[Any],
 ) -> Any:
-    if isinstance(payload, dict):
-        if "state_dict" in payload and "model_config" in payload:
-            state_dict = payload.get("state_dict")
-            model_config = payload.get("model_config", {})
-            if not model_config.get("loss_name"):
-                model_config = dict(model_config)
-                model_config["loss_name"] = _resolve_loss_name(
-                    cfg, model_name, task_type
-                )
-            if "distribution" not in model_config:
-                model_config = dict(model_config)
-                model_config["distribution"] = cfg.get("distribution")
-            from ins_pricing.modelling.bayesopt.checkpoints import rebuild_ft_model_from_checkpoint
-
-            model = rebuild_ft_model_from_checkpoint(
-                state_dict=state_dict,
-                model_config=model_config,
-            )
-            _move_to_device(model, device=device)
-            return model
-        if "model" in payload:
-            model = payload.get("model")
-            _move_to_device(model, device=device)
-            return model
-    _move_to_device(payload, device=device)
-    return payload
+    model, _best_params, _kind = rebuild_ft_model_from_payload(
+        payload=payload,
+        model_config_overrides={
+            "loss_name": _resolve_loss_name(cfg, model_name, task_type),
+            "distribution": cfg.get("distribution"),
+        },
+        fill_missing_model_config=True,
+    )
+    _move_to_device(model, device=device)
+    return model
 
 
 def load_saved_model(
@@ -372,7 +333,7 @@ def load_saved_model(
         return payload
 
     if model_key == "ft":
-        payload = _torch_load(
+        payload = torch_load(
             model_path, map_location="cpu", weights_only=False)
         return _load_ft_model_from_payload(
             payload=payload,
@@ -385,55 +346,49 @@ def load_saved_model(
     if model_key == "resn":
         if input_dim is None:
             raise ValueError("input_dim is required for ResNet loading")
-        payload = _torch_load(model_path, map_location="cpu")
-        if isinstance(payload, dict) and "state_dict" in payload:
-            state_dict = payload.get("state_dict")
-            params = payload.get("best_params") or load_best_params(
-                output_dir, model_name, model_key
-            )
-        else:
-            state_dict = payload
-            params = load_best_params(output_dir, model_name, model_key)
-        if params is None:
-            raise RuntimeError("Best params not found for resn")
+        payload = torch_load(model_path, map_location="cpu")
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
-        model = _build_resn_model(
-            model_name=model_name,
-            input_dim=input_dim,
-            task_type=task_type,
-            epochs=int(cfg.get("epochs", 50)),
-            resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
-            loss_name=loss_name,
-            distribution=cfg.get("distribution"),
-            params=params,
+        params_fallback = load_best_params(output_dir, model_name, model_key)
+        model, _resolved_params = rebuild_resn_model_from_payload(
+            payload=payload,
+            model_builder=lambda p: _build_resn_model(
+                model_name=model_name,
+                input_dim=input_dim,
+                task_type=task_type,
+                epochs=int(cfg.get("epochs", 50)),
+                resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
+                loss_name=loss_name,
+                distribution=cfg.get("distribution"),
+                params=p,
+            ),
+            params_fallback=params_fallback,
         )
-        model.resnet.load_state_dict(state_dict)
         _move_to_device(model, device=device)
         return model
 
     if model_key == "gnn":
         if input_dim is None:
             raise ValueError("input_dim is required for GNN loading")
-        payload = _torch_load(model_path, map_location="cpu")
-        if not isinstance(payload, dict):
-            raise ValueError(f"Invalid GNN checkpoint: {model_path}")
-        params = payload.get("best_params") or {}
-        state_dict = payload.get("state_dict")
+        payload = torch_load(model_path, map_location="cpu")
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
-        model = _build_gnn_model(
-            model_name=model_name,
-            input_dim=input_dim,
-            task_type=task_type,
-            epochs=int(cfg.get("epochs", 50)),
-            cfg=cfg,
-            loss_name=loss_name,
-            distribution=cfg.get("distribution"),
-            params=params,
-        )
-        model.set_params(dict(params))
-        base_gnn = getattr(model, "_unwrap_gnn", lambda: None)()
-        if base_gnn is not None and state_dict is not None:
-            base_gnn.load_state_dict(state_dict, strict=False)
+        try:
+            model, _params, _warning = rebuild_gnn_model_from_payload(
+                payload=payload,
+                model_builder=lambda p: _build_gnn_model(
+                    model_name=model_name,
+                    input_dim=input_dim,
+                    task_type=task_type,
+                    epochs=int(cfg.get("epochs", 50)),
+                    cfg=cfg,
+                    loss_name=loss_name,
+                    distribution=cfg.get("distribution"),
+                    params=p,
+                ),
+                strict=False,
+                allow_non_strict_fallback=False,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid GNN checkpoint: {model_path}") from exc
         _move_to_device(model, device=device)
         return model
 

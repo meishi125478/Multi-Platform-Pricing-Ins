@@ -12,21 +12,39 @@ def compute_exposure(
     end_col: str,
     *,
     unit: str = "year",
+    time_unit: Optional[str] = None,
     inclusive: bool = False,
     clip_min: Optional[float] = 0.0,
     clip_max: Optional[float] = None,
-) -> pd.Series:
-    """Compute exposure from start/end date columns."""
+) -> pd.Series | pd.DataFrame:
+    """Compute exposure from start/end date columns.
+
+    Compatibility behavior:
+    - If ``time_unit`` is provided, returns a DataFrame copy with ``exposure`` column.
+    - Otherwise returns a Series (legacy lightweight utility behavior).
+    """
+
+    resolved_unit = (time_unit or unit or "year").strip().lower()
+    aliases = {
+        "day": "day",
+        "days": "day",
+        "month": "month",
+        "months": "month",
+        "year": "year",
+        "years": "year",
+    }
+    resolved_unit = aliases.get(resolved_unit, resolved_unit)
+
     start = pd.to_datetime(df[start_col])
     end = pd.to_datetime(df[end_col])
     delta_days = (end - start).dt.days.astype(float)
     if inclusive:
         delta_days = delta_days + 1.0
-    if unit == "day":
+    if resolved_unit == "day":
         exposure = delta_days
-    elif unit == "month":
+    elif resolved_unit == "month":
         exposure = delta_days / 30.0
-    elif unit == "year":
+    elif resolved_unit == "year":
         exposure = delta_days / 365.25
     else:
         raise ValueError("unit must be one of: day, month, year.")
@@ -36,6 +54,10 @@ def compute_exposure(
         exposure = exposure.clip(lower=clip_min)
     if clip_max is not None:
         exposure = exposure.clip(upper=clip_max)
+    if time_unit is not None:
+        out = df.copy()
+        out["exposure"] = exposure.to_numpy(dtype=float)
+        return out
     return exposure
 
 

@@ -125,23 +125,35 @@ def _try_import_from_paths(
     return None
 
 
+def _collect_attrs_from_paths(
+    paths: List[str],
+    attrs: List[str],
+    *,
+    min_found: int = 1,
+) -> Dict[str, Any]:
+    results: Dict[str, Any] = {attr: None for attr in attrs}
+    for path in paths:
+        module = _try_import(path)
+        if module is None:
+            continue
+        for attr in attrs:
+            if results[attr] is None:
+                results[attr] = getattr(module, attr, None)
+        found = sum(1 for value in results.values() if value is not None)
+        if found >= min_found:
+            break
+    return results
+
+
 def _resolve_bayesopt() -> Optional[Any]:
-    """Resolve the bayesopt module from multiple possible locations."""
-    paths = [
-        "ins_pricing.modelling.bayesopt",
-        "bayesopt",
-        "BayesOpt",
-    ]
+    """Resolve the bayesopt module."""
+    paths = ["ins_pricing.modelling.bayesopt"]
     return _try_import_from_paths(paths)
 
 
 def _resolve_cli_common() -> Dict[str, Any]:
     """Resolve CLI common utilities."""
-    paths = [
-        "ins_pricing.cli.utils.cli_common",
-        "cli.utils.cli_common",
-        "utils.cli_common",
-    ]
+    paths = ["ins_pricing.cli.utils.cli_common"]
 
     attrs = [
         "PLOT_MODEL_LABELS",
@@ -157,27 +169,16 @@ def _resolve_cli_common() -> Dict[str, Any]:
         "split_train_test",
     ]
 
-    results = {}
-    for path in paths:
-        module = _try_import(path)
-        if module is not None:
-            for attr in attrs:
-                if attr not in results or results[attr] is None:
-                    results[attr] = getattr(module, attr, None)
-            # If we got most attributes, break
-            if sum(1 for v in results.values() if v is not None) >= len(attrs) // 2:
-                break
-
-    return results
+    return _collect_attrs_from_paths(
+        paths,
+        attrs,
+        min_found=max(1, len(attrs) // 2),
+    )
 
 
 def _resolve_cli_config() -> Dict[str, Any]:
     """Resolve CLI config utilities."""
-    paths = [
-        "ins_pricing.cli.utils.cli_config",
-        "cli.utils.cli_config",
-        "utils.cli_config",
-    ]
+    paths = ["ins_pricing.cli.utils.cli_config"]
 
     attrs = [
         "add_config_json_arg",
@@ -194,122 +195,76 @@ def _resolve_cli_config() -> Dict[str, Any]:
         "resolve_output_dirs",
     ]
 
-    results = {}
-    for path in paths:
-        module = _try_import(path)
-        if module is not None:
-            for attr in attrs:
-                if attr not in results or results[attr] is None:
-                    results[attr] = getattr(module, attr, None)
-            if sum(1 for v in results.values() if v is not None) >= len(attrs) // 2:
-                break
-
-    return results
+    return _collect_attrs_from_paths(
+        paths,
+        attrs,
+        min_found=max(1, len(attrs) // 2),
+    )
 
 
 def _resolve_evaluation() -> Dict[str, Any]:
     """Resolve evaluation utilities."""
-    paths = [
-        "ins_pricing.modelling.evaluation",
-        "evaluation",
-    ]
+    paths = ["ins_pricing.modelling.evaluation"]
 
-    results = {}
-    for path in paths:
-        module = _try_import(path)
-        if module is not None:
-            results["bootstrap_ci"] = getattr(module, "bootstrap_ci", None)
-            results["calibrate_predictions"] = getattr(module, "calibrate_predictions", None)
-            results["metrics_report"] = getattr(module, "metrics_report", None)
-            results["select_threshold"] = getattr(module, "select_threshold", None)
-            if any(v is not None for v in results.values()):
-                break
-
-    return results
+    return _collect_attrs_from_paths(
+        paths,
+        ["bootstrap_ci", "calibrate_predictions", "metrics_report", "select_threshold"],
+        min_found=1,
+    )
 
 
 def _resolve_governance() -> Dict[str, Any]:
     """Resolve governance and reporting utilities."""
-    results = {}
-
-    # ModelRegistry and ModelArtifact
-    registry_paths = [
-        "ins_pricing.governance.registry",
-    ]
-    for path in registry_paths:
-        module = _try_import(path)
-        if module is not None:
-            results["ModelArtifact"] = getattr(module, "ModelArtifact", None)
-            results["ModelRegistry"] = getattr(module, "ModelRegistry", None)
-            break
-
-    # PSI report
-    psi_paths = [
-        "ins_pricing.production",
-    ]
-    for path in psi_paths:
-        module = _try_import(path)
-        if module is not None:
-            results["drift_psi_report"] = getattr(module, "psi_report", None)
-            break
-
-    # Group metrics
-    monitoring_paths = [
-        "ins_pricing.production.monitoring",
-    ]
-    for path in monitoring_paths:
-        module = _try_import(path)
-        if module is not None:
-            results["group_metrics"] = getattr(module, "group_metrics", None)
-            break
-
-    # Report builder
-    report_paths = [
-        "ins_pricing.reporting.report_builder",
-    ]
-    for path in report_paths:
-        module = _try_import(path)
-        if module is not None:
-            results["ReportPayload"] = getattr(module, "ReportPayload", None)
-            results["write_report"] = getattr(module, "write_report", None)
-            break
-
+    results: Dict[str, Any] = {}
+    results.update(
+        _collect_attrs_from_paths(
+            ["ins_pricing.governance.registry"],
+            ["ModelArtifact", "ModelRegistry"],
+            min_found=1,
+        )
+    )
+    results.update(
+        _collect_attrs_from_paths(
+            ["ins_pricing.production"],
+            ["drift_psi_report"],
+            min_found=1,
+        )
+    )
+    if results.get("drift_psi_report") is None:
+        production_mod = _try_import("ins_pricing.production")
+        if production_mod is not None:
+            results["drift_psi_report"] = getattr(production_mod, "psi_report", None)
+    results.update(
+        _collect_attrs_from_paths(
+            ["ins_pricing.production.monitoring"],
+            ["group_metrics"],
+            min_found=1,
+        )
+    )
+    results.update(
+        _collect_attrs_from_paths(
+            ["ins_pricing.reporting.report_builder"],
+            ["ReportPayload", "write_report"],
+            min_found=1,
+        )
+    )
     return results
 
 
 def _resolve_logging() -> Dict[str, Any]:
     """Resolve logging utilities."""
-    paths = [
-        "ins_pricing.cli.utils.run_logging",
-        "cli.utils.run_logging",
-        "utils.run_logging",
-    ]
+    paths = ["ins_pricing.cli.utils.run_logging"]
 
-    results = {}
-    for path in paths:
-        module = _try_import(path)
-        if module is not None:
-            results["configure_run_logging"] = getattr(module, "configure_run_logging", None)
-            break
-
-    return results
+    return _collect_attrs_from_paths(paths, ["configure_run_logging"], min_found=1)
 
 
 def _resolve_plotting() -> Dict[str, Any]:
     """Resolve plotting utilities."""
     paths = [
         "ins_pricing.modelling.plotting.diagnostics",
-        "ins_pricing.plotting.diagnostics",
     ]
 
-    results = {}
-    for path in paths:
-        module = _try_import(path)
-        if module is not None:
-            results["plot_loss_curve"] = getattr(module, "plot_loss_curve", None)
-            break
-
-    return results
+    return _collect_attrs_from_paths(paths, ["plot_loss_curve"], min_found=1)
 
 
 def resolve_imports() -> ResolvedImports:

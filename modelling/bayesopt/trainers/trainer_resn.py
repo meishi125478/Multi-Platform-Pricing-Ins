@@ -7,6 +7,7 @@ import numpy as np
 import optuna
 from sklearn.metrics import log_loss
 
+from ins_pricing.modelling.bayesopt.checkpoints import rebuild_resn_model_from_payload
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import ResNetSklearn
 from ins_pricing.utils.losses import regression_loss
@@ -26,7 +27,13 @@ class ResNetTrainer(TrainerBase):
         else:
             super().__init__(context, 'ResNet', 'ResNet')
         self.model: Optional[ResNetSklearn] = None
-        self.enable_distributed_optuna = bool(context.config.use_resn_ddp and context.use_gpu)
+        dist_cfg = getattr(context.config, "distributed", context.config)
+        self.enable_distributed_optuna = bool(
+            getattr(dist_cfg, "use_resn_ddp", False) and context.use_gpu
+        )
+
+    def _dist_cfg(self):
+        return getattr(self.ctx.config, "distributed", self.ctx.config)
 
     def _maybe_cleanup_gpu(self, model: Optional[ResNetSklearn]) -> None:
         if not bool(getattr(self.ctx.config, "resn_cleanup_per_fold", False)):
@@ -76,8 +83,10 @@ class ResNetTrainer(TrainerBase):
             residual_scale=float(params.get("residual_scale", 0.1)),
             stochastic_depth=float(params.get("stochastic_depth", 0.0)),
             weight_decay=resn_weight_decay,
-            use_data_parallel=self.ctx.config.use_resn_data_parallel,
-            use_ddp=self.ctx.config.use_resn_ddp,
+            use_data_parallel=bool(
+                getattr(self._dist_cfg(), "use_resn_data_parallel", False)
+            ),
+            use_ddp=bool(getattr(self._dist_cfg(), "use_resn_ddp", False)),
             use_gpu=self.ctx.use_gpu,
             loss_name=loss_name,
             distribution=getattr(self.ctx, "distribution", None),
@@ -281,15 +290,18 @@ class ResNetTrainer(TrainerBase):
         path = self.output.model_path(self._get_model_filename())
         if os.path.exists(path):
             payload = torch_load(path, map_location='cpu', weights_only=False)
-            if isinstance(payload, dict) and "state_dict" in payload:
-                state_dict = payload.get("state_dict")
-                params = payload.get("best_params") or self.best_params
-            else:
-                state_dict = payload
-                params = self.best_params
-            resn_loaded = self._build_model(params)
-            resn_loaded.resnet.load_state_dict(state_dict)
-
+            params_fallback = (
+                dict(self.best_params)
+                if isinstance(self.best_params, dict)
+                else None
+            )
+            resn_loaded, resolved_params = rebuild_resn_model_from_payload(
+                payload=payload,
+                model_builder=self._build_model,
+                params_fallback=params_fallback,
+                require_params=False,
+            )
+            self.best_params = resolved_params
             self._move_to_device(resn_loaded)
             self.model = resn_loaded
             self.ctx.resn_best = self.model

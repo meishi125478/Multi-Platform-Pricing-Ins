@@ -6,10 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-try:
-    from ins_pricing.cli.utils.cli_common import resolve_dir_path, resolve_path  # type: ignore
-except Exception:  # pragma: no cover
-    from cli_common import resolve_dir_path, resolve_path  # type: ignore
+from ins_pricing.cli.utils.cli_common import resolve_dir_path, resolve_path  # type: ignore
 
 
 def resolve_config_path(raw: str, script_dir: Path) -> Path:

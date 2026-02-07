@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
+from ins_pricing.modelling.bayesopt.trainers.trainer_context import TrainerContext
 from ins_pricing.modelling.bayesopt.trainers.trainer_ft import FTTrainer
 from ins_pricing.modelling.bayesopt.trainers.trainer_glm import GLMTrainer
 from ins_pricing.modelling.bayesopt.trainers.trainer_gnn import GNNTrainer
@@ -10,6 +11,7 @@ from ins_pricing.modelling.bayesopt.trainers.trainer_xgb import XGBTrainer, _xgb
 
 __all__ = [
     "TrainerBase",
+    "TrainerContext",
     "FTTrainer",
     "GLMTrainer",
     "GNNTrainer",

@@ -2,7 +2,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from ins_pricing.bayesopt.utils import DistributedUtils
+from ins_pricing.modelling.bayesopt.utils import DistributedUtils
 
 
 def test_setup_ddp_without_env(monkeypatch):

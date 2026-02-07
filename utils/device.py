@@ -244,6 +244,23 @@ class DeviceManager:
         return device
 
     @classmethod
+    def resolve_training_device(
+        cls,
+        *,
+        is_ddp_enabled: bool = False,
+        local_rank: int = 0,
+        use_gpu: bool = True,
+    ) -> Any:
+        """Resolve training device with DDP-aware behavior."""
+        if not TORCH_AVAILABLE:
+            return None
+        if not bool(use_gpu):
+            return torch.device("cpu")
+        if bool(is_ddp_enabled):
+            return torch.device(f"cuda:{int(local_rank)}")
+        return cls.get_best_device(prefer_cuda=True)
+
+    @classmethod
     def move_to_device(cls, model_obj: Any, device: Optional[Any] = None) -> None:
         """Move a model object to the specified device.
 

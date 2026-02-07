@@ -55,23 +55,7 @@ _BAYESOPT_EXPORTS = {
     "_xgb_cuda_available",
 }
 
-_LEGACY_EXPORTS = {
-    "IOUtils": "ins_pricing.utils",
-    "DeviceManager": "ins_pricing.utils",
-    "GPUMemoryManager": "ins_pricing.utils",
-    "MetricFactory": "ins_pricing.utils",
-    "EPS": "ins_pricing.utils",
-    "set_global_seed": "ins_pricing.utils",
-    "compute_batch_size": "ins_pricing.utils",
-    "tweedie_loss": "ins_pricing.utils",
-    "infer_factor_and_cate_list": "ins_pricing.utils",
-    "DistributedUtils": "ins_pricing.modelling.bayesopt.utils",
-    "TrainingUtils": "ins_pricing.modelling.bayesopt.utils",
-    "free_cuda": "ins_pricing.modelling.bayesopt.utils",
-    "TorchTrainerMixin": "ins_pricing.modelling.bayesopt.utils",
-}
-
-__all__ = sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(_LEGACY_EXPORTS))
+__all__ = sorted(set(__all__) | set(_BAYESOPT_EXPORTS))
 
 _LAZY_SUBMODULES = {
     "bayesopt": "ins_pricing.modelling.bayesopt",
@@ -140,14 +124,8 @@ def __getattr__(name: str):
         globals()[name] = value
         return value
 
-    legacy_module = _LEGACY_EXPORTS.get(name)
-    if legacy_module:
-        module = import_module(legacy_module)
-        value = getattr(module, name)
-        globals()[name] = value
-        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(_LEGACY_EXPORTS) | set(globals().keys()))
+    return sorted(set(__all__) | set(_BAYESOPT_EXPORTS) | set(globals().keys()))

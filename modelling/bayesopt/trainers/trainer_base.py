@@ -8,6 +8,7 @@ from ins_pricing.modelling.bayesopt.runtime import (
     TrainerOptunaMixin,
     TrainerPersistenceMixin,
 )
+from ins_pricing.modelling.bayesopt.trainers.trainer_context import TrainerContext
 
 
 class TrainerBase(
@@ -15,7 +16,7 @@ class TrainerBase(
     TrainerPersistenceMixin,
     TrainerCVPredictionMixin,
 ):
-    def __init__(self, context: "BayesOptModel", label: str, model_name_prefix: str) -> None:
+    def __init__(self, context: TrainerContext, label: str, model_name_prefix: str) -> None:
         self.ctx = context
         self.label = label
         self.model_name_prefix = model_name_prefix

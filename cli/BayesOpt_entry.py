@@ -57,10 +57,7 @@ def _apply_env_from_config(argv: list[str]) -> None:
 
 _apply_env_from_config(sys.argv)
 
-try:
-    from ins_pricing.cli.bayesopt_entry_runner import main
-except Exception:  # pragma: no cover
-    from ins_pricing.cli.bayesopt_entry_runner import main
+from ins_pricing.cli.bayesopt_entry_runner import main
 
 __all__ = ["main"]
 
