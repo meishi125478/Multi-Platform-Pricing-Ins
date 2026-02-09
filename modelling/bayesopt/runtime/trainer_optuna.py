@@ -219,6 +219,17 @@ class TrainerOptunaMixin:
         completed = len(study.get_trials(states=completed_states))
         progress_counter["count"] = completed
         remaining = max(0, total_trials - completed)
+        if remaining < 1:
+            has_complete = bool(
+                study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+            )
+            if not has_complete:
+                _log(
+                    f"[Optuna][{self.label}] Study has no completed trial yet; "
+                    "running one recovery trial.",
+                    flush=True,
+                )
+                remaining = 1
         if remaining > 0:
             study.optimize(
                 objective_wrapper,
@@ -226,8 +237,31 @@ class TrainerOptunaMixin:
                 callbacks=[checkpoint_callback],
             )
 
-        self.best_params = study.best_params
+        complete_count = len(
+            study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+        )
+        if complete_count < 1:
+            pruned_count = len(
+                study.get_trials(states=(optuna.trial.TrialState.PRUNED,))
+            )
+            fail_count = len(
+                study.get_trials(states=(optuna.trial.TrialState.FAIL,))
+            )
+            study_name = getattr(study, "study_name", None) or "<unnamed>"
+            raise RuntimeError(
+                f"[Optuna][{self.label}] No completed trials in study '{study_name}' "
+                f"(complete=0, pruned={pruned_count}, failed={fail_count}, "
+                f"max_evals={total_trials}). Increase max_evals or relax pruning/"
+                "search constraints (for XGB, try lowering xgb_max_depth_max and "
+                "xgb_n_estimators_max), then rerun."
+            )
+
         self.best_trial = study.best_trial
+        self.best_params = dict(getattr(self.best_trial, "params", None) or {})
+        if not self.best_params:
+            raise RuntimeError(
+                f"[Optuna][{self.label}] Best trial has empty params; cannot continue."
+            )
         self._persist_best_params_csv(self.best_params)
 
     def tune(self, max_evals: int, objective_fn=None) -> None:
@@ -241,16 +275,20 @@ class TrainerOptunaMixin:
         total_trials = max(1, int(max_evals))
         progress_counter = {"count": 0}
         study = self._create_study()
+        self._optuna_total_trials = total_trials
         objective_wrapper = self._make_objective_wrapper(
             objective_fn, total_trials, progress_counter, barrier_on_end=False)
         checkpoint_callback = self._make_checkpoint_callback()
-        self._run_study_and_extract(
-            study,
-            objective_wrapper,
-            checkpoint_callback,
-            total_trials,
-            progress_counter,
-        )
+        try:
+            self._run_study_and_extract(
+                study,
+                objective_wrapper,
+                checkpoint_callback,
+                total_trials,
+                progress_counter,
+            )
+        finally:
+            self._optuna_total_trials = None
 
     def _should_use_distributed_optuna(self) -> bool:
         if not self.enable_distributed_optuna:
@@ -380,6 +418,7 @@ class TrainerOptunaMixin:
         total_trials = max(1, int(max_evals))
         progress_counter = {"count": 0}
         study = self._create_study()
+        self._optuna_total_trials = total_trials
         objective_wrapper = self._make_objective_wrapper(
             objective_fn, total_trials, progress_counter, barrier_on_end=True)
         checkpoint_callback = self._make_checkpoint_callback()
@@ -392,6 +431,7 @@ class TrainerOptunaMixin:
                 progress_counter,
             )
         finally:
+            self._optuna_total_trials = None
             self._distributed_send_command(
                 {"type": "STOP", "best_params": self.best_params})
 

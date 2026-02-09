@@ -29,6 +29,31 @@ def _is_oom_error(exc: Exception) -> bool:
     return "out of memory" in msg or ("cuda" in msg and "memory" in msg)
 
 
+def _is_host_memory_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        isinstance(exc, MemoryError)
+        or "unable to allocate" in msg
+        or "arraymemoryerror" in msg
+        or "bad_alloc" in msg
+        or "std::bad_alloc" in msg
+    )
+
+
+def _has_categorical_columns(X: Any) -> bool:
+    """Best-effort check for pandas categorical columns."""
+    dtypes = getattr(X, "dtypes", None)
+    if dtypes is not None:
+        try:
+            return any(str(dtype) == "category" for dtype in dtypes)
+        except Exception:
+            pass
+    dtype = getattr(X, "dtype", None)
+    if dtype is not None:
+        return str(dtype) == "category"
+    return False
+
+
 class _XGBDMatrixWrapper:
     """Sklearn-like wrapper that uses xgb.train + (Quantile)DMatrix internally."""
 
@@ -56,11 +81,21 @@ class _XGBDMatrixWrapper:
         return dict(self.params)
 
     def _select_dmatrix_class(self) -> Any:
-        if self.use_gpu and hasattr(xgb, "DeviceQuantileDMatrix"):
-            return xgb.DeviceQuantileDMatrix
         if hasattr(xgb, "QuantileDMatrix"):
             return xgb.QuantileDMatrix
+        if self.use_gpu and hasattr(xgb, "DeviceQuantileDMatrix"):
+            return xgb.DeviceQuantileDMatrix
         return xgb.DMatrix
+
+    def _raise_incompatible_categorical_error(self, dmatrix_cls: Any, exc: Exception) -> None:
+        cls_name = getattr(dmatrix_cls, "__name__", str(dmatrix_cls))
+        raise TypeError(
+            f"{cls_name} does not support native categorical handling in this "
+            f"XGBoost build. Categorical columns are present, and this trainer "
+            f"will not silently disable categorical support. "
+            f"Reinstall a consistent XGBoost build (CPU/GPU variants must match) "
+            f"or set xgb_use_dmatrix=false as a temporary workaround."
+        ) from exc
 
     def _build_dmatrix(self, X, y=None, weight=None) -> xgb.DMatrix:
         if isinstance(X, (str, os.PathLike)):
@@ -81,16 +116,28 @@ class _XGBDMatrixWrapper:
             kwargs["enable_categorical"] = True
         try:
             return dmatrix_cls(X, **kwargs)
-        except TypeError:
-            kwargs.pop("enable_categorical", None)
+        except TypeError as exc:
+            if "enable_categorical" in kwargs:
+                if _has_categorical_columns(X):
+                    self._raise_incompatible_categorical_error(dmatrix_cls, exc)
+                kwargs.pop("enable_categorical", None)
             return dmatrix_cls(X, **kwargs)
         except Exception:
             if dmatrix_cls is not xgb.DMatrix:
-                return xgb.DMatrix(X, **kwargs)
+                try:
+                    return xgb.DMatrix(X, **kwargs)
+                except TypeError as exc:
+                    if "enable_categorical" in kwargs and _has_categorical_columns(X):
+                        self._raise_incompatible_categorical_error(xgb.DMatrix, exc)
+                    kwargs.pop("enable_categorical", None)
+                    return xgb.DMatrix(X, **kwargs)
             raise
 
     def _resolve_train_params(self) -> Dict[str, Any]:
         params = dict(self.params)
+        # enable_categorical is a DMatrix-side option; passing it to xgb.train
+        # triggers "Parameters ... are not used" warnings.
+        params.pop("enable_categorical", None)
         if not self.use_gpu:
             params["tree_method"] = "hist"
             params["predictor"] = "cpu_predictor"
@@ -340,6 +387,26 @@ class XGBTrainer(TrainerBase):
         fit_kwargs.setdefault("verbose", False)
         return fit_kwargs
 
+    def _resolve_optuna_total_trials(self) -> int:
+        raw = getattr(self, "_optuna_total_trials", None)
+        if raw is None:
+            return 100
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return 100
+
+    def _should_prune_slow_config(
+        self,
+        *,
+        max_depth: int,
+        n_estimators: int,
+    ) -> bool:
+        if max_depth < 20 or n_estimators < 300:
+            return False
+        # Avoid pruning away the full search budget when max_evals is tiny.
+        return self._resolve_optuna_total_trials() > 2
+
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best XGB parameters.")
@@ -421,7 +488,10 @@ class XGBTrainer(TrainerBase):
                 f"n_estimators={n_estimators}",
                 flush=True,
             )
-        if max_depth >= 20 and n_estimators >= 300:
+        if self._should_prune_slow_config(
+            max_depth=max_depth,
+            n_estimators=n_estimators,
+        ):
             raise optuna.TrialPruned(
                 "XGB config is likely too slow (max_depth>=20 & n_estimators>=300)")
         clf = self._build_estimator()
@@ -532,8 +602,19 @@ class XGBTrainer(TrainerBase):
                 refit_kwargs.pop("early_stopping_rounds", None)
                 refit_kwargs.pop("eval_metric", None)
                 refit_kwargs.setdefault("verbose", False)
-                refit_model.fit(X_all, y_all, **refit_kwargs)
-                self.model = refit_model
+                try:
+                    refit_model.fit(X_all, y_all, **refit_kwargs)
+                    self.model = refit_model
+                except Exception as exc:
+                    if _is_host_memory_error(exc):
+                        _log(
+                            "[XGBoost] final_refit failed due to host memory; "
+                            "keeping early-stopped model. Consider setting "
+                            "final_refit=false for large datasets.",
+                            flush=True,
+                        )
+                    else:
+                        raise
         else:
             fit_kwargs = dict(self.ctx.fit_params or {})
             fit_kwargs.setdefault("sample_weight", w_all)
