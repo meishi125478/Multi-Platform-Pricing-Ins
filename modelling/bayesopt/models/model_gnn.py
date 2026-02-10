@@ -5,7 +5,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -135,6 +135,9 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                  knn_gpu_mem_ratio: float = 0.9,
                  knn_gpu_mem_overhead: float = 2.0,
                  knn_cpu_jobs: Optional[int] = -1,
+                 max_fit_rows: Optional[int] = None,
+                 max_predict_rows: Optional[int] = None,
+                 predict_chunk_rows: Optional[int] = None,
                  loss_name: Optional[str] = None,
                  distribution: Optional[str] = None) -> None:
         super().__init__()
@@ -170,6 +173,9 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
         self.knn_gpu_mem_ratio = max(0.0, min(1.0, knn_gpu_mem_ratio))
         self.knn_gpu_mem_overhead = max(1.0, knn_gpu_mem_overhead)
         self.knn_cpu_jobs = knn_cpu_jobs
+        self.max_fit_rows = self._coerce_positive_int(max_fit_rows)
+        self.max_predict_rows = self._coerce_positive_int(max_predict_rows)
+        self.predict_chunk_rows = self._coerce_positive_int(predict_chunk_rows)
         self.mps_dense_max_nodes = int(
             os.environ.get("BAYESOPT_GNN_MPS_DENSE_MAX_NODES", "5000")
         )
@@ -286,6 +292,66 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             raise ValueError(
                 f"{name} length {length} does not match X length {n_rows}."
             )
+
+    @staticmethod
+    def _coerce_positive_int(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            resolved = int(value)
+        except (TypeError, ValueError):
+            return None
+        if resolved < 1:
+            return None
+        return resolved
+
+    @staticmethod
+    def _slice_rows(X, start: int, end: int):
+        if hasattr(X, "iloc"):
+            return X.iloc[start:end]
+        return X[start:end]
+
+    @staticmethod
+    def _take_rows(data, indices):
+        if data is None:
+            return None
+        if hasattr(data, "iloc"):
+            return data.iloc[indices]
+        arr = np.asarray(data)
+        return arr[indices]
+
+    @staticmethod
+    def _reset_index_if_possible(data):
+        if data is None:
+            return None
+        if hasattr(data, "reset_index"):
+            return data.reset_index(drop=True)
+        return data
+
+    def _maybe_cap_fit_rows(self, X, y, w, *, label: str):
+        limit = self.max_fit_rows
+        if limit is None:
+            return X, y, w
+        n_rows = len(X)
+        if n_rows <= limit:
+            return X, y, w
+        rng = np.random.default_rng(13)
+        sample_idx = np.sort(rng.choice(n_rows, size=int(limit), replace=False))
+        X_out = self._reset_index_if_possible(self._take_rows(X, sample_idx))
+        y_out = self._reset_index_if_possible(self._take_rows(y, sample_idx))
+        w_out = self._reset_index_if_possible(self._take_rows(w, sample_idx))
+        _log(
+            f"[GNN] {label} rows reduced from {n_rows} to {int(limit)} "
+            f"via uniform subsampling (gnn_max_fit_rows).",
+            flush=True,
+        )
+        return X_out, y_out, w_out
+
+    def _resolve_predict_chunk_rows(self, n_rows: int) -> Optional[int]:
+        chunk_rows = self._coerce_positive_int(self.predict_chunk_rows)
+        if chunk_rows is None:
+            return None
+        return min(int(chunk_rows), int(n_rows))
 
     def _unwrap_gnn(self) -> nn.Module:
         if isinstance(self.gnn, (DDP, nn.DataParallel)):
@@ -734,10 +800,14 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
     def _fit_impl(self, X_train, y_train, w_train=None,
                   X_val=None, y_val=None, w_val=None,
                   trial: Optional[optuna.trial.Trial] = None):
+        X_train, y_train, w_train = self._maybe_cap_fit_rows(
+            X_train, y_train, w_train, label="training")
         X_train_tensor, y_train_tensor, w_train_tensor = self._tensorize_split(
             X_train, y_train, w_train, allow_none=False)
         has_val = X_val is not None and y_val is not None
         if has_val:
+            X_val, y_val, w_val = self._maybe_cap_fit_rows(
+                X_val, y_val, w_val, label="validation")
             X_val_tensor, y_val_tensor, w_val_tensor = self._tensorize_split(
                 X_val, y_val, w_val, allow_none=False)
         else:
@@ -845,7 +915,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         return self._run_with_mps_fallback(self._predict_impl, X)
 
-    def _predict_impl(self, X: pd.DataFrame) -> np.ndarray:
+    def _predict_single(self, X: pd.DataFrame) -> np.ndarray:
         self.gnn.eval()
         X_tensor, _, _ = self._tensorize_split(
             X, None, None, allow_none=False)
@@ -864,10 +934,59 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
             y_pred = np.clip(y_pred, 1e-6, None)
         return y_pred.ravel()
 
+    def _predict_chunked(self, X: pd.DataFrame, chunk_rows: int) -> np.ndarray:
+        n_rows = len(X)
+        if n_rows <= chunk_rows:
+            return self._predict_single(X)
+        if not getattr(self, "_predict_chunk_warned", False):
+            _log(
+                "[GNN] Using chunked local-graph prediction to cap memory usage. "
+                "Chunks are predicted independently.",
+                flush=True,
+            )
+            self._predict_chunk_warned = True
+        preds: List[np.ndarray] = []
+        original_graph_cache = self.graph_cache_path
+        try:
+            self.graph_cache_path = None
+            self.invalidate_graph_cache()
+            for start in range(0, n_rows, chunk_rows):
+                end = min(n_rows, start + chunk_rows)
+                X_chunk = self._reset_index_if_possible(
+                    self._slice_rows(X, start, end))
+                preds.append(self._predict_single(X_chunk))
+                self.invalidate_graph_cache()
+        finally:
+            self.graph_cache_path = original_graph_cache
+        return np.concatenate(preds, axis=0) if preds else np.empty(0, dtype=np.float32)
+
+    def _predict_impl(self, X: pd.DataFrame) -> np.ndarray:
+        n_rows = len(X)
+        if n_rows == 0:
+            return np.empty(0, dtype=np.float32)
+        chunk_rows = self._resolve_predict_chunk_rows(n_rows)
+        max_predict_rows = self._coerce_positive_int(self.max_predict_rows)
+        if max_predict_rows is not None and n_rows > max_predict_rows:
+            if chunk_rows is None:
+                raise MemoryError(
+                    f"[GNN] predict rows={n_rows} exceeds gnn_max_predict_rows={max_predict_rows}. "
+                    "Set gnn_predict_chunk_rows to enable chunked local-graph prediction."
+                )
+            if not getattr(self, "_predict_limit_warned", False):
+                _log(
+                    f"[GNN] predict rows={n_rows} exceeds gnn_max_predict_rows={max_predict_rows}; "
+                    f"switching to chunked prediction with chunk_rows={chunk_rows}.",
+                    flush=True,
+                )
+                self._predict_limit_warned = True
+        if chunk_rows is not None and n_rows > chunk_rows:
+            return self._predict_chunked(X, chunk_rows)
+        return self._predict_single(X)
+
     def encode(self, X: pd.DataFrame) -> np.ndarray:
         return self._run_with_mps_fallback(self._encode_impl, X)
 
-    def _encode_impl(self, X: pd.DataFrame) -> np.ndarray:
+    def _encode_single(self, X: pd.DataFrame) -> np.ndarray:
         """Return per-sample node embeddings (hidden representations)."""
         base = self._unwrap_gnn()
         base.eval()
@@ -885,6 +1004,55 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                 h = layer(h, adj)
             h = _adj_mm(adj, h)
         return h.detach().cpu().numpy()
+
+    def _encode_chunked(self, X: pd.DataFrame, chunk_rows: int) -> np.ndarray:
+        n_rows = len(X)
+        if n_rows <= chunk_rows:
+            return self._encode_single(X)
+        if not getattr(self, "_encode_chunk_warned", False):
+            _log(
+                "[GNN] Using chunked local-graph encoding to cap memory usage. "
+                "Chunks are encoded independently.",
+                flush=True,
+            )
+            self._encode_chunk_warned = True
+        outputs: List[np.ndarray] = []
+        original_graph_cache = self.graph_cache_path
+        try:
+            self.graph_cache_path = None
+            self.invalidate_graph_cache()
+            for start in range(0, n_rows, chunk_rows):
+                end = min(n_rows, start + chunk_rows)
+                X_chunk = self._reset_index_if_possible(
+                    self._slice_rows(X, start, end))
+                outputs.append(self._encode_single(X_chunk))
+                self.invalidate_graph_cache()
+        finally:
+            self.graph_cache_path = original_graph_cache
+        return np.concatenate(outputs, axis=0) if outputs else np.empty((0, 0), dtype=np.float32)
+
+    def _encode_impl(self, X: pd.DataFrame) -> np.ndarray:
+        n_rows = len(X)
+        if n_rows == 0:
+            return np.empty((0, 0), dtype=np.float32)
+        chunk_rows = self._resolve_predict_chunk_rows(n_rows)
+        max_predict_rows = self._coerce_positive_int(self.max_predict_rows)
+        if max_predict_rows is not None and n_rows > max_predict_rows:
+            if chunk_rows is None:
+                raise MemoryError(
+                    f"[GNN] encode rows={n_rows} exceeds gnn_max_predict_rows={max_predict_rows}. "
+                    "Set gnn_predict_chunk_rows to enable chunked local-graph encoding."
+                )
+            if not getattr(self, "_encode_limit_warned", False):
+                _log(
+                    f"[GNN] encode rows={n_rows} exceeds gnn_max_predict_rows={max_predict_rows}; "
+                    f"switching to chunked encoding with chunk_rows={chunk_rows}.",
+                    flush=True,
+                )
+                self._encode_limit_warned = True
+        if chunk_rows is not None and n_rows > chunk_rows:
+            return self._encode_chunked(X, chunk_rows)
+        return self._encode_single(X)
 
     def set_params(self, params: Dict[str, Any]):
         for key, value in params.items():

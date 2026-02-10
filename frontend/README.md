@@ -157,10 +157,13 @@ Fill in parameters in the **"Manual Configuration"** section:
 - **Use GPU**: Whether to use GPU
 - **Model Keys**: Comma-separated model types (e.g., `xgb, resn`)
 - **Max Evaluations**: Maximum number of evaluations
+- **ResNet Lazy Dataset**: Avoid full-tensor materialization during ResNet training
+- **ResNet Predict Batch Size (0=auto)**: Use batched ResNet inference to reduce peak memory
 
 **XGBoost Settings**
 - **XGB Max Depth**: XGBoost maximum depth
 - **XGB Max Estimators**: XGBoost maximum number of estimators
+- **XGB Chunk Size (rows, 0=off)**: Enable chunked incremental XGBoost training to lower peak memory
 
 ### 2. Build Configuration
 

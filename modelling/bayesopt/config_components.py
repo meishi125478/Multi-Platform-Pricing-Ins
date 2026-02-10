@@ -72,6 +72,9 @@ class GNNConfig:
         max_gpu_knn_nodes: Max nodes for GPU k-NN construction
         knn_gpu_mem_ratio: Fraction of GPU memory for k-NN
         knn_gpu_mem_overhead: Temporary memory overhead multiplier
+        max_fit_rows: Optional cap for GNN fit rows (None = no cap)
+        max_predict_rows: Optional hard limit for prediction rows before chunking/fail-fast
+        predict_chunk_rows: Optional chunk size for local-graph chunked prediction
     """
 
     use_approx_knn: bool = True
@@ -80,6 +83,9 @@ class GNNConfig:
     max_gpu_knn_nodes: int = 200000
     knn_gpu_mem_ratio: float = 0.9
     knn_gpu_mem_overhead: float = 2.0
+    max_fit_rows: Optional[int] = None
+    max_predict_rows: Optional[int] = None
+    predict_chunk_rows: Optional[int] = None
 
     @classmethod
     def from_flat_dict(cls, d: Dict[str, Any]) -> "GNNConfig":
@@ -91,6 +97,9 @@ class GNNConfig:
             max_gpu_knn_nodes=int(_value_or_default(d, "gnn_max_gpu_knn_nodes", 200000)),
             knn_gpu_mem_ratio=float(_value_or_default(d, "gnn_knn_gpu_mem_ratio", 0.9)),
             knn_gpu_mem_overhead=float(_value_or_default(d, "gnn_knn_gpu_mem_overhead", 2.0)),
+            max_fit_rows=d.get("gnn_max_fit_rows"),
+            max_predict_rows=d.get("gnn_max_predict_rows"),
+            predict_chunk_rows=d.get("gnn_predict_chunk_rows"),
         )
 
 
@@ -162,11 +171,15 @@ class FTTransformerConfig:
         role: Model role ('model', 'embedding', 'unsupervised_embedding')
         feature_prefix: Prefix for generated embedding features
         num_numeric_tokens: Number of numeric tokens
+        use_lazy_dataset: Whether to avoid full tensor materialization during supervised FT training
+        predict_batch_size: Optional batch size for FT prediction
     """
 
     role: str = "model"
     feature_prefix: str = "ft_emb"
     num_numeric_tokens: Optional[int] = None
+    use_lazy_dataset: bool = True
+    predict_batch_size: Optional[int] = None
 
     @classmethod
     def from_flat_dict(cls, d: Dict[str, Any]) -> "FTTransformerConfig":
@@ -175,6 +188,8 @@ class FTTransformerConfig:
             role=str(_value_or_default(d, "ft_role", "model")),
             feature_prefix=str(_value_or_default(d, "ft_feature_prefix", "ft_emb")),
             num_numeric_tokens=d.get("ft_num_numeric_tokens"),
+            use_lazy_dataset=bool(_value_or_default(d, "ft_use_lazy_dataset", True)),
+            predict_batch_size=d.get("ft_predict_batch_size"),
         )
 
 
@@ -189,6 +204,7 @@ class XGBoostConfig:
         cleanup_per_fold: Whether to cleanup GPU memory after each fold
         cleanup_synchronize: Whether to synchronize CUDA during cleanup
         use_dmatrix: Whether to use xgb.train with DMatrix/QuantileDMatrix
+        chunk_size: Rows per chunk for chunked incremental training (None = disabled)
     """
 
     max_depth_max: int = 25
@@ -197,6 +213,7 @@ class XGBoostConfig:
     cleanup_per_fold: bool = False
     cleanup_synchronize: bool = False
     use_dmatrix: bool = True
+    chunk_size: Optional[int] = None
 
     @classmethod
     def from_flat_dict(cls, d: Dict[str, Any]) -> "XGBoostConfig":
@@ -208,6 +225,7 @@ class XGBoostConfig:
             cleanup_per_fold=bool(_value_or_default(d, "xgb_cleanup_per_fold", False)),
             cleanup_synchronize=bool(_value_or_default(d, "xgb_cleanup_synchronize", False)),
             use_dmatrix=bool(_value_or_default(d, "xgb_use_dmatrix", True)),
+            chunk_size=d.get("xgb_chunk_size"),
         )
 
 

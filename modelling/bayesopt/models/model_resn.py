@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import TensorDataset
+from torch.utils.data import Dataset, TensorDataset
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
@@ -144,6 +144,65 @@ class ResNetSequential(nn.Module):
             self._printed_device = True
         return self.net(x)
 
+
+class _LazyTabularDataset(Dataset):
+    """Lazy map-style dataset to avoid materializing full torch tensors."""
+
+    def __init__(self, X, y, w=None):
+        self.X = X
+        self.y = y
+        self.w = w
+        self._len = len(X)
+        if len(y) != self._len:
+            raise ValueError(
+                f"y length {len(y)} does not match X length {self._len}."
+            )
+        if w is not None and len(w) != self._len:
+            raise ValueError(
+                f"w length {len(w)} does not match X length {self._len}."
+            )
+
+    @staticmethod
+    def _row_slice(arr, idx: int):
+        if hasattr(arr, "iloc"):
+            return arr.iloc[idx]
+        return arr[idx]
+
+    @staticmethod
+    def _row_to_feature_array(row) -> np.ndarray:
+        if hasattr(row, "to_numpy"):
+            out = row.to_numpy(dtype=np.float32, copy=False)
+        else:
+            out = np.asarray(row, dtype=np.float32)
+        out = np.asarray(out, dtype=np.float32)
+        if out.ndim == 0:
+            return out.reshape(1)
+        return out.reshape(-1)
+
+    @staticmethod
+    def _scalar_to_float(value) -> float:
+        out = np.asarray(value, dtype=np.float32).reshape(-1)
+        if out.size == 0:
+            return 0.0
+        return float(out[0])
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, idx: int):
+        row_x = self._row_slice(self.X, int(idx))
+        row_y = self._row_slice(self.y, int(idx))
+        row_w = self._row_slice(self.w, int(idx)) if self.w is not None else 1.0
+
+        x_np = self._row_to_feature_array(row_x)
+        y_val = self._scalar_to_float(row_y)
+        w_val = self._scalar_to_float(row_w)
+
+        x_tensor = torch.as_tensor(x_np, dtype=torch.float32)
+        y_tensor = torch.tensor([y_val], dtype=torch.float32)
+        w_tensor = torch.tensor([w_val], dtype=torch.float32)
+        return x_tensor, y_tensor, w_tensor
+
 # Define the ResNet sklearn-style wrapper.
 
 
@@ -189,6 +248,8 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
         self.training_history: Dict[str, List[float]] = {
             "train": [], "val": []}
         self.use_data_parallel = bool(use_data_parallel and self.use_gpu)
+        self.use_lazy_dataset: bool = True
+        self.predict_batch_size: Optional[int] = None
         self.device = resolve_training_device(
             is_ddp_enabled=self.is_ddp_enabled,
             local_rank=self.local_rank,
@@ -297,6 +358,18 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
             X_val_tensor = y_val_tensor = w_val_tensor = None
         return X_tensor, y_tensor, w_tensor, X_val_tensor, y_val_tensor, w_val_tensor, has_val
 
+    def _build_train_val_datasets(self, X_train, y_train, w_train, X_val, y_val, w_val):
+        self._validate_inputs(X_train, y_train, w_train, "train")
+        has_val = X_val is not None and y_val is not None
+        if X_val is not None or y_val is not None or w_val is not None:
+            if not has_val:
+                raise ValueError("validation X and y must both be provided.")
+            self._validate_inputs(X_val, y_val, w_val, "val")
+        train_dataset = _LazyTabularDataset(X_train, y_train, w_train)
+        val_dataset = _LazyTabularDataset(
+            X_val, y_val, w_val) if has_val else None
+        return train_dataset, val_dataset, has_val
+
     def forward(self, x):
         # Handle SHAP NumPy input.
         if isinstance(x, np.ndarray):
@@ -312,15 +385,30 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
 
     def fit(self, X_train, y_train, w_train=None,
             X_val=None, y_val=None, w_val=None, trial=None):
+        use_lazy = bool(getattr(self, "use_lazy_dataset", True))
+        if use_lazy:
+            train_dataset, val_dataset, has_val = self._build_train_val_datasets(
+                X_train, y_train, w_train, X_val, y_val, w_val
+            )
+            if not getattr(self, "_lazy_dataset_logged", False):
+                _log(
+                    ">>> ResNet using lazy tabular dataset to avoid full tensor materialization.",
+                    flush=True,
+                )
+                self._lazy_dataset_logged = True
+        else:
+            X_tensor, y_tensor, w_tensor, X_val_tensor, y_val_tensor, w_val_tensor, has_val = \
+                self._build_train_val_tensors(
+                    X_train, y_train, w_train, X_val, y_val, w_val)
+            train_dataset = TensorDataset(X_tensor, y_tensor, w_tensor)
+            val_dataset = (
+                TensorDataset(X_val_tensor, y_val_tensor, w_val_tensor)
+                if has_val else None
+            )
 
-        X_tensor, y_tensor, w_tensor, X_val_tensor, y_val_tensor, w_val_tensor, has_val = \
-            self._build_train_val_tensors(
-                X_train, y_train, w_train, X_val, y_val, w_val)
-
-        dataset = TensorDataset(X_tensor, y_tensor, w_tensor)
         dataloader, accum_steps = self._build_dataloader(
-            dataset,
-            N=X_tensor.shape[0],
+            train_dataset,
+            N=len(train_dataset),
             base_bs_gpu=(2048, 1024, 512),
             base_bs_cpu=(256, 128),
             min_bs=64,
@@ -342,12 +430,9 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
         )
         self.scaler = create_grad_scaler(self.device.type)
 
-        X_val_dev = y_val_dev = w_val_dev = None
         val_dataloader = None
         if has_val:
             # Build validation DataLoader.
-            val_dataset = TensorDataset(
-                X_val_tensor, y_val_tensor, w_val_tensor)
             # No backward pass in validation; batch size can be larger for throughput.
             val_dataloader = self._build_val_dataloader(
                 val_dataset, dataloader, accum_steps)
@@ -424,16 +509,45 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
 
     # ---------------- Prediction ----------------
 
+    @staticmethod
+    def _slice_rows(X, start: int, end: int):
+        if hasattr(X, "iloc"):
+            return X.iloc[start:end]
+        return X[start:end]
+
+    def _resolve_predict_batch_size(self, n_rows: int) -> int:
+        raw = getattr(self, "predict_batch_size", None)
+        if raw is not None:
+            try:
+                resolved = int(raw)
+                if resolved > 0:
+                    return resolved
+            except (TypeError, ValueError):
+                pass
+        if self.device.type == "cuda":
+            return min(max(1024, 4 * int(getattr(self, "batch_num", 100))), max(1024, n_rows))
+        if self.device.type == "mps":
+            return min(max(512, 2 * int(getattr(self, "batch_num", 100))), max(512, n_rows))
+        return min(max(1024, 8 * int(getattr(self, "batch_num", 100))), max(1024, n_rows))
+
     def predict(self, X_test):
         self.resnet.eval()
-        if isinstance(X_test, pd.DataFrame):
-            X_np = X_test.to_numpy(dtype=np.float32, copy=False)
-        else:
-            X_np = np.asarray(X_test, dtype=np.float32)
-
+        n_rows = len(X_test)
+        if n_rows == 0:
+            return np.array([], dtype=np.float32)
+        batch_size = max(1, self._resolve_predict_batch_size(n_rows))
+        preds = []
         inference_cm = getattr(torch, "inference_mode", torch.no_grad)
         with inference_cm():
-            y_pred = self(X_np).cpu().numpy()
+            for start in range(0, n_rows, batch_size):
+                end = min(n_rows, start + batch_size)
+                X_batch = self._slice_rows(X_test, start, end)
+                if isinstance(X_batch, pd.DataFrame):
+                    X_np = X_batch.to_numpy(dtype=np.float32, copy=False)
+                else:
+                    X_np = np.asarray(X_batch, dtype=np.float32)
+                preds.append(self(X_np).cpu().numpy())
+        y_pred = np.concatenate(preds, axis=0) if preds else np.empty((0, 1), dtype=np.float32)
 
         if self.task_type == 'classification':
             y_pred = 1 / (1 + np.exp(-y_pred))  # Sigmoid converts logits to probabilities.

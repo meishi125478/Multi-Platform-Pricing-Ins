@@ -138,6 +138,21 @@ class GNNTrainer(TrainerBase):
                     2.0,
                 )
             ),
+            max_fit_rows=self._resolve_gnn_setting(
+                "max_fit_rows",
+                "gnn_max_fit_rows",
+                None,
+            ),
+            max_predict_rows=self._resolve_gnn_setting(
+                "max_predict_rows",
+                "gnn_max_predict_rows",
+                None,
+            ),
+            predict_chunk_rows=self._resolve_gnn_setting(
+                "predict_chunk_rows",
+                "gnn_predict_chunk_rows",
+                None,
+            ),
             loss_name=loss_name,
             distribution=getattr(self.ctx, "distribution", None),
         )

@@ -345,6 +345,13 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
             xgb_gpu_id = int(xgb_gpu_id)
         except (TypeError, ValueError):
             xgb_gpu_id = None
+    stream_split_chunksize = cfg.get("stream_split_chunksize", 200000)
+    try:
+        stream_split_chunksize = int(stream_split_chunksize)
+    except (TypeError, ValueError):
+        stream_split_chunksize = 200000
+    if stream_split_chunksize < 1:
+        stream_split_chunksize = 200000
     return {
         "save_preprocess": bool(cfg.get("save_preprocess", False)),
         "preprocess_artifact_path": cfg.get("preprocess_artifact_path"),
@@ -373,6 +380,8 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "prediction_cache_dir": cfg.get("prediction_cache_dir"),
         "prediction_cache_format": cfg.get("prediction_cache_format", "parquet"),
         "ddp_min_rows": cfg.get("ddp_min_rows", 50000),
+        "stream_split_csv": bool(cfg.get("stream_split_csv", False)),
+        "stream_split_chunksize": stream_split_chunksize,
     }
 
 

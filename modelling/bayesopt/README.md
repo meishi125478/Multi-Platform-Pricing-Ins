@@ -88,6 +88,11 @@ Example:
   - If you need to reclaim memory between folds, set `xgb_cleanup_per_fold=true`.
   - If you still need a full device sync, set `xgb_cleanup_synchronize=true` (slower).
 - `xgb_use_dmatrix=true` switches XGBoost to `xgb.train` + DMatrix/QuantileDMatrix for better throughput.
+- `xgb_chunk_size` enables chunked incremental boosting to reduce peak training memory.
+  - Example: `xgb_chunk_size=200000` trains on 200k-row chunks and appends trees chunk-by-chunk.
+  - In chunk mode, `early_stopping_rounds` is ignored (set `final_refit=false` for very large datasets).
+- `stream_split_csv=true` enables CSV streaming random split at entry runtime to avoid loading all rows at once.
+  - Tune `stream_split_chunksize` (default `200000`) based on memory budget.
 - External-memory DMatrix (file-backed) is disabled; pass in-memory arrays/dataframes.
 
 ## Torch model cleanup
@@ -98,6 +103,13 @@ Enable if you see memory pressure:
 - `resn_cleanup_per_fold`, `resn_cleanup_synchronize`
 - `gnn_cleanup_per_fold`, `gnn_cleanup_synchronize`
 - `optuna_cleanup_synchronize` controls whether trial-level cleanup syncs CUDA (default false)
+- `resn_use_lazy_dataset=true` (default) avoids creating a full in-memory torch tensor copy for ResNet training.
+- `resn_predict_batch_size` controls batched ResNet inference to avoid OOM during train/test prediction caching.
+- `ft_use_lazy_dataset=true` (default) avoids full tensor materialization during supervised FT training.
+- `ft_predict_batch_size` controls FT batched inference when generating cached predictions/embeddings.
+- `gnn_max_fit_rows` caps GNN train/val rows (uniform subsampling) to avoid graph OOM during fit.
+- `gnn_max_predict_rows` and `gnn_predict_chunk_rows` gate large GNN prediction/encoding requests.
+  - When chunking is enabled, each chunk builds a local graph independently (memory-safe, approximate).
 
 ## Notes
 

@@ -114,10 +114,15 @@ class BayesOptConfig:
         xgb_cleanup_per_fold: Whether to cleanup GPU memory after each XGBoost fold
         xgb_cleanup_synchronize: Whether to synchronize CUDA during XGBoost cleanup
         xgb_use_dmatrix: Whether to use xgb.train with DMatrix/QuantileDMatrix
+        xgb_chunk_size: Rows per chunk for XGBoost chunked incremental training
         ft_cleanup_per_fold: Whether to cleanup GPU memory after each FT fold
         ft_cleanup_synchronize: Whether to synchronize CUDA during FT cleanup
         resn_cleanup_per_fold: Whether to cleanup GPU memory after each ResNet fold
         resn_cleanup_synchronize: Whether to synchronize CUDA during ResNet cleanup
+        resn_use_lazy_dataset: Whether ResNet uses lazy row-wise dataset to avoid full tensor materialization
+        resn_predict_batch_size: Optional batch size for ResNet prediction (None = auto)
+        ft_use_lazy_dataset: Whether FT-Transformer uses lazy row-wise dataset to avoid full tensor materialization
+        ft_predict_batch_size: Optional batch size for FT-Transformer prediction (None = auto)
         gnn_cleanup_per_fold: Whether to cleanup GPU memory after each GNN fold
         gnn_cleanup_synchronize: Whether to synchronize CUDA during GNN cleanup
         optuna_cleanup_synchronize: Whether to synchronize CUDA during Optuna cleanup
@@ -168,10 +173,15 @@ class BayesOptConfig:
     xgb_cleanup_per_fold: bool = False
     xgb_cleanup_synchronize: bool = False
     xgb_use_dmatrix: bool = True
+    xgb_chunk_size: Optional[int] = None
     ft_cleanup_per_fold: bool = False
     ft_cleanup_synchronize: bool = False
     resn_cleanup_per_fold: bool = False
     resn_cleanup_synchronize: bool = False
+    resn_use_lazy_dataset: bool = True
+    resn_predict_batch_size: Optional[int] = None
+    ft_use_lazy_dataset: bool = True
+    ft_predict_batch_size: Optional[int] = None
     gnn_cleanup_per_fold: bool = False
     gnn_cleanup_synchronize: bool = False
     optuna_cleanup_synchronize: bool = False
@@ -191,6 +201,9 @@ class BayesOptConfig:
     gnn_max_gpu_knn_nodes: Optional[int] = 200000
     gnn_knn_gpu_mem_ratio: float = 0.9
     gnn_knn_gpu_mem_overhead: float = 2.0
+    gnn_max_fit_rows: Optional[int] = None
+    gnn_max_predict_rows: Optional[int] = None
+    gnn_predict_chunk_rows: Optional[int] = None
 
     # Region/Geo settings
     region_province_col: Optional[str] = None
@@ -419,6 +432,42 @@ class BayesOptConfig:
             else:
                 if gpu_id < 0:
                     errors.append(f"xgb_gpu_id must be >= 0, got {gpu_id}")
+        if self.xgb_chunk_size is not None:
+            try:
+                xgb_chunk_size = int(self.xgb_chunk_size)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"xgb_chunk_size must be a positive integer, got {self.xgb_chunk_size!r}"
+                )
+            else:
+                if xgb_chunk_size < 1:
+                    errors.append(
+                        f"xgb_chunk_size must be >= 1 when provided, got {xgb_chunk_size}"
+                    )
+        if self.resn_predict_batch_size is not None:
+            try:
+                resn_predict_batch_size = int(self.resn_predict_batch_size)
+            except (TypeError, ValueError):
+                errors.append(
+                    "resn_predict_batch_size must be a positive integer when provided."
+                )
+            else:
+                if resn_predict_batch_size < 1:
+                    errors.append(
+                        f"resn_predict_batch_size must be >= 1 when provided, got {resn_predict_batch_size}"
+                    )
+        if self.ft_predict_batch_size is not None:
+            try:
+                ft_predict_batch_size = int(self.ft_predict_batch_size)
+            except (TypeError, ValueError):
+                errors.append(
+                    "ft_predict_batch_size must be a positive integer when provided."
+                )
+            else:
+                if ft_predict_batch_size < 1:
+                    errors.append(
+                        f"ft_predict_batch_size must be >= 1 when provided, got {ft_predict_batch_size}"
+                    )
 
         # Validate distributed training: can't use both DataParallel and DDP
         if self.use_resn_data_parallel and self.use_resn_ddp:
@@ -473,6 +522,36 @@ class BayesOptConfig:
             errors.append(
                 f"gnn_knn_gpu_mem_ratio must be in (0, 1], got {self.gnn_knn_gpu_mem_ratio}"
             )
+        if self.gnn_max_fit_rows is not None:
+            try:
+                gnn_max_fit_rows = int(self.gnn_max_fit_rows)
+            except (TypeError, ValueError):
+                errors.append("gnn_max_fit_rows must be a positive integer when provided.")
+            else:
+                if gnn_max_fit_rows < 1:
+                    errors.append(
+                        f"gnn_max_fit_rows must be >= 1 when provided, got {gnn_max_fit_rows}"
+                    )
+        if self.gnn_max_predict_rows is not None:
+            try:
+                gnn_max_predict_rows = int(self.gnn_max_predict_rows)
+            except (TypeError, ValueError):
+                errors.append("gnn_max_predict_rows must be a positive integer when provided.")
+            else:
+                if gnn_max_predict_rows < 1:
+                    errors.append(
+                        f"gnn_max_predict_rows must be >= 1 when provided, got {gnn_max_predict_rows}"
+                    )
+        if self.gnn_predict_chunk_rows is not None:
+            try:
+                gnn_predict_chunk_rows = int(self.gnn_predict_chunk_rows)
+            except (TypeError, ValueError):
+                errors.append("gnn_predict_chunk_rows must be a positive integer when provided.")
+            else:
+                if gnn_predict_chunk_rows < 1:
+                    errors.append(
+                        f"gnn_predict_chunk_rows must be >= 1 when provided, got {gnn_predict_chunk_rows}"
+                    )
 
         if errors:
             raise ConfigurationError(

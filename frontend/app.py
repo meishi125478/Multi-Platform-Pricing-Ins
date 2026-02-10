@@ -132,10 +132,13 @@ class PricingApp:
         xgb_cleanup_per_fold: bool,
         xgb_cleanup_synchronize: bool,
         xgb_use_dmatrix: bool,
+        xgb_chunk_size: int,
         ft_cleanup_per_fold: bool,
         ft_cleanup_synchronize: bool,
         resn_cleanup_per_fold: bool,
         resn_cleanup_synchronize: bool,
+        resn_use_lazy_dataset: bool,
+        resn_predict_batch_size: int,
         gnn_cleanup_per_fold: bool,
         gnn_cleanup_synchronize: bool,
         optuna_cleanup_synchronize: bool,
@@ -153,6 +156,20 @@ class PricingApp:
                 x.strip() for x in categorical_features.split(',') if x.strip()]
             model_keys = [x.strip()
                           for x in model_keys.split(',') if x.strip()]
+            parsed_xgb_chunk_size: Optional[int] = None
+            try:
+                chunk_size_val = int(xgb_chunk_size)
+            except (TypeError, ValueError):
+                chunk_size_val = 0
+            if chunk_size_val > 0:
+                parsed_xgb_chunk_size = chunk_size_val
+            parsed_resn_predict_batch_size: Optional[int] = None
+            try:
+                resn_pred_bs_val = int(resn_predict_batch_size)
+            except (TypeError, ValueError):
+                resn_pred_bs_val = 0
+            if resn_pred_bs_val > 0:
+                parsed_resn_predict_batch_size = resn_pred_bs_val
 
             config = self.config_builder.build_config(
                 data_dir=data_dir,
@@ -179,10 +196,13 @@ class PricingApp:
                 xgb_cleanup_per_fold=xgb_cleanup_per_fold,
                 xgb_cleanup_synchronize=xgb_cleanup_synchronize,
                 xgb_use_dmatrix=xgb_use_dmatrix,
+                xgb_chunk_size=parsed_xgb_chunk_size,
                 ft_cleanup_per_fold=ft_cleanup_per_fold,
                 ft_cleanup_synchronize=ft_cleanup_synchronize,
                 resn_cleanup_per_fold=resn_cleanup_per_fold,
                 resn_cleanup_synchronize=resn_cleanup_synchronize,
+                resn_use_lazy_dataset=resn_use_lazy_dataset,
+                resn_predict_batch_size=parsed_resn_predict_batch_size,
                 gnn_cleanup_per_fold=gnn_cleanup_per_fold,
                 gnn_cleanup_synchronize=gnn_cleanup_synchronize,
                 optuna_cleanup_synchronize=optuna_cleanup_synchronize,
@@ -608,6 +628,8 @@ def create_ui():
                         label="XGB Cleanup Synchronize", value=False)
                     xgb_use_dmatrix = gr.Checkbox(
                         label="XGB Use DMatrix", value=True)
+                    xgb_chunk_size = gr.Number(
+                        label="XGB Chunk Size (rows, 0=off)", value=0, precision=0)
                     gr.Markdown("#### Fold Cleanup")
                     ft_cleanup_per_fold = gr.Checkbox(
                         label="FT Cleanup Per Fold", value=False)
@@ -617,6 +639,10 @@ def create_ui():
                         label="ResNet Cleanup Per Fold", value=False)
                     resn_cleanup_synchronize = gr.Checkbox(
                         label="ResNet Cleanup Synchronize", value=False)
+                    resn_use_lazy_dataset = gr.Checkbox(
+                        label="ResNet Lazy Dataset", value=True)
+                    resn_predict_batch_size = gr.Number(
+                        label="ResNet Predict Batch Size (0=auto)", value=0, precision=0)
                     gnn_cleanup_per_fold = gr.Checkbox(
                         label="GNN Cleanup Per Fold", value=False)
                     gnn_cleanup_synchronize = gr.Checkbox(
@@ -906,8 +932,10 @@ def create_ui():
                 output_dir, use_gpu, model_keys, max_evals,
                 xgb_max_depth_max, xgb_n_estimators_max,
                 xgb_gpu_id, xgb_cleanup_per_fold, xgb_cleanup_synchronize,
-                xgb_use_dmatrix, ft_cleanup_per_fold, ft_cleanup_synchronize,
+                xgb_use_dmatrix, xgb_chunk_size,
+                ft_cleanup_per_fold, ft_cleanup_synchronize,
                 resn_cleanup_per_fold, resn_cleanup_synchronize,
+                resn_use_lazy_dataset, resn_predict_batch_size,
                 gnn_cleanup_per_fold, gnn_cleanup_synchronize,
                 optuna_cleanup_synchronize
             ],

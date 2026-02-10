@@ -37,6 +37,8 @@ class ConfigBuilder:
             "cache_predictions": False,
             "prediction_cache_dir": None,
             "prediction_cache_format": "parquet",
+            "stream_split_csv": False,
+            "stream_split_chunksize": 200000,
             "plot_curves": False,
             "plot": {
                 "enable": False,
@@ -62,6 +64,8 @@ class ConfigBuilder:
             "ft_role": "model",
             "ft_feature_prefix": "ft_emb",
             "ft_num_numeric_tokens": None,
+            "ft_use_lazy_dataset": True,
+            "ft_predict_batch_size": None,
             "ft_oof_folds": None,
             "ft_oof_strategy": None,
             "ft_oof_shuffle": True,
@@ -74,12 +78,18 @@ class ConfigBuilder:
             "optuna_study_prefix": "pricing",
             "reuse_best_params": False,
             "best_params_files": {},
+            "xgb_chunk_size": None,
+            "resn_use_lazy_dataset": True,
+            "resn_predict_batch_size": None,
             "gnn_use_approx_knn": True,
             "gnn_approx_knn_threshold": 50000,
             "gnn_graph_cache": None,
             "gnn_max_gpu_knn_nodes": 200000,
             "gnn_knn_gpu_mem_ratio": 0.9,
             "gnn_knn_gpu_mem_overhead": 2.0,
+            "gnn_max_fit_rows": None,
+            "gnn_max_predict_rows": None,
+            "gnn_predict_chunk_rows": None,
             "geo_feature_nmes": [],
             "region_province_col": None,
             "region_city_col": None,
@@ -154,12 +164,22 @@ class ConfigBuilder:
         xgb_cleanup_per_fold: bool = False,
         xgb_cleanup_synchronize: bool = False,
         xgb_use_dmatrix: bool = True,
+        xgb_chunk_size: Optional[int] = None,
+        stream_split_csv: bool = False,
+        stream_split_chunksize: int = 200000,
         ft_cleanup_per_fold: bool = False,
         ft_cleanup_synchronize: bool = False,
+        ft_use_lazy_dataset: bool = True,
+        ft_predict_batch_size: Optional[int] = None,
         resn_cleanup_per_fold: bool = False,
         resn_cleanup_synchronize: bool = False,
+        resn_use_lazy_dataset: bool = True,
+        resn_predict_batch_size: Optional[int] = None,
         gnn_cleanup_per_fold: bool = False,
         gnn_cleanup_synchronize: bool = False,
+        gnn_max_fit_rows: Optional[int] = None,
+        gnn_max_predict_rows: Optional[int] = None,
+        gnn_predict_chunk_rows: Optional[int] = None,
         optuna_cleanup_synchronize: bool = False,
         nproc_per_node: int = 2,
     ) -> Dict[str, Any]:
@@ -192,12 +212,22 @@ class ConfigBuilder:
             xgb_cleanup_per_fold: Cleanup GPU memory per XGBoost fold
             xgb_cleanup_synchronize: Synchronize CUDA during XGBoost cleanup
             xgb_use_dmatrix: Use xgb.train with DMatrix/QuantileDMatrix
+            xgb_chunk_size: Rows per chunk for XGBoost chunked incremental training
+            stream_split_csv: Stream CSV chunks during random split to avoid full-file loading
+            stream_split_chunksize: Rows per CSV chunk when stream_split_csv is enabled
             ft_cleanup_per_fold: Cleanup GPU memory per FT fold
             ft_cleanup_synchronize: Synchronize CUDA during FT cleanup
+            ft_use_lazy_dataset: Use lazy dataset for FT supervised training
+            ft_predict_batch_size: Optional batch size for FT prediction
             resn_cleanup_per_fold: Cleanup GPU memory per ResNet fold
             resn_cleanup_synchronize: Synchronize CUDA during ResNet cleanup
+            resn_use_lazy_dataset: Use lazy dataset for ResNet to avoid full tensor materialization
+            resn_predict_batch_size: Optional batch size for ResNet prediction
             gnn_cleanup_per_fold: Cleanup GPU memory per GNN fold
             gnn_cleanup_synchronize: Synchronize CUDA during GNN cleanup
+            gnn_max_fit_rows: Optional cap for GNN fit rows (subsamples when exceeded)
+            gnn_max_predict_rows: Optional max rows for GNN predict/encode before chunk/fail-fast
+            gnn_predict_chunk_rows: Optional chunk size for chunked local-graph GNN predict/encode
             optuna_cleanup_synchronize: Synchronize CUDA during Optuna cleanup
             nproc_per_node: Number of processes per node
 
@@ -234,12 +264,22 @@ class ConfigBuilder:
             "xgb_cleanup_per_fold": xgb_cleanup_per_fold,
             "xgb_cleanup_synchronize": xgb_cleanup_synchronize,
             "xgb_use_dmatrix": xgb_use_dmatrix,
+            "xgb_chunk_size": xgb_chunk_size,
+            "stream_split_csv": stream_split_csv,
+            "stream_split_chunksize": stream_split_chunksize,
             "ft_cleanup_per_fold": ft_cleanup_per_fold,
             "ft_cleanup_synchronize": ft_cleanup_synchronize,
+            "ft_use_lazy_dataset": ft_use_lazy_dataset,
+            "ft_predict_batch_size": ft_predict_batch_size,
             "resn_cleanup_per_fold": resn_cleanup_per_fold,
             "resn_cleanup_synchronize": resn_cleanup_synchronize,
+            "resn_use_lazy_dataset": resn_use_lazy_dataset,
+            "resn_predict_batch_size": resn_predict_batch_size,
             "gnn_cleanup_per_fold": gnn_cleanup_per_fold,
             "gnn_cleanup_synchronize": gnn_cleanup_synchronize,
+            "gnn_max_fit_rows": gnn_max_fit_rows,
+            "gnn_max_predict_rows": gnn_max_predict_rows,
+            "gnn_predict_chunk_rows": gnn_predict_chunk_rows,
             "optuna_cleanup_synchronize": optuna_cleanup_synchronize,
             "optuna_storage": f"{output_dir}/optuna/bayesopt.sqlite3",
             "stack_model_keys": model_keys,

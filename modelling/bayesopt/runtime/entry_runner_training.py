@@ -6,6 +6,9 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+import pandas as pd
+
 
 @dataclass(frozen=True)
 class BayesOptRunnerDeps:
@@ -58,6 +61,63 @@ def _create_ddp_barrier(dist_ctx: Any, ropt: Any):
             raise
 
     return _ddp_barrier
+
+
+def _stream_random_split_csv(
+    data_path: Path,
+    *,
+    holdout_ratio: float,
+    rand_seed: Optional[int],
+    dtype_map: Dict[str, Any],
+    low_memory: bool,
+    chunksize: int,
+    coerce_dataset_types: Callable[[Any], Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Stream CSV chunks and split rows by Bernoulli sampling to avoid full-file loading."""
+    holdout_ratio = float(holdout_ratio)
+    if not (0.0 < holdout_ratio < 1.0):
+        raise ValueError(
+            f"holdout_ratio must be in (0, 1) for streaming random split; got {holdout_ratio}."
+        )
+    chunk_size = max(1, int(chunksize))
+    rng = np.random.default_rng(rand_seed if rand_seed is not None else 13)
+    read_kwargs: Dict[str, Any] = {"low_memory": bool(low_memory), "chunksize": chunk_size}
+    if dtype_map:
+        read_kwargs["dtype"] = dtype_map
+
+    train_parts: List[pd.DataFrame] = []
+    test_parts: List[pd.DataFrame] = []
+    total_rows = 0
+    columns: Optional[pd.Index] = None
+
+    for chunk in pd.read_csv(data_path, **read_kwargs):
+        chunk = coerce_dataset_types(chunk)
+        if columns is None:
+            columns = chunk.columns
+        n_chunk = int(len(chunk))
+        if n_chunk == 0:
+            continue
+        total_rows += n_chunk
+        mask_test = rng.random(n_chunk) < holdout_ratio
+        if mask_test.any():
+            test_parts.append(chunk.loc[mask_test].copy())
+        mask_train = ~mask_test
+        if mask_train.any():
+            train_parts.append(chunk.loc[mask_train].copy())
+
+    if total_rows == 0:
+        raise ValueError(f"Dataset is empty: {data_path}")
+
+    if columns is None:
+        columns = pd.Index([])
+    train_df = pd.concat(train_parts, ignore_index=True) if train_parts else pd.DataFrame(columns=columns)
+    test_df = pd.concat(test_parts, ignore_index=True) if test_parts else pd.DataFrame(columns=columns)
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "Streaming split produced an empty train or test set. "
+            "Adjust holdout_ratio or disable stream_split_csv."
+        )
+    return train_df, test_df, total_rows
 
 
 def run_bayesopt_entry_training(
@@ -158,6 +218,8 @@ def run_bayesopt_entry_training(
     optuna_study_prefix = runtime_cfg["optuna_study_prefix"]
     best_params_files = runtime_cfg["best_params_files"]
     plot_path_style = runtime_cfg["plot_path_style"]
+    stream_split_csv = runtime_cfg["stream_split_csv"]
+    stream_split_chunksize = runtime_cfg["stream_split_chunksize"]
 
     model_names = deps.build_model_names(
         cfg["model_list"], cfg["model_categories"])
@@ -185,31 +247,55 @@ def run_bayesopt_entry_training(
             )
 
         print(f"\n=== Processing model {model_name} ===")
-        raw = deps.load_dataset(
-            data_path,
-            data_format=data_format,
-            dtype_map=dtype_map,
-            low_memory=False,
+        fmt_lower = str(data_format).strip().lower()
+        is_csv_source = fmt_lower == "csv" or (
+            fmt_lower == "auto" and data_path.suffix.lower() == ".csv"
         )
-        raw = deps.coerce_dataset_types(raw)
-
-        train_df, test_df = deps.split_train_test(
-            raw,
-            holdout_ratio=holdout_ratio,
-            strategy=split_strategy,
-            group_col=split_group_col,
-            time_col=split_time_col,
-            time_ascending=split_time_ascending,
-            rand_seed=rand_seed,
-            reset_index_mode="time_group",
-            ratio_label="holdout_ratio",
+        use_stream_split = bool(
+            stream_split_csv
+            and is_csv_source
+            and str(split_strategy).strip().lower() in {"random"}
         )
+        if use_stream_split:
+            print(
+                f"[Data] streaming random split enabled "
+                f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
+                flush=True,
+            )
+            train_df, test_df, dataset_rows = _stream_random_split_csv(
+                data_path,
+                holdout_ratio=holdout_ratio,
+                rand_seed=rand_seed,
+                dtype_map=dtype_map,
+                low_memory=False,
+                chunksize=int(stream_split_chunksize),
+                coerce_dataset_types=deps.coerce_dataset_types,
+            )
+        else:
+            raw = deps.load_dataset(
+                data_path,
+                data_format=data_format,
+                dtype_map=dtype_map,
+                low_memory=False,
+            )
+            raw = deps.coerce_dataset_types(raw)
+            train_df, test_df = deps.split_train_test(
+                raw,
+                holdout_ratio=holdout_ratio,
+                strategy=split_strategy,
+                group_col=split_group_col,
+                time_col=split_time_col,
+                time_ascending=split_time_ascending,
+                rand_seed=rand_seed,
+                reset_index_mode="time_group",
+                ratio_label="holdout_ratio",
+            )
+            dataset_rows = len(raw)
 
         use_resn_dp = bool((args.use_resn_dp or cfg.get(
             "use_resn_data_parallel", False)) and cfg.get("use_gpu", True))
         use_ft_dp = bool((args.use_ft_dp or cfg.get(
             "use_ft_data_parallel", False)) and cfg.get("use_gpu", True))
-        dataset_rows = len(raw)
         ddp_enabled = bool(
             dist_active
             and cfg.get("use_gpu", True)

@@ -9,7 +9,10 @@ optuna = pytest.importorskip("optuna")
 pytest.importorskip("xgboost")
 
 from ins_pricing.modelling.bayesopt.runtime.trainer_optuna import TrainerOptunaMixin
-from ins_pricing.modelling.bayesopt.trainers.trainer_xgb import XGBTrainer
+from ins_pricing.modelling.bayesopt.trainers.trainer_xgb import (
+    XGBTrainer,
+    _XGBDMatrixWrapper,
+)
 
 
 class _DummyTrainer(TrainerOptunaMixin):
@@ -71,6 +74,32 @@ def test_xgb_slow_prune_disabled_when_trial_budget_is_tiny() -> None:
     assert trainer._should_prune_slow_config(max_depth=21, n_estimators=490) is True
 
 
+def test_xgb_chunk_plan_covers_all_rows_and_rounds() -> None:
+    plan = _XGBDMatrixWrapper._build_chunk_plan(
+        total_rows=10,
+        chunk_size=3,
+        num_boost_round=5,
+    )
+    assert plan[0][0] == 0
+    assert plan[-1][1] == 10
+    assert sum(end - start for start, end, _ in plan) == 10
+    assert sum(rounds for _, _, rounds in plan) == 5
+    assert all(rounds >= 1 for _, _, rounds in plan)
+    for prev, curr in zip(plan, plan[1:]):
+        assert prev[1] == curr[0]
+
+
+def test_xgb_chunk_plan_limits_chunk_count_by_boost_rounds() -> None:
+    plan = _XGBDMatrixWrapper._build_chunk_plan(
+        total_rows=100,
+        chunk_size=10,
+        num_boost_round=3,
+    )
+    assert len(plan) == 3
+    assert sum(rounds for _, _, rounds in plan) == 3
+    assert plan[-1][1] == 100
+
+
 def test_run_study_and_extract_recovers_from_pruned_only_history(tmp_path: Path) -> None:
     trainer = _DummyTrainer(tmp_path)
     study = trainer._create_study()
@@ -103,3 +132,24 @@ def test_run_study_and_extract_recovers_from_pruned_only_history(tmp_path: Path)
 
     assert isinstance(trainer.best_params, dict)
     assert "learning_rate" in trainer.best_params
+
+
+def test_objective_wrapper_prunes_dataloader_worker_runtime_error(tmp_path: Path) -> None:
+    trainer = _DummyTrainer(tmp_path)
+    study = trainer._create_study()
+    trial = study.ask()
+    progress_counter = {"count": 0}
+
+    def _raise_dataloader_runtime(_trial: optuna.trial.Trial) -> float:
+        raise RuntimeError("DataLoader worker (pid 123) exited unexpectedly")
+
+    objective_wrapper = trainer._make_objective_wrapper(
+        _raise_dataloader_runtime,
+        total_trials=1,
+        progress_counter=progress_counter,
+        barrier_on_end=False,
+    )
+
+    with pytest.raises(optuna.TrialPruned):
+        objective_wrapper(trial)
+    assert progress_counter["count"] == 1

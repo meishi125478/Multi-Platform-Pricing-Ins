@@ -159,25 +159,52 @@ class TrainerOptunaMixin:
                     f"[Optuna][{self.label}] Trial {current_idx}/{total_trials} started "
                     f"(trial_id={trial.number})."
                 )
+            status_repr = "OK"
             try:
                 result = objective_fn(trial)
+            except optuna.TrialPruned:
+                status_repr = "PRUNED"
+                raise
             except RuntimeError as exc:
-                if "out of memory" in str(exc).lower():
+                exc_text = str(exc)
+                exc_lower = exc_text.lower()
+                if "out of memory" in exc_lower:
+                    status_repr = "PRUNED"
                     _log(
                         f"[Optuna][{self.label}] OOM detected. Pruning trial and clearing CUDA cache."
                     )
                     self._clean_gpu(synchronize=True)
                     raise optuna.TrialPruned() from exc
+                dataloader_markers = (
+                    "dataloader worker",
+                    "exited unexpectedly",
+                    "connection reset by peer",
+                    "killed by signal: aborted",
+                    "resource_sharer",
+                )
+                if any(marker in exc_lower for marker in dataloader_markers):
+                    status_repr = "PRUNED"
+                    _log(
+                        f"[Optuna][{self.label}] DataLoader worker failure detected; pruning trial. "
+                        f"detail={exc_text}",
+                        flush=True,
+                    )
+                    self._clean_gpu(synchronize=True)
+                    raise optuna.TrialPruned(
+                        f"DataLoader worker failure: {exc_text}"
+                    ) from exc
+                status_repr = "FAIL"
+                raise
+            except Exception:
+                status_repr = "FAIL"
                 raise
             finally:
                 self._clean_gpu(synchronize=self._optuna_cleanup_sync())
                 if should_log:
                     progress_counter["count"] = progress_counter["count"] + 1
-                    trial_state = getattr(trial, "state", None)
-                    state_repr = getattr(trial_state, "name", "OK")
                     _log(
                         f"[Optuna][{self.label}] Trial {progress_counter['count']}/{total_trials} finished "
-                        f"(status={state_repr})."
+                        f"(status={status_repr})."
                     )
                 if barrier_on_end:
                     self._dist_barrier("trial_end")

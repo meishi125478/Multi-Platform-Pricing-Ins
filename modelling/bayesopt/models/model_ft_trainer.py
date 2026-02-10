@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import Dataset
 
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 from ins_pricing.modelling.bayesopt.utils.torch_runtime import (
@@ -150,6 +151,81 @@ def _compute_reconstruction_loss(
     return num_loss + cat_loss
 
 
+class _LazyFTSupervisedDataset(Dataset):
+    """Lazy supervised dataset that tensorizes rows on demand."""
+
+    def __init__(
+        self,
+        owner: "FTTransformerSklearn",
+        X: pd.DataFrame,
+        y,
+        w=None,
+        geo_tokens=None,
+    ) -> None:
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("X must be a pandas DataFrame.")
+        n_rows = len(X)
+        owner._validate_vector(y, "y", n_rows)
+        owner._validate_vector(w, "w", n_rows)
+        self.owner = owner
+        self.n_rows = int(n_rows)
+        self.X_num = X[owner.num_cols] if owner.num_cols else None
+        self.X_cat = X[owner.cat_cols] if owner.cat_cols else None
+        y_np = y.to_numpy(dtype=np.float32, copy=False) if hasattr(
+            y, "to_numpy") else np.asarray(y, dtype=np.float32)
+        self.y_values = np.asarray(y_np, dtype=np.float32).reshape(-1)
+        if w is None:
+            self.w_values = None
+        else:
+            w_np = w.to_numpy(dtype=np.float32, copy=False) if hasattr(
+                w, "to_numpy") else np.asarray(w, dtype=np.float32)
+            self.w_values = np.asarray(w_np, dtype=np.float32).reshape(-1)
+
+        if geo_tokens is not None:
+            geo_np = geo_tokens.to_numpy(dtype=np.float32, copy=False) if hasattr(
+                geo_tokens, "to_numpy") else np.asarray(geo_tokens, dtype=np.float32)
+            if geo_np.ndim == 1:
+                geo_np = geo_np.reshape(-1, 1)
+            if geo_np.shape[0] != n_rows:
+                raise ValueError("geo_tokens length does not match X rows.")
+            self.geo_values = np.asarray(geo_np, dtype=np.float32)
+        elif owner.num_geo > 0:
+            raise RuntimeError("geo_tokens must not be empty; prepare geo tokens first.")
+        else:
+            self.geo_values = None
+
+    def __len__(self) -> int:
+        return self.n_rows
+
+    def __getitem__(self, idx: int):
+        if self.X_num is None:
+            X_num = torch.zeros((0,), dtype=torch.float32)
+        else:
+            num_np = self.X_num.iloc[idx].to_numpy(dtype=np.float32, copy=False)
+            num_np = np.nan_to_num(num_np, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+            if self.owner._num_mean is not None and self.owner._num_std is not None and num_np.size:
+                num_np = (num_np - self.owner._num_mean) / self.owner._num_std
+            X_num = torch.as_tensor(np.asarray(num_np, dtype=np.float32))
+
+        if self.X_cat is None:
+            X_cat = torch.zeros((0,), dtype=torch.long)
+        else:
+            cat_np = self.owner._encode_cats(self.X_cat.iloc[idx:idx + 1]).reshape(-1)
+            X_cat = torch.as_tensor(cat_np, dtype=torch.long)
+
+        if self.geo_values is None:
+            X_geo = torch.zeros((0,), dtype=torch.float32)
+        else:
+            X_geo = torch.as_tensor(self.geo_values[idx], dtype=torch.float32)
+
+        y_item = torch.as_tensor(self.y_values[idx:idx + 1], dtype=torch.float32)
+        if self.w_values is None:
+            w_item = torch.ones((1,), dtype=torch.float32)
+        else:
+            w_item = torch.as_tensor(self.w_values[idx:idx + 1], dtype=torch.float32)
+        return X_num, X_cat, X_geo, y_item, w_item
+
+
 # Scikit-Learn style wrapper for FTTransformer.
 
 
@@ -246,6 +322,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         self.loss_curve_path: Optional[str] = None
         self.training_history: Dict[str, List[float]] = {
             "train": [], "val": []}
+        self.use_lazy_dataset: bool = True
+        self.predict_batch_size: Optional[int] = None
 
     def _build_model(self, X_train):
         num_numeric = len(self.num_cols)
@@ -349,6 +427,17 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
     def _build_val_tensors(self, X_val, y_val, w_val, geo_val=None):
         return self._tensorize_split(X_val, y_val, w_val, geo_tokens=geo_val, allow_none=True)
 
+    def _build_train_val_datasets(self, X_train, y_train, w_train, X_val, y_val, w_val, geo_train=None, geo_val=None):
+        train_dataset = _LazyFTSupervisedDataset(
+            self, X_train, y_train, w_train, geo_tokens=geo_train)
+        has_val = X_val is not None and y_val is not None
+        if has_val:
+            val_dataset = _LazyFTSupervisedDataset(
+                self, X_val, y_val, w_val, geo_tokens=geo_val)
+        else:
+            val_dataset = None
+        return train_dataset, val_dataset, has_val
+
     @staticmethod
     def _validate_vector(arr, name: str, n_rows: int) -> None:
         if arr is None:
@@ -437,19 +526,42 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         if self.ft is None:
             self._build_model(X_train)
 
-        X_num_train, X_cat_train, X_geo_train, y_tensor, w_tensor, _ = self._build_train_tensors(
-            X_train, y_train, w_train, geo_train=geo_train)
-        X_num_val, X_cat_val, X_geo_val, y_val_tensor, w_val_tensor, has_val = self._build_val_tensors(
-            X_val, y_val, w_val, geo_val=geo_val)
-
-        # --- Build DataLoader ---
-        dataset = TabularDataset(
-            X_num_train, X_cat_train, X_geo_train, y_tensor, w_tensor
-        )
+        use_lazy = bool(getattr(self, "use_lazy_dataset", True))
+        if use_lazy:
+            dataset, val_dataset, has_val = self._build_train_val_datasets(
+                X_train,
+                y_train,
+                w_train,
+                X_val,
+                y_val,
+                w_val,
+                geo_train=geo_train,
+                geo_val=geo_val,
+            )
+            if not getattr(self, "_lazy_dataset_logged", False):
+                _log(
+                    ">>> FTTransformer using lazy supervised dataset to avoid full tensor materialization.",
+                    flush=True,
+                )
+                self._lazy_dataset_logged = True
+            train_rows = len(dataset)
+        else:
+            X_num_train, X_cat_train, X_geo_train, y_tensor, w_tensor, _ = self._build_train_tensors(
+                X_train, y_train, w_train, geo_train=geo_train)
+            X_num_val, X_cat_val, X_geo_val, y_val_tensor, w_val_tensor, has_val = self._build_val_tensors(
+                X_val, y_val, w_val, geo_val=geo_val)
+            dataset = TabularDataset(
+                X_num_train, X_cat_train, X_geo_train, y_tensor, w_tensor
+            )
+            val_dataset = (
+                TabularDataset(X_num_val, X_cat_val, X_geo_val, y_val_tensor, w_val_tensor)
+                if has_val else None
+            )
+            train_rows = int(X_num_train.shape[0])
 
         dataloader, accum_steps = self._build_dataloader(
             dataset,
-            N=X_num_train.shape[0],
+            N=train_rows,
             base_bs_gpu=(2048, 1024, 512),
             base_bs_cpu=(256, 128),
             min_bs=64,
@@ -469,12 +581,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         )
         scaler = create_grad_scaler(self.device.type)
 
-        X_num_val_dev = X_cat_val_dev = y_val_dev = w_val_dev = None
         val_dataloader = None
         if has_val:
-            val_dataset = TabularDataset(
-                X_num_val, X_cat_val, X_geo_val, y_val_tensor, w_val_tensor
-            )
             val_dataloader = self._build_val_dataloader(
                 val_dataset, dataloader, accum_steps)
 
@@ -691,8 +799,10 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                             num_pred, cat_logits, num_true_b, num_mask_b,
                             cat_true_b, cat_mask_b, num_loss_weight, cat_loss_weight,
                             device=X_num_b.device)
-                        local_bad = 0 if bool(torch.isfinite(batch_loss)) else 1
+                        local_loss_value = float(batch_loss.detach().item())
+                        local_bad = 0 if np.isfinite(local_loss_value) else 1
                         global_bad = local_bad
+                        first_bad_rank = int(self.rank) if local_bad else -1
                         if use_collectives:
                             bad = torch.tensor(
                                 [local_bad],
@@ -701,30 +811,46 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                             )
                             dist.all_reduce(bad, op=dist.ReduceOp.MAX)
                             global_bad = int(bad.item())
+                            sentinel = max(1, int(self.world_size))
+                            bad_rank = torch.tensor(
+                                [int(self.rank) if local_bad else sentinel],
+                                device=batch_loss.device,
+                                dtype=torch.int32,
+                            )
+                            dist.all_reduce(bad_rank, op=dist.ReduceOp.MIN)
+                            bad_rank_val = int(bad_rank.item())
+                            first_bad_rank = (
+                                bad_rank_val if bad_rank_val < sentinel else -1
+                            )
 
                         if global_bad:
                             msg = (
-                                f"[FTTransformerSklearn.fit_unsupervised] non-finite loss "
-                                f"(epoch={epoch}, step={step}, loss={batch_loss.detach().item()})"
+                                "[FTTransformerSklearn.fit_unsupervised] non-finite loss "
+                                f"detected (epoch={epoch}, step={step}, local_rank={int(self.rank)}, "
+                                f"local_loss={local_loss_value}, bad_rank={first_bad_rank})"
                             )
-                            should_log = (not dist.is_initialized()
-                                          or DistributedUtils.is_main_process())
+                            should_log = (
+                                not dist.is_initialized()
+                                or DistributedUtils.is_main_process()
+                                or bool(local_bad)
+                            )
                             if should_log:
                                 _log(msg, flush=True)
-                                _log(
-                                    f"  X_num: finite={bool(torch.isfinite(X_num_b).all())} "
-                                    f"min={float(X_num_b.min().detach().cpu()) if X_num_b.numel() else 0.0:.3g} "
-                                    f"max={float(X_num_b.max().detach().cpu()) if X_num_b.numel() else 0.0:.3g}",
-                                    flush=True,
-                                )
-                                if X_geo_b is not None:
+                                if local_bad:
                                     _log(
-                                        f"  X_geo: finite={bool(torch.isfinite(X_geo_b).all())} "
-                                        f"min={float(X_geo_b.min().detach().cpu()) if X_geo_b.numel() else 0.0:.3g} "
-                                        f"max={float(X_geo_b.max().detach().cpu()) if X_geo_b.numel() else 0.0:.3g}",
+                                        f"  X_num: finite={bool(torch.isfinite(X_num_b).all())} "
+                                        f"min={float(X_num_b.min().detach().cpu()) if X_num_b.numel() else 0.0:.3g} "
+                                        f"max={float(X_num_b.max().detach().cpu()) if X_num_b.numel() else 0.0:.3g}",
                                         flush=True,
                                     )
-                            if trial is not None:
+                                    if X_geo_b is not None:
+                                        _log(
+                                            f"  X_geo: finite={bool(torch.isfinite(X_geo_b).all())} "
+                                            f"min={float(X_geo_b.min().detach().cpu()) if X_geo_b.numel() else 0.0:.3g} "
+                                            f"max={float(X_geo_b.max().detach().cpu()) if X_geo_b.numel() else 0.0:.3g}",
+                                            flush=True,
+                                        )
+                            if trial is not None or use_collectives:
                                 raise optuna.TrialPruned(msg)
                             raise RuntimeError(msg)
                         loss_for_backward = batch_loss / float(accum_steps)
@@ -853,49 +979,71 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             base_module.load_state_dict(best_state)
         return float(best_loss if has_val else (train_history[-1] if train_history else 0.0))
 
+    @staticmethod
+    def _slice_rows(X, start: int, end: int):
+        if hasattr(X, "iloc"):
+            return X.iloc[start:end]
+        return X[start:end]
+
+    @staticmethod
+    def _slice_geo_tokens(geo_tokens, start: int, end: int):
+        if geo_tokens is None:
+            return None
+        if hasattr(geo_tokens, "iloc"):
+            return geo_tokens.iloc[start:end]
+        return geo_tokens[start:end]
+
+    def _resolve_predict_batch_size(self, n_rows: int, batch_size: Optional[int] = None) -> int:
+        if batch_size is not None:
+            return max(1, min(int(batch_size), n_rows))
+        raw = getattr(self, "predict_batch_size", None)
+        if raw is not None:
+            try:
+                resolved = int(raw)
+            except (TypeError, ValueError):
+                resolved = 0
+            if resolved > 0:
+                return max(1, min(resolved, n_rows))
+        device = self.device if isinstance(
+            self.device, torch.device) else torch.device(self.device)
+        token_cnt = self.num_numeric_tokens + len(self.cat_cols)
+        if self.num_geo > 0:
+            token_cnt += 1
+        approx_units = max(1, token_cnt * max(1, self.d_model))
+        if device.type == 'cuda':
+            if approx_units >= 8192:
+                base = 512
+            elif approx_units >= 4096:
+                base = 1024
+            else:
+                base = 2048
+        else:
+            base = 512
+        return max(1, min(base, n_rows))
+
     def predict(self, X_test, geo_tokens=None, batch_size: Optional[int] = None, return_embedding: bool = False):
         # X_test must include all numeric/categorical columns; geo_tokens is optional.
-
         self.ft.eval()
-        X_num, X_cat, X_geo, _, _, _ = self._tensorize_split(
-            X_test, None, None, geo_tokens=geo_tokens, allow_none=True)
-
-        num_rows = X_num.shape[0]
+        num_rows = len(X_test)
         if num_rows == 0:
             return np.empty(0, dtype=np.float32)
 
         device = self.device if isinstance(
             self.device, torch.device) else torch.device(self.device)
-
-        def resolve_batch_size(n_rows: int) -> int:
-            if batch_size is not None:
-                return max(1, min(int(batch_size), n_rows))
-            # Estimate a safe batch size based on model size to avoid attention OOM.
-            token_cnt = self.num_numeric_tokens + len(self.cat_cols)
-            if self.num_geo > 0:
-                token_cnt += 1
-            approx_units = max(1, token_cnt * max(1, self.d_model))
-            if device.type == 'cuda':
-                if approx_units >= 8192:
-                    base = 512
-                elif approx_units >= 4096:
-                    base = 1024
-                else:
-                    base = 2048
-            else:
-                base = 512
-            return max(1, min(base, n_rows))
-
-        eff_batch = resolve_batch_size(num_rows)
+        eff_batch = self._resolve_predict_batch_size(num_rows, batch_size=batch_size)
         preds: List[torch.Tensor] = []
 
         inference_cm = getattr(torch, "inference_mode", torch.no_grad)
         with inference_cm():
             for start in range(0, num_rows, eff_batch):
                 end = min(num_rows, start + eff_batch)
-                X_num_b = X_num[start:end].to(device, non_blocking=True)
-                X_cat_b = X_cat[start:end].to(device, non_blocking=True)
-                X_geo_b = X_geo[start:end].to(device, non_blocking=True)
+                X_batch = self._slice_rows(X_test, start, end)
+                geo_batch = self._slice_geo_tokens(geo_tokens, start, end)
+                X_num_b, X_cat_b, X_geo_b, _, _, _ = self._tensorize_split(
+                    X_batch, None, None, geo_tokens=geo_batch, allow_none=True)
+                X_num_b = X_num_b.to(device, non_blocking=True)
+                X_cat_b = X_cat_b.to(device, non_blocking=True)
+                X_geo_b = X_geo_b.to(device, non_blocking=True)
                 pred_chunk = self.ft(
                     X_num_b, X_cat_b, X_geo_b, return_embedding=return_embedding)
                 preds.append(pred_chunk.cpu())

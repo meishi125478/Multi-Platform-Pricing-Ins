@@ -345,13 +345,41 @@ class TorchTrainerMixin:
         accum_steps = max(1, min(desired_accum, steps_per_epoch))
 
         workers = self._resolve_num_workers(8, profile=profile)
+        allow_ddp_workers = str(
+            os.environ.get(
+                "BAYESOPT_DDP_ALLOW_WORKERS_IN_MEMORY_SAVING",
+                "",
+            )
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if (
+            is_ddp
+            and device_type == "cuda"
+            and profile == "memory_saving"
+            and workers > 0
+            and not allow_ddp_workers
+        ):
+            _log(
+                ">>> DataLoader safety: DDP + memory_saving on CUDA detected; "
+                "forcing workers=0. Set BAYESOPT_DDP_ALLOW_WORKERS_IN_MEMORY_SAVING=1 to override."
+            )
+            workers = 0
+
         prefetch_factor = None
         if workers > 0:
-            prefetch_factor = 4 if profile == "throughput" else 2
+            if profile == "throughput":
+                prefetch_factor = 4
+            elif is_ddp and device_type == "cuda" and profile == "memory_saving":
+                prefetch_factor = 1
+            else:
+                prefetch_factor = 2
         persistent = workers > 0 and profile != "memory_saving"
+        pin_memory = (device_type == 'cuda')
+        if is_ddp and profile == "memory_saving" and workers > 0:
+            pin_memory = False
         _log(
             f">>> DataLoader config: Batch Size={batch_size}, Accum Steps={accum_steps}, "
-            f"Workers={workers}, Prefetch={prefetch_factor or 'off'}, Profile={profile}")
+            f"Workers={workers}, Prefetch={prefetch_factor or 'off'}, "
+            f"PinMemory={pin_memory}, Profile={profile}")
         sampler = None
         use_distributed_sampler = bool(
             dist.is_initialized() and getattr(self, "is_ddp_enabled", False)
@@ -368,7 +396,7 @@ class TorchTrainerMixin:
             shuffle=shuffle,
             sampler=sampler,
             num_workers=workers,
-            pin_memory=(device_type == 'cuda'),
+            pin_memory=pin_memory,
             persistent_workers=persistent,
             **({"prefetch_factor": prefetch_factor} if prefetch_factor is not None else {}),
         )

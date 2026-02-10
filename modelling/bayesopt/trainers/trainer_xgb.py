@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,22 +64,44 @@ class _XGBDMatrixWrapper:
         *,
         task_type: str,
         use_gpu: bool,
+        chunk_size: Optional[int] = None,
         allow_cpu_fallback: bool = True,
     ) -> None:
         self.params = dict(params)
         self.task_type = task_type
         self.use_gpu = bool(use_gpu)
+        self.chunk_size = self._coerce_chunk_size(chunk_size)
         self.allow_cpu_fallback = allow_cpu_fallback
         self._booster: Optional[xgb.Booster] = None
         self.best_iteration: Optional[int] = None
+        self._chunk_early_stopping_warned = False
+        self._chunk_mode_logged = False
+
+    @staticmethod
+    def _coerce_chunk_size(raw_chunk_size: Any) -> Optional[int]:
+        if raw_chunk_size is None:
+            return None
+        try:
+            chunk_size = int(raw_chunk_size)
+        except (TypeError, ValueError):
+            return None
+        if chunk_size < 1:
+            return None
+        return chunk_size
 
     def set_params(self, **params: Any) -> "_XGBDMatrixWrapper":
+        if "xgb_chunk_size" in params:
+            self.chunk_size = self._coerce_chunk_size(params.pop("xgb_chunk_size"))
+        elif "chunk_size" in params:
+            self.chunk_size = self._coerce_chunk_size(params.pop("chunk_size"))
         self.params.update(params)
         return self
 
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
         _ = deep
-        return dict(self.params)
+        params = dict(self.params)
+        params["xgb_chunk_size"] = self.chunk_size
+        return params
 
     def _select_dmatrix_class(self) -> Any:
         if hasattr(xgb, "QuantileDMatrix"):
@@ -144,6 +167,75 @@ class _XGBDMatrixWrapper:
             params.pop("gpu_id", None)
         return params
 
+    @staticmethod
+    def _slice_rows(data: Any, start: int, end: int) -> Any:
+        if data is None:
+            return None
+        if hasattr(data, "iloc"):
+            return data.iloc[start:end]
+        return data[start:end]
+
+    @staticmethod
+    def _normalize_eval_weights(sample_weight_eval_set: Any) -> List[Any]:
+        if sample_weight_eval_set is None:
+            return []
+        if isinstance(sample_weight_eval_set, (list, tuple)):
+            return list(sample_weight_eval_set)
+        return [sample_weight_eval_set]
+
+    @staticmethod
+    def _build_chunk_plan(
+        *,
+        total_rows: int,
+        chunk_size: Optional[int],
+        num_boost_round: int,
+    ) -> List[Tuple[int, int, int]]:
+        total_rows = int(total_rows)
+        if total_rows < 1:
+            return []
+        total_rounds = max(1, int(num_boost_round))
+        resolved_chunk_size = _XGBDMatrixWrapper._coerce_chunk_size(chunk_size)
+        if resolved_chunk_size is None or resolved_chunk_size >= total_rows:
+            return [(0, total_rows, total_rounds)]
+
+        n_chunks = int(math.ceil(total_rows / float(resolved_chunk_size)))
+        if n_chunks > total_rounds:
+            n_chunks = total_rounds
+            resolved_chunk_size = int(math.ceil(total_rows / float(n_chunks)))
+
+        bounds: List[Tuple[int, int]] = []
+        start = 0
+        for _ in range(n_chunks):
+            end = min(total_rows, start + resolved_chunk_size)
+            bounds.append((start, end))
+            start = end
+
+        base_rounds = total_rounds // len(bounds)
+        extra_rounds = total_rounds % len(bounds)
+
+        plan: List[Tuple[int, int, int]] = []
+        for idx, (chunk_start, chunk_end) in enumerate(bounds):
+            rounds = base_rounds + (1 if idx < extra_rounds else 0)
+            if rounds > 0 and chunk_end > chunk_start:
+                plan.append((chunk_start, chunk_end, rounds))
+        return plan
+
+    def _build_eval_matrices(
+        self,
+        *,
+        eval_set=None,
+        sample_weight_eval_set=None,
+    ) -> List[Tuple[xgb.DMatrix, str]]:
+        evals: List[Tuple[xgb.DMatrix, str]] = []
+        if not eval_set:
+            return evals
+        weights = self._normalize_eval_weights(sample_weight_eval_set)
+        for idx, (X_val, y_val) in enumerate(eval_set):
+            w_val = weights[idx] if idx < len(weights) else None
+            dval = self._build_dmatrix(X_val, y_val, w_val)
+            evals.append((dval, f"val{idx}"))
+        return evals
+
     def _train_booster(
         self,
         X,
@@ -156,24 +248,71 @@ class _XGBDMatrixWrapper:
         verbose: bool = False,
     ) -> None:
         params = self._resolve_train_params()
-        num_boost_round = int(params.pop("n_estimators", 100))
-        dtrain = self._build_dmatrix(X, y, sample_weight)
-        evals = []
-        if eval_set:
-            weights = sample_weight_eval_set or []
-            for idx, (X_val, y_val) in enumerate(eval_set):
-                w_val = weights[idx] if idx < len(weights) else None
-                dval = self._build_dmatrix(X_val, y_val, w_val)
-                evals.append((dval, f"val{idx}"))
-        self._booster = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=num_boost_round,
-            evals=evals,
-            early_stopping_rounds=early_stopping_rounds,
-            verbose_eval=verbose,
+        num_boost_round = max(1, int(params.pop("n_estimators", 100)))
+        evals = self._build_eval_matrices(
+            eval_set=eval_set,
+            sample_weight_eval_set=sample_weight_eval_set,
         )
-        self.best_iteration = getattr(self._booster, "best_iteration", None)
+        chunk_plan = self._build_chunk_plan(
+            total_rows=len(X),
+            chunk_size=self.chunk_size,
+            num_boost_round=num_boost_round,
+        )
+        if not chunk_plan:
+            raise ValueError("Training data is empty; cannot fit XGBoost model.")
+
+        is_chunk_mode = len(chunk_plan) > 1
+        if not is_chunk_mode:
+            chunk_start, chunk_end, _ = chunk_plan[0]
+            dtrain = self._build_dmatrix(
+                self._slice_rows(X, chunk_start, chunk_end),
+                self._slice_rows(y, chunk_start, chunk_end),
+                self._slice_rows(sample_weight, chunk_start, chunk_end),
+            )
+            self._booster = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=num_boost_round,
+                evals=evals,
+                early_stopping_rounds=early_stopping_rounds,
+                verbose_eval=verbose,
+            )
+            self.best_iteration = getattr(self._booster, "best_iteration", None)
+            return
+
+        if not self._chunk_mode_logged:
+            _log(
+                "[XGBoost] chunked training enabled: "
+                f"chunk_size={self.chunk_size}, chunks={len(chunk_plan)}, "
+                f"total_boost_rounds={num_boost_round}.",
+                flush=True,
+            )
+            self._chunk_mode_logged = True
+        if early_stopping_rounds is not None and not self._chunk_early_stopping_warned:
+            _log(
+                "[XGBoost] early_stopping_rounds is ignored when xgb_chunk_size is enabled.",
+                flush=True,
+            )
+            self._chunk_early_stopping_warned = True
+
+        booster: Optional[xgb.Booster] = None
+        for chunk_start, chunk_end, chunk_rounds in chunk_plan:
+            dtrain = self._build_dmatrix(
+                self._slice_rows(X, chunk_start, chunk_end),
+                self._slice_rows(y, chunk_start, chunk_end),
+                self._slice_rows(sample_weight, chunk_start, chunk_end),
+            )
+            booster = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=chunk_rounds,
+                evals=evals,
+                early_stopping_rounds=None,
+                verbose_eval=verbose,
+                xgb_model=booster,
+            )
+        self._booster = booster
+        self.best_iteration = None
 
     def fit(self, X, y, **fit_kwargs) -> "_XGBDMatrixWrapper":
         sample_weight = fit_kwargs.pop("sample_weight", None)
@@ -284,6 +423,7 @@ class XGBTrainer(TrainerBase):
         self.model: Optional[xgb.XGBModel] = None
         self._xgb_use_gpu = False
         self._xgb_gpu_warned = False
+        self._xgb_chunk_warned = False
 
     def _build_sklearn_estimator(self, params: Dict[str, Any]) -> xgb.XGBModel:
         if self.ctx.task_type == 'classification':
@@ -315,13 +455,36 @@ class XGBTrainer(TrainerBase):
         if eval_metric is not None:
             params.setdefault("eval_metric", eval_metric)
         use_dmatrix = bool(getattr(self.config, "xgb_use_dmatrix", True))
+        chunk_size = self._resolve_chunk_size()
+        if chunk_size is not None and not use_dmatrix:
+            if not self._xgb_chunk_warned:
+                _log(
+                    "[XGBoost] xgb_chunk_size is set while xgb_use_dmatrix=false; "
+                    "forcing xgb_use_dmatrix=true.",
+                    flush=True,
+                )
+                self._xgb_chunk_warned = True
+            use_dmatrix = True
         if use_dmatrix:
             return _XGBDMatrixWrapper(
                 params,
                 task_type=self.ctx.task_type,
                 use_gpu=use_gpu,
+                chunk_size=chunk_size,
             )
         return self._build_sklearn_estimator(params)
+
+    def _resolve_chunk_size(self) -> Optional[int]:
+        raw = getattr(self.config, "xgb_chunk_size", None)
+        if raw is None:
+            return None
+        try:
+            chunk_size = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if chunk_size < 1:
+            return None
+        return chunk_size
 
     def _resolve_gpu_id(self) -> int:
         gpu_id = getattr(self.config, "xgb_gpu_id", None)
