@@ -131,10 +131,10 @@ class BayesOptConfig:
         use_resn_ddp: Use DDP for ResNet
         use_ft_ddp: Use DDP for FT-Transformer
         use_gnn_data_parallel: Use DataParallel for GNN
-        use_gnn_ddp: Use DDP for GNN
         ft_role: FT-Transformer role ('model', 'embedding', 'unsupervised_embedding')
         cv_strategy: CV strategy ('random', 'group', 'time', 'stratified')
         build_oht: Whether to build one-hot encoded features (default True)
+        keep_unscaled_oht: Keep unscaled one-hot copy in memory (default True)
 
     Example:
         >>> config = BayesOptConfig(
@@ -192,7 +192,6 @@ class BayesOptConfig:
     use_resn_ddp: bool = False
     use_ft_ddp: bool = False
     use_gnn_data_parallel: bool = False
-    use_gnn_ddp: bool = False
 
     # GNN settings
     gnn_use_approx_knn: bool = True
@@ -251,6 +250,7 @@ class BayesOptConfig:
     plot_path_style: str = "nested"
     bo_sample_limit: Optional[int] = None
     build_oht: bool = True
+    keep_unscaled_oht: bool = True
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"
@@ -386,6 +386,8 @@ class BayesOptConfig:
                     errors.append("dataloader_workers must be >= 0 when provided.")
             except (TypeError, ValueError):
                 errors.append("dataloader_workers must be an integer when provided.")
+        if not isinstance(self.keep_unscaled_oht, bool):
+            errors.append("keep_unscaled_oht must be a boolean.")
         # Validate distribution
         try:
             normalized_distribution = normalize_distribution_name(
@@ -477,10 +479,6 @@ class BayesOptConfig:
         if self.use_ft_data_parallel and self.use_ft_ddp:
             errors.append(
                 "Cannot use both use_ft_data_parallel and use_ft_ddp"
-            )
-        if self.use_gnn_data_parallel and self.use_gnn_ddp:
-            errors.append(
-                "Cannot use both use_gnn_data_parallel and use_gnn_ddp"
             )
 
         # Validate ft_role
@@ -727,11 +725,42 @@ class DatasetPreprocessor:
             self.var_nmes = list(cfg.factor_nmes)
             return self
 
-        # Memory optimization: Single copy + in-place operations
-        train_oht = self.train_data[cfg.factor_nmes +
-                                    [cfg.weight_nme] + [cfg.resp_nme]].copy()
-        test_oht = self.test_data[cfg.factor_nmes +
-                                  [cfg.weight_nme] + [cfg.resp_nme]].copy()
+        keep_unscaled_oht = bool(getattr(cfg, "keep_unscaled_oht", True))
+        keep_unscaled_env = os.environ.get("BAYESOPT_KEEP_UNSCALED_OHT")
+        if keep_unscaled_env is not None:
+            keep_unscaled_oht = str(keep_unscaled_env).strip().lower() in {
+                "1", "true", "yes", "y", "on"
+            }
+        profile = str(
+            getattr(cfg, "resource_profile", os.environ.get("BAYESOPT_RESOURCE_PROFILE", "auto"))
+        ).strip().lower()
+        world_size = 1
+        try:
+            world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        except (TypeError, ValueError):
+            world_size = 1
+        if (
+            keep_unscaled_oht
+            and profile == "memory_saving"
+            and world_size > 1
+            and len(self.train_data) >= 500_000
+        ):
+            keep_unscaled_oht = False
+            _log(
+                "[Preprocess] Auto-set keep_unscaled_oht=False for DDP + memory_saving "
+                "on large dataset to reduce host RAM pressure.",
+                flush=True,
+            )
+
+        oht_cols = cfg.factor_nmes + [cfg.weight_nme] + [cfg.resp_nme]
+        train_oht = self.train_data[oht_cols].copy()
+        test_oht = self.test_data[oht_cols].copy()
+        # Downcast dense numeric inputs before one-hot to reduce peak RAM.
+        dense_float_cols = [col for col in (self.num_features + [cfg.weight_nme, cfg.resp_nme]) if col in oht_cols]
+        for col in dense_float_cols:
+            train_oht[col] = pd.to_numeric(train_oht[col], errors="coerce").astype(np.float32, copy=False)
+            test_oht[col] = pd.to_numeric(test_oht[col], errors="coerce").astype(np.float32, copy=False)
+
         train_oht = pd.get_dummies(
             train_oht,
             columns=cate_list,
@@ -746,17 +775,25 @@ class DatasetPreprocessor:
         )
 
         # Fill missing dummy columns when reindexing to align train/test columns.
-        test_oht = test_oht.reindex(columns=train_oht.columns, fill_value=0)
+        test_oht = test_oht.reindex(
+            columns=train_oht.columns, fill_value=0, copy=False)
 
         # Keep unscaled one-hot data for fold-specific scaling to avoid leakage.
-        # Store direct references - these won't be mutated
-        self.train_oht_data = train_oht
-        self.test_oht_data = test_oht
+        if keep_unscaled_oht:
+            self.train_oht_data = train_oht
+            self.test_oht_data = test_oht
+        else:
+            self.train_oht_data = None
+            self.test_oht_data = None
 
-        # Only copy if we need to scale numeric features (memory optimization)
+        # Only keep a second full OHT copy when explicitly requested.
         if self.num_features:
-            train_oht_scaled = train_oht.copy()
-            test_oht_scaled = test_oht.copy()
+            if keep_unscaled_oht:
+                train_oht_scaled = train_oht.copy()
+                test_oht_scaled = test_oht.copy()
+            else:
+                train_oht_scaled = train_oht
+                test_oht_scaled = test_oht
         else:
             # No scaling needed, reuse original
             train_oht_scaled = train_oht
@@ -765,9 +802,11 @@ class DatasetPreprocessor:
             # Scale per column so features are on comparable ranges for NN stability.
             scaler = StandardScaler()
             train_oht_scaled[num_chr] = scaler.fit_transform(
-                train_oht_scaled[num_chr].values.reshape(-1, 1))
+                train_oht_scaled[num_chr].values.reshape(-1, 1)
+            ).astype(np.float32, copy=False).reshape(-1)
             test_oht_scaled[num_chr] = scaler.transform(
-                test_oht_scaled[num_chr].values.reshape(-1, 1))
+                test_oht_scaled[num_chr].values.reshape(-1, 1)
+            ).astype(np.float32, copy=False).reshape(-1)
             scale_val = float(getattr(scaler, "scale_", [1.0])[0])
             if scale_val == 0.0:
                 scale_val = 1.0
@@ -775,9 +814,10 @@ class DatasetPreprocessor:
                 "mean": float(getattr(scaler, "mean_", [0.0])[0]),
                 "scale": scale_val,
             }
-        # Fill missing dummy columns when reindexing to align train/test columns.
-        test_oht_scaled = test_oht_scaled.reindex(
-            columns=train_oht_scaled.columns, fill_value=0)
+        # Columns are already aligned before scaling. Reindex only when needed.
+        if not test_oht_scaled.columns.equals(train_oht_scaled.columns):
+            test_oht_scaled = test_oht_scaled.reindex(
+                columns=train_oht_scaled.columns, fill_value=0, copy=False)
         self.train_oht_scl_data = train_oht_scaled
         self.test_oht_scl_data = test_oht_scaled
         excluded = {cfg.weight_nme, cfg.resp_nme}

@@ -73,11 +73,6 @@ def parse_bayesopt_args(
         help="Enable GNN DataParallel fall-back regardless of config.",
     )
     parser.add_argument(
-        "--use-gnn-ddp",
-        action="store_true",
-        help="Force GNN trainer to use DistributedDataParallel.",
-    )
-    parser.add_argument(
         "--gnn-no-ann",
         action="store_true",
         help="Disable approximate k-NN for GNN graph construction and use exact search.",

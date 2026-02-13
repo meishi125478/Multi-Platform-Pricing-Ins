@@ -609,7 +609,6 @@ class IncrementalUpdateRunner:
             "use_gnn_data_parallel": self.cfg.get("use_gnn_data_parallel", False),
             "use_resn_ddp": self.cfg.get("use_resn_ddp", False),
             "use_ft_ddp": self.cfg.get("use_ft_ddp", False),
-            "use_gnn_ddp": self.cfg.get("use_gnn_ddp", False),
             "output_dir": str(self.output_root) if self.output_root else None,
             "xgb_max_depth_max": self.xgb_max_depth_max,
             "xgb_n_estimators_max": self.xgb_n_estimators_max,

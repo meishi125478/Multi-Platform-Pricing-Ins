@@ -307,8 +307,6 @@ def run_bayesopt_entry_training(
             "use_ft_ddp", False)) and ddp_enabled
         use_gnn_dp = bool((args.use_gnn_dp or cfg.get(
             "use_gnn_data_parallel", False)) and cfg.get("use_gpu", True))
-        use_gnn_ddp = (args.use_gnn_ddp or cfg.get(
-            "use_gnn_ddp", False)) and ddp_enabled
         gnn_use_ann = cfg.get("gnn_use_approx_knn", True)
         if args.gnn_no_ann:
             gnn_use_ann = False
@@ -390,7 +388,6 @@ def run_bayesopt_entry_training(
             "use_gnn_data_parallel": use_gnn_dp,
             "use_resn_ddp": use_resn_ddp,
             "use_ft_ddp": use_ft_ddp,
-            "use_gnn_ddp": use_gnn_ddp,
             "output_dir": output_dir,
             "xgb_max_depth_max": xgb_max_depth_max,
             "xgb_n_estimators_max": xgb_n_estimators_max,

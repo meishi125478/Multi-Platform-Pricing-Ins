@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -64,3 +65,73 @@ def test_nested_config_views_are_immutable():
     cfg = _build_config(binary_resp=False)
     with pytest.raises(FrozenInstanceError):
         cfg.distributed.use_ft_ddp = True
+
+
+def test_preprocessor_scales_numeric_to_float32_and_keeps_columns_aligned():
+    train = pd.DataFrame(
+        {
+            "x_num": [1.0, 2.0, 3.0, 4.0],
+            "x_cat": ["a", "b", "a", "c"],
+            "y": [10.0, 20.0, 30.0, 40.0],
+            "w": [1.0, 1.0, 2.0, 2.0],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x_num": [5.0, 6.0],
+            "x_cat": ["b", "d"],
+            "y": [50.0, 60.0],
+            "w": [1.0, 1.0],
+        }
+    )
+
+    cfg = BayesOptConfig(
+        model_nme="demo",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x_num", "x_cat"],
+        cate_list=["x_cat"],
+        task_type="regression",
+    )
+    result = DatasetPreprocessor(train, test, cfg).run()
+
+    assert result.train_oht_scl_data is not None
+    assert result.test_oht_scl_data is not None
+    assert result.train_oht_scl_data.columns.equals(result.test_oht_scl_data.columns)
+    assert result.train_oht_scl_data["x_num"].dtype == np.float32
+    assert result.test_oht_scl_data["x_num"].dtype == np.float32
+
+
+def test_preprocessor_can_disable_unscaled_oht_cache():
+    train = pd.DataFrame(
+        {
+            "x_num": [1.0, 2.0, 3.0, 4.0],
+            "x_cat": ["a", "b", "a", "c"],
+            "y": [10.0, 20.0, 30.0, 40.0],
+            "w": [1.0, 1.0, 2.0, 2.0],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x_num": [5.0, 6.0],
+            "x_cat": ["b", "d"],
+            "y": [50.0, 60.0],
+            "w": [1.0, 1.0],
+        }
+    )
+
+    cfg = BayesOptConfig(
+        model_nme="demo",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x_num", "x_cat"],
+        cate_list=["x_cat"],
+        task_type="regression",
+        keep_unscaled_oht=False,
+    )
+    result = DatasetPreprocessor(train, test, cfg).run()
+
+    assert result.train_oht_data is None
+    assert result.test_oht_data is None
+    assert result.train_oht_scl_data is not None
+    assert result.test_oht_scl_data is not None

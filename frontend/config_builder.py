@@ -59,7 +59,6 @@ class ConfigBuilder:
             "use_gnn_data_parallel": False,
             "use_resn_ddp": True,
             "use_ft_ddp": True,
-            "use_gnn_ddp": False,
             "ddp_min_rows": 50000,
             "ft_role": "model",
             "ft_feature_prefix": "ft_emb",

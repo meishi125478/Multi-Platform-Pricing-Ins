@@ -58,7 +58,6 @@ class FTWorkflowHelper:
         # DDP settings
         config['use_ft_ddp'] = use_ddp
         config['use_resn_ddp'] = False
-        config['use_gnn_ddp'] = False
         config['use_ft_data_parallel'] = False
         config['use_resn_data_parallel'] = False
         config['use_gnn_data_parallel'] = False
@@ -215,7 +214,6 @@ class FTWorkflowHelper:
         # Disable DDP for XGB
         xgb_cfg["use_resn_ddp"] = False
         xgb_cfg["use_ft_ddp"] = False
-        xgb_cfg["use_gnn_ddp"] = False
         xgb_cfg["use_resn_data_parallel"] = False
         xgb_cfg["use_ft_data_parallel"] = False
         xgb_cfg["use_gnn_data_parallel"] = False
@@ -257,7 +255,6 @@ class FTWorkflowHelper:
         # Enable DDP for ResNet
         resn_cfg["use_resn_ddp"] = True
         resn_cfg["use_ft_ddp"] = False
-        resn_cfg["use_gnn_ddp"] = False
         resn_cfg["use_resn_data_parallel"] = False
         resn_cfg["use_ft_data_parallel"] = False
         resn_cfg["use_gnn_data_parallel"] = False

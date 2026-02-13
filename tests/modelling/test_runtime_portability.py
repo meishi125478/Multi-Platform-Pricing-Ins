@@ -134,10 +134,10 @@ def test_ddp_memory_saving_forces_workers_zero(monkeypatch):
     assert dataloader.num_workers == 0
 
 
-def test_gnn_trainer_disables_distributed_optuna_when_unsupported(monkeypatch):
+def test_gnn_trainer_disables_distributed_optuna(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "2")
     ctx = types.SimpleNamespace(
-        config=types.SimpleNamespace(use_gnn_ddp=True)
+        config=types.SimpleNamespace()
     )
     trainer = GNNTrainer(ctx)
     assert trainer.enable_distributed_optuna is False

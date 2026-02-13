@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,27 +24,8 @@ class GNNTrainer(TrainerBase):
     def __init__(self, context: "BayesOptModel") -> None:
         super().__init__(context, 'GNN', 'GNN')
         self.model: Optional[GraphNeuralNetSklearn] = None
-        try:
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        except (TypeError, ValueError):
-            world_size = 1
-        gpu_enabled = bool(getattr(context, "use_gpu", True))
-        dist_cfg = getattr(context.config, "distributed", context.config)
-        requested_ddp = bool(getattr(dist_cfg, "use_gnn_ddp", False))
-        supports_ddp = bool(getattr(GraphNeuralNetSklearn, "SUPPORTS_MULTI_PROCESS_DDP", False))
-        self._runtime_use_ddp = requested_ddp and supports_ddp and gpu_enabled
-        if requested_ddp and not gpu_enabled:
-            _log(
-                "[GNNTrainer] use_gnn_ddp=true but use_gpu=false; forcing CPU single-process mode.",
-                flush=True,
-            )
-        if requested_ddp and world_size > 1 and not supports_ddp:
-            _log(
-                "[GNNTrainer] use_gnn_ddp=true but GNN multi-process DDP is unsupported; "
-                "falling back to single-process training on rank0.",
-                flush=True,
-            )
-        self.enable_distributed_optuna = bool(self._runtime_use_ddp and world_size > 1)
+        self._runtime_use_ddp = False
+        self.enable_distributed_optuna = False
 
     def _dist_cfg(self):
         return getattr(self.ctx.config, "distributed", self.ctx.config)

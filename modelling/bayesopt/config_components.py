@@ -38,7 +38,6 @@ class DistributedConfig:
         use_gnn_data_parallel: Use DataParallel for GNN
         use_resn_ddp: Use DistributedDataParallel for ResNet
         use_ft_ddp: Use DistributedDataParallel for FT-Transformer
-        use_gnn_ddp: Use DistributedDataParallel for GNN
     """
 
     use_resn_data_parallel: bool = False
@@ -46,7 +45,6 @@ class DistributedConfig:
     use_gnn_data_parallel: bool = False
     use_resn_ddp: bool = False
     use_ft_ddp: bool = False
-    use_gnn_ddp: bool = False
 
     @classmethod
     def from_flat_dict(cls, d: Dict[str, Any]) -> "DistributedConfig":
@@ -57,7 +55,6 @@ class DistributedConfig:
             use_gnn_data_parallel=bool(_value_or_default(d, "use_gnn_data_parallel", False)),
             use_resn_ddp=bool(_value_or_default(d, "use_resn_ddp", False)),
             use_ft_ddp=bool(_value_or_default(d, "use_ft_ddp", False)),
-            use_gnn_ddp=bool(_value_or_default(d, "use_gnn_ddp", False)),
         )
 
 
