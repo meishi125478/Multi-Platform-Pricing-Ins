@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import pandas as pd
 
 
@@ -216,42 +217,77 @@ def load_dataset(
     *,
     data_format: str = "auto",
     dtype_map: Optional[Dict[str, Any]] = None,
+    usecols: Optional[List[str]] = None,
     low_memory: bool = False,
     chunksize: Optional[int] = None,
-) -> pd.DataFrame:
+) -> Union[pd.DataFrame, Iterator[pd.DataFrame]]:
     """Load a dataset from various formats.
 
     Args:
         path: Path to data file
         data_format: Format ('csv', 'parquet', 'feather', 'auto')
         dtype_map: Column type mapping
+        usecols: Optional projected columns to load
         low_memory: Whether to use low memory mode for CSV
         chunksize: Optional chunk size for CSV streaming
 
     Returns:
-        Loaded DataFrame
+        Loaded DataFrame, or a CSV chunk iterator when `chunksize` is set
     """
     fmt = str(data_format or "auto").strip().lower()
     if fmt == "auto":
         fmt = _infer_format_from_path(path)
+    selected_cols: Optional[List[str]] = None
+    if usecols is not None:
+        selected_cols = []
+        seen = set()
+        for col in usecols:
+            if not isinstance(col, str):
+                continue
+            key = col.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            selected_cols.append(key)
+        if not selected_cols:
+            selected_cols = None
+
+    dtype_selected: Optional[Dict[str, Any]] = None
+    if dtype_map:
+        dtype_selected = dict(dtype_map)
+        if selected_cols is not None:
+            allowed = set(selected_cols)
+            dtype_selected = {
+                k: v for k, v in dtype_selected.items() if k in allowed
+            }
+        if not dtype_selected:
+            dtype_selected = None
 
     if fmt == "parquet":
-        df = pd.read_parquet(path)
-    elif fmt == "feather":
-        df = pd.read_feather(path)
-    elif fmt == "csv":
-        if chunksize is not None:
-            chunks = []
-            for chunk in pd.read_csv(path, low_memory=low_memory, dtype=dtype_map or None, chunksize=chunksize):
-                chunks.append(chunk)
-            df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        if selected_cols is not None:
+            df = pd.read_parquet(path, columns=selected_cols)
         else:
-            df = pd.read_csv(path, low_memory=low_memory, dtype=dtype_map or None)
+            df = pd.read_parquet(path)
+    elif fmt == "feather":
+        if selected_cols is not None:
+            df = pd.read_feather(path, columns=selected_cols)
+        else:
+            df = pd.read_feather(path)
+    elif fmt == "csv":
+        read_kwargs: Dict[str, Any] = {"low_memory": low_memory}
+        if dtype_selected is not None:
+            read_kwargs["dtype"] = dtype_selected
+        if selected_cols is not None:
+            read_kwargs["usecols"] = selected_cols
+        if chunksize is not None:
+            return pd.read_csv(path, chunksize=int(chunksize), **read_kwargs)
+        else:
+            df = pd.read_csv(path, **read_kwargs)
     else:
         raise ValueError(f"Unsupported data_format: {data_format}")
 
-    if dtype_map:
-        for col, dtype in dtype_map.items():
+    if dtype_selected:
+        for col, dtype in dtype_selected.items():
             if col in df.columns:
                 df[col] = df[col].astype(dtype)
     return df
@@ -266,13 +302,19 @@ def coerce_dataset_types(raw: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with coerced types
     """
-    data = raw.copy()
+    data = raw
     for col in data.columns:
         s = data[col]
+        if pd.api.types.is_bool_dtype(s):
+            data[col] = s.astype(np.int8, copy=False)
+            continue
         if pd.api.types.is_numeric_dtype(s):
-            data[col] = pd.to_numeric(s, errors="coerce").fillna(0)
-        else:
-            data[col] = s.astype("object").fillna("<NA>")
+            s_num = pd.to_numeric(s, errors="coerce").fillna(0)
+            data[col] = s_num.astype(np.float32, copy=False)
+            continue
+        if pd.api.types.is_object_dtype(s) and s.hasnans:
+            # Keep string-like columns as-is, but normalize missing markers.
+            data[col] = s.where(s.notna(), "<NA>")
     return data
 
 

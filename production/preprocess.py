@@ -30,6 +30,7 @@ Note:
 
 from __future__ import annotations
 
+import inspect
 import json
 import pickle
 from pathlib import Path
@@ -37,6 +38,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import OneHotEncoder
 
 from ins_pricing.exceptions import DataValidationError, PreprocessingError
 from ins_pricing.utils.validation import validate_column_types
@@ -64,8 +66,69 @@ def _one_hot_encode(
     columns: Sequence[str],
     drop_first: bool,
     dtype: str = "int8",
+    cat_categories: Optional[Dict[str, Sequence[Any]]] = None,
 ) -> pd.DataFrame:
-    return pd.get_dummies(df, columns=list(columns), drop_first=drop_first, dtype=dtype)
+    cols = [c for c in columns if c in df.columns]
+    if not cols:
+        return df.copy()
+
+    numeric_cols = [c for c in df.columns if c not in cols]
+    out_num = df[numeric_cols].copy()
+    out_cat = df[cols].copy()
+    for col in cols:
+        out_cat[col] = out_cat[col].astype("object").where(
+            out_cat[col].notna(), "<NA>"
+        )
+
+    has_full_categories = bool(cat_categories) and all(
+        isinstance((cat_categories or {}).get(col), Sequence)
+        and len((cat_categories or {}).get(col) or []) > 0
+        for col in cols
+    )
+    if not has_full_categories:
+        cat_oht = pd.get_dummies(
+            out_cat,
+            columns=cols,
+            drop_first=drop_first,
+            dtype=dtype,
+        )
+        return pd.concat([out_num, cat_oht], axis=1)
+
+    categories = [list((cat_categories or {}).get(col) or []) for col in cols]
+    kwargs: Dict[str, Any] = {
+        "categories": categories,
+        "handle_unknown": "ignore",
+        "drop": "first" if drop_first else None,
+        "dtype": np.float32,
+    }
+    try:
+        params = inspect.signature(OneHotEncoder).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "sparse_output" in params:
+        kwargs["sparse_output"] = False
+    else:
+        kwargs["sparse"] = False
+
+    try:
+        encoder = OneHotEncoder(**kwargs)
+        fit_frame = pd.DataFrame(
+            {col: [cats[0]] for col, cats in zip(cols, categories)},
+            columns=cols,
+        )
+        encoder.fit(fit_frame)
+        cat_array = encoder.transform(out_cat[cols])
+        cat_names = [str(name) for name in encoder.get_feature_names_out(cols)]
+        cat_oht = pd.DataFrame(cat_array, index=df.index, columns=cat_names)
+        return pd.concat([out_num, cat_oht], axis=1)
+    except Exception:
+        cat_oht = pd.get_dummies(
+            out_cat,
+            columns=cols,
+            drop_first=drop_first,
+            dtype=dtype,
+        )
+        return pd.concat([out_num, cat_oht], axis=1)
 
 
 def _apply_numeric_scalers(
@@ -264,12 +327,22 @@ def apply_preprocess_artifacts(df: pd.DataFrame, artifacts: Dict[str, Any]) -> p
     """
     cate_list = list(artifacts.get("cate_list") or [])
     num_features = list(artifacts.get("num_features") or [])
+    ohe_feature_names = list(artifacts.get("ohe_feature_names") or [])
     var_nmes = list(artifacts.get("var_nmes") or [])
+    if not var_nmes and ohe_feature_names:
+        var_nmes = list(num_features) + list(ohe_feature_names)
     numeric_scalers = artifacts.get("numeric_scalers") or {}
+    cat_categories = artifacts.get("cat_categories") or {}
     drop_first = bool(artifacts.get("drop_first", True))
 
     work = prepare_raw_features(df, artifacts)
-    oht = _one_hot_encode(work, columns=cate_list, drop_first=drop_first, dtype="int8")
+    oht = _one_hot_encode(
+        work,
+        columns=cate_list,
+        drop_first=drop_first,
+        dtype="int8",
+        cat_categories=cat_categories,
+    )
     oht = _apply_numeric_scalers(oht, columns=num_features, numeric_scalers=numeric_scalers)
     oht = _align_columns(oht, columns=var_nmes, fill_value=0)
     return oht

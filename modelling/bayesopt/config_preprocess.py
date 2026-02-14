@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass, asdict, field
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from ins_pricing.modelling.bayesopt.config_components import (
     CVConfig,
@@ -44,6 +45,23 @@ def _clean_column_name(name: Any) -> Any:
     if not isinstance(name, str):
         return name
     return name.replace("\ufeff", "").strip()
+
+
+def _build_sparse_onehot_encoder(*, drop_first: bool) -> OneHotEncoder:
+    kwargs: Dict[str, Any] = {
+        "handle_unknown": "ignore",
+        "dtype": np.float32,
+        "drop": "first" if drop_first else None,
+    }
+    try:
+        params = inspect.signature(OneHotEncoder).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "sparse_output" in params:
+        kwargs["sparse_output"] = True
+    else:
+        kwargs["sparse"] = True
+    return OneHotEncoder(**kwargs)
 
 
 def _normalize_required_columns(
@@ -134,6 +152,7 @@ class BayesOptConfig:
         ft_role: FT-Transformer role ('model', 'embedding', 'unsupervised_embedding')
         cv_strategy: CV strategy ('random', 'group', 'time', 'stratified')
         build_oht: Whether to build one-hot encoded features (default True)
+        oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
         keep_unscaled_oht: Keep unscaled one-hot copy in memory (default True)
 
     Example:
@@ -247,9 +266,13 @@ class BayesOptConfig:
     # Caching and output settings
     save_preprocess: bool = False
     preprocess_artifact_path: Optional[str] = None
+    save_preprocess_bundle: bool = False
+    load_preprocess_bundle: bool = False
+    preprocess_bundle_path: Optional[str] = None
     plot_path_style: str = "nested"
     bo_sample_limit: Optional[int] = None
     build_oht: bool = True
+    oht_sparse_csr: bool = True
     keep_unscaled_oht: bool = True
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
@@ -388,6 +411,25 @@ class BayesOptConfig:
                 errors.append("dataloader_workers must be an integer when provided.")
         if not isinstance(self.keep_unscaled_oht, bool):
             errors.append("keep_unscaled_oht must be a boolean.")
+        if not isinstance(self.oht_sparse_csr, bool):
+            errors.append("oht_sparse_csr must be a boolean.")
+        if not isinstance(self.save_preprocess_bundle, bool):
+            errors.append("save_preprocess_bundle must be a boolean.")
+        if not isinstance(self.load_preprocess_bundle, bool):
+            errors.append("load_preprocess_bundle must be a boolean.")
+        if (
+            self.load_preprocess_bundle
+            and isinstance(self.preprocess_bundle_path, str)
+            and not self.preprocess_bundle_path.strip()
+        ):
+            errors.append(
+                "preprocess_bundle_path must be a non-empty string when "
+                "load_preprocess_bundle=True."
+            )
+        if self.save_preprocess_bundle and self.load_preprocess_bundle:
+            errors.append(
+                "Cannot set both save_preprocess_bundle and load_preprocess_bundle to True."
+            )
         # Validate distribution
         try:
             normalized_distribution = normalize_distribution_name(
@@ -564,12 +606,14 @@ class PreprocessArtifacts:
     num_features: List[str]
     var_nmes: List[str]
     cat_categories: Dict[str, List[Any]]
+    ohe_feature_names: List[str]
     dummy_columns: List[str]
     numeric_scalers: Dict[str, Dict[str, float]]
     weight_nme: str
     resp_nme: str
     binary_resp_nme: Optional[str] = None
     drop_first: bool = True
+    oht_sparse_csr: bool = True
 
 
 class OutputManager:
@@ -646,6 +690,10 @@ class DatasetPreprocessor:
         self.var_nmes: List[str] = []
         self.cat_categories_for_shap: Dict[str, List[Any]] = {}
         self.numeric_scalers: Dict[str, Dict[str, float]] = {}
+        self.ohe_feature_names: List[str] = []
+        self.train_cat_oht_csr = None
+        self.test_cat_oht_csr = None
+        self.oht_sparse_csr: bool = bool(getattr(config, "oht_sparse_csr", True))
 
     def run(self) -> "DatasetPreprocessor":
         """Run preprocessing: categorical encoding, target clipping, numeric scaling."""
@@ -753,13 +801,125 @@ class DatasetPreprocessor:
             )
 
         oht_cols = cfg.factor_nmes + [cfg.weight_nme] + [cfg.resp_nme]
+        use_sparse_csr = bool(getattr(cfg, "oht_sparse_csr", True) and cate_list)
+
+        if use_sparse_csr:
+            dense_cols = [
+                col for col in (self.num_features + [cfg.weight_nme, cfg.resp_nme])
+                if col in oht_cols
+            ]
+            train_dense = self.train_data[dense_cols].copy()
+            test_dense = self.test_data[dense_cols].copy()
+            for col in dense_cols:
+                train_dense[col] = pd.to_numeric(
+                    train_dense[col], errors="coerce"
+                ).astype(np.float32, copy=False)
+                test_dense[col] = pd.to_numeric(
+                    test_dense[col], errors="coerce"
+                ).astype(np.float32, copy=False)
+
+            train_cat = self.train_data[cate_list].copy()
+            test_cat = self.test_data[cate_list].copy()
+            for col in cate_list:
+                train_cat[col] = train_cat[col].astype("object").where(
+                    train_cat[col].notna(), "<NA>"
+                )
+                test_cat[col] = test_cat[col].astype("object").where(
+                    test_cat[col].notna(), "<NA>"
+                )
+
+            try:
+                encoder = _build_sparse_onehot_encoder(drop_first=True)
+                train_cat_sparse = encoder.fit_transform(train_cat)
+                test_cat_sparse = encoder.transform(test_cat)
+                cat_feature_names = [
+                    str(name) for name in encoder.get_feature_names_out(cate_list)
+                ]
+                self.train_cat_oht_csr = train_cat_sparse.tocsr()
+                self.test_cat_oht_csr = test_cat_sparse.tocsr()
+                self.ohe_feature_names = list(cat_feature_names)
+                self.oht_sparse_csr = True
+                _log(
+                    f"[Preprocess] one-hot CSR enabled: {len(cat_feature_names)} columns.",
+                    flush=True,
+                )
+            except Exception as exc:
+                _log(
+                    f"[Preprocess] CSR one-hot failed, fallback to dense get_dummies: {exc}",
+                    flush=True,
+                )
+                use_sparse_csr = False
+
+            if use_sparse_csr:
+                train_cat_df = pd.DataFrame.sparse.from_spmatrix(
+                    self.train_cat_oht_csr,
+                    index=train_dense.index,
+                    columns=self.ohe_feature_names,
+                )
+                test_cat_df = pd.DataFrame.sparse.from_spmatrix(
+                    self.test_cat_oht_csr,
+                    index=test_dense.index,
+                    columns=self.ohe_feature_names,
+                )
+
+                if keep_unscaled_oht:
+                    self.train_oht_data = pd.concat(
+                        [train_dense, train_cat_df], axis=1
+                    )
+                    self.test_oht_data = pd.concat(
+                        [test_dense, test_cat_df], axis=1
+                    )
+                    train_dense_scaled = train_dense.copy()
+                    test_dense_scaled = test_dense.copy()
+                else:
+                    self.train_oht_data = None
+                    self.test_oht_data = None
+                    train_dense_scaled = train_dense
+                    test_dense_scaled = test_dense
+
+                for num_chr in self.num_features:
+                    scaler = StandardScaler()
+                    train_dense_scaled[num_chr] = scaler.fit_transform(
+                        train_dense_scaled[num_chr].values.reshape(-1, 1)
+                    ).astype(np.float32, copy=False).reshape(-1)
+                    test_dense_scaled[num_chr] = scaler.transform(
+                        test_dense_scaled[num_chr].values.reshape(-1, 1)
+                    ).astype(np.float32, copy=False).reshape(-1)
+                    scale_val = float(getattr(scaler, "scale_", [1.0])[0])
+                    if scale_val == 0.0:
+                        scale_val = 1.0
+                    self.numeric_scalers[num_chr] = {
+                        "mean": float(getattr(scaler, "mean_", [0.0])[0]),
+                        "scale": scale_val,
+                    }
+
+                self.train_oht_scl_data = pd.concat(
+                    [train_dense_scaled, train_cat_df], axis=1
+                )
+                self.test_oht_scl_data = pd.concat(
+                    [test_dense_scaled, test_cat_df], axis=1
+                )
+                self.var_nmes = list(self.num_features) + list(self.ohe_feature_names)
+                return self
+
+        # Fallback path: dense one-hot via pandas get_dummies.
+        self.train_cat_oht_csr = None
+        self.test_cat_oht_csr = None
+        self.oht_sparse_csr = False
+
         train_oht = self.train_data[oht_cols].copy()
         test_oht = self.test_data[oht_cols].copy()
-        # Downcast dense numeric inputs before one-hot to reduce peak RAM.
-        dense_float_cols = [col for col in (self.num_features + [cfg.weight_nme, cfg.resp_nme]) if col in oht_cols]
+        dense_float_cols = [
+            col for col in (self.num_features + [cfg.weight_nme, cfg.resp_nme])
+            if col in oht_cols
+        ]
         for col in dense_float_cols:
-            train_oht[col] = pd.to_numeric(train_oht[col], errors="coerce").astype(np.float32, copy=False)
-            test_oht[col] = pd.to_numeric(test_oht[col], errors="coerce").astype(np.float32, copy=False)
+            train_oht[col] = pd.to_numeric(
+                train_oht[col], errors="coerce"
+            ).astype(np.float32, copy=False)
+            test_oht[col] = pd.to_numeric(
+                test_oht[col], errors="coerce"
+            ).astype(np.float32, copy=False)
 
         train_oht = pd.get_dummies(
             train_oht,
@@ -773,12 +933,9 @@ class DatasetPreprocessor:
             drop_first=True,
             dtype=np.int8
         )
-
-        # Fill missing dummy columns when reindexing to align train/test columns.
         test_oht = test_oht.reindex(
             columns=train_oht.columns, fill_value=0, copy=False)
 
-        # Keep unscaled one-hot data for fold-specific scaling to avoid leakage.
         if keep_unscaled_oht:
             self.train_oht_data = train_oht
             self.test_oht_data = test_oht
@@ -786,7 +943,6 @@ class DatasetPreprocessor:
             self.train_oht_data = None
             self.test_oht_data = None
 
-        # Only keep a second full OHT copy when explicitly requested.
         if self.num_features:
             if keep_unscaled_oht:
                 train_oht_scaled = train_oht.copy()
@@ -795,11 +951,9 @@ class DatasetPreprocessor:
                 train_oht_scaled = train_oht
                 test_oht_scaled = test_oht
         else:
-            # No scaling needed, reuse original
             train_oht_scaled = train_oht
             test_oht_scaled = test_oht
         for num_chr in self.num_features:
-            # Scale per column so features are on comparable ranges for NN stability.
             scaler = StandardScaler()
             train_oht_scaled[num_chr] = scaler.fit_transform(
                 train_oht_scaled[num_chr].values.reshape(-1, 1)
@@ -814,7 +968,6 @@ class DatasetPreprocessor:
                 "mean": float(getattr(scaler, "mean_", [0.0])[0]),
                 "scale": scale_val,
             }
-        # Columns are already aligned before scaling. Reindex only when needed.
         if not test_oht_scaled.columns.equals(train_oht_scaled.columns):
             test_oht_scaled = test_oht_scaled.reindex(
                 columns=train_oht_scaled.columns, fill_value=0, copy=False)
@@ -823,6 +976,9 @@ class DatasetPreprocessor:
         excluded = {cfg.weight_nme, cfg.resp_nme}
         self.var_nmes = [
             col for col in train_oht_scaled.columns if col not in excluded
+        ]
+        self.ohe_feature_names = [
+            col for col in self.var_nmes if col not in set(self.num_features)
         ]
         return self
 
@@ -836,12 +992,14 @@ class DatasetPreprocessor:
             num_features=list(self.num_features),
             var_nmes=list(self.var_nmes),
             cat_categories=dict(self.cat_categories_for_shap),
+            ohe_feature_names=list(self.ohe_feature_names),
             dummy_columns=dummy_columns,
             numeric_scalers=dict(self.numeric_scalers),
             weight_nme=str(self.config.weight_nme),
             resp_nme=str(self.config.resp_nme),
             binary_resp_nme=self.config.binary_resp_nme,
             drop_first=True,
+            oht_sparse_csr=bool(self.oht_sparse_csr),
         )
 
     def save_artifacts(self, path: str | Path) -> str:

@@ -1,10 +1,33 @@
-"""
-Insurance Pricing Frontend Package
-Web-based interface for configuring and running insurance pricing model tasks.
+"""Insurance Pricing Frontend package.
+
+Lazy exports keep optional runtime dependencies isolated from import-time
+code paths.
 """
 
-from ins_pricing.frontend.config_builder import ConfigBuilder
-from ins_pricing.frontend.runner import TaskRunner, TrainingRunner
-from ins_pricing.frontend.ft_workflow import FTWorkflowHelper
+from __future__ import annotations
 
-__all__ = ['ConfigBuilder', 'TaskRunner', 'TrainingRunner', 'FTWorkflowHelper']
+from importlib import import_module
+
+__all__ = ["ConfigBuilder", "TaskRunner", "TrainingRunner", "FTWorkflowHelper"]
+
+_LAZY_ATTRS = {
+    "ConfigBuilder": ("ins_pricing.frontend.config_builder", "ConfigBuilder"),
+    "TaskRunner": ("ins_pricing.frontend.runner", "TaskRunner"),
+    "TrainingRunner": ("ins_pricing.frontend.runner", "TrainingRunner"),
+    "FTWorkflowHelper": ("ins_pricing.frontend.ft_workflow", "FTWorkflowHelper"),
+}
+
+
+def __getattr__(name: str):
+    target = _LAZY_ATTRS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | set(globals().keys()))

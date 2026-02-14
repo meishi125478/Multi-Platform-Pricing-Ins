@@ -72,18 +72,27 @@ class TrainerBase(
         dummy_columns: List[str] = []
         if getattr(self.ctx, "train_oht_data", None) is not None:
             dummy_columns = list(self.ctx.train_oht_data.columns)
+        ohe_feature_names = list(getattr(self.ctx, "ohe_feature_names", []) or [])
+        if not ohe_feature_names:
+            num_set = set(getattr(self.ctx, "num_features", []) or [])
+            ohe_feature_names = [
+                col for col in (getattr(self.ctx, "var_nmes", []) or [])
+                if col not in num_set
+            ]
         return {
             "factor_nmes": list(getattr(self.ctx, "factor_nmes", []) or []),
             "cate_list": list(getattr(self.ctx, "cate_list", []) or []),
             "num_features": list(getattr(self.ctx, "num_features", []) or []),
             "var_nmes": list(getattr(self.ctx, "var_nmes", []) or []),
             "cat_categories": dict(getattr(self.ctx, "cat_categories_for_shap", {}) or {}),
+            "ohe_feature_names": ohe_feature_names,
             "dummy_columns": dummy_columns,
             "numeric_scalers": dict(getattr(self.ctx, "numeric_scalers", {}) or {}),
             "weight_nme": str(getattr(self.ctx, "weight_nme", "")),
             "resp_nme": str(getattr(self.ctx, "resp_nme", "")),
             "binary_resp_nme": getattr(self.ctx, "binary_resp_nme", None),
             "drop_first": True,
+            "oht_sparse_csr": bool(getattr(self.ctx, "oht_sparse_csr", False)),
         }
 
     @property

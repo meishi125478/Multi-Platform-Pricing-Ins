@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 import os
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
@@ -118,28 +119,56 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         self.output_manager = OutputManager(
             cfg.output_dir or os.getcwd(), self.model_nme)
 
-        preprocessor = DatasetPreprocessor(train_data, test_data, cfg).run()
-        self.train_data = preprocessor.train_data
-        self.test_data = preprocessor.test_data
-        self.train_oht_data = preprocessor.train_oht_data
-        self.test_oht_data = preprocessor.test_oht_data
-        self.train_oht_scl_data = preprocessor.train_oht_scl_data
-        self.test_oht_scl_data = preprocessor.test_oht_scl_data
-        self.var_nmes = preprocessor.var_nmes
-        self.num_features = preprocessor.num_features
-        self.cat_categories_for_shap = preprocessor.cat_categories_for_shap
-        self.numeric_scalers = preprocessor.numeric_scalers
-        if getattr(self.config, "save_preprocess", False):
-            artifact_path = getattr(self.config, "preprocess_artifact_path", None)
-            if artifact_path:
-                target = Path(str(artifact_path))
-                if not target.is_absolute():
-                    target = Path(self.output_manager.result_dir) / target
-            else:
-                target = Path(self.output_manager.result_path(
-                    f"{self.model_nme}_preprocess.json"
-                ))
-            preprocessor.save_artifacts(target)
+        bundle_path = self._resolve_preprocess_bundle_path()
+        load_preprocess_bundle = bool(
+            getattr(self.config, "load_preprocess_bundle", False)
+        )
+        save_preprocess_bundle = bool(
+            getattr(self.config, "save_preprocess_bundle", False)
+        )
+
+        if load_preprocess_bundle:
+            if bundle_path is None:
+                raise ValueError(
+                    "load_preprocess_bundle=True requires preprocess_bundle_path."
+                )
+            self._load_preprocess_bundle(bundle_path)
+        else:
+            if train_data is None or test_data is None:
+                raise ValueError(
+                    "train_data/test_data must be provided unless "
+                    "load_preprocess_bundle=True."
+                )
+            preprocessor = DatasetPreprocessor(train_data, test_data, cfg).run()
+            self.train_data = preprocessor.train_data
+            self.test_data = preprocessor.test_data
+            self.train_oht_data = preprocessor.train_oht_data
+            self.test_oht_data = preprocessor.test_oht_data
+            self.train_oht_scl_data = preprocessor.train_oht_scl_data
+            self.test_oht_scl_data = preprocessor.test_oht_scl_data
+            self.var_nmes = preprocessor.var_nmes
+            self.num_features = preprocessor.num_features
+            self.cat_categories_for_shap = preprocessor.cat_categories_for_shap
+            self.numeric_scalers = preprocessor.numeric_scalers
+            self.ohe_feature_names = list(
+                getattr(preprocessor, "ohe_feature_names", []) or []
+            )
+            self.oht_sparse_csr = bool(
+                getattr(preprocessor, "oht_sparse_csr", False)
+            )
+            if getattr(self.config, "save_preprocess", False):
+                artifact_path = getattr(self.config, "preprocess_artifact_path", None)
+                if artifact_path:
+                    target = Path(str(artifact_path))
+                    if not target.is_absolute():
+                        target = Path(self.output_manager.result_dir) / target
+                else:
+                    target = Path(self.output_manager.result_path(
+                        f"{self.model_nme}_preprocess.json"
+                    ))
+                preprocessor.save_artifacts(target)
+            if save_preprocess_bundle and bundle_path is not None:
+                self._save_preprocess_bundle(bundle_path)
         self.geo_token_cols: List[str] = []
         self.train_geo_tokens: Optional[pd.DataFrame] = None
         self.test_geo_tokens: Optional[pd.DataFrame] = None
@@ -168,6 +197,77 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         }
         self._prepare_geo_tokens()
         self.version_manager = VersionManager(self.output_manager)
+
+    def _resolve_preprocess_bundle_path(self) -> Optional[Path]:
+        raw_path = getattr(self.config, "preprocess_bundle_path", None)
+        if raw_path is None:
+            return None
+        path = Path(str(raw_path))
+        if not path.is_absolute():
+            path = Path(self.output_manager.result_dir) / path
+        return path
+
+    def _save_preprocess_bundle(self, target: Path) -> None:
+        payload = {
+            "schema_version": 1,
+            "model_nme": self.model_nme,
+            "train_data": self.train_data,
+            "test_data": self.test_data,
+            "train_oht_data": self.train_oht_data,
+            "test_oht_data": self.test_oht_data,
+            "train_oht_scl_data": self.train_oht_scl_data,
+            "test_oht_scl_data": self.test_oht_scl_data,
+            "var_nmes": list(self.var_nmes),
+            "num_features": list(self.num_features),
+            "cat_categories_for_shap": dict(self.cat_categories_for_shap),
+            "numeric_scalers": dict(self.numeric_scalers),
+            "ohe_feature_names": list(getattr(self, "ohe_feature_names", []) or []),
+            "oht_sparse_csr": bool(getattr(self, "oht_sparse_csr", False)),
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        _log(f"[PreprocessBundle] Saved: {target}", flush=True)
+
+    def _load_preprocess_bundle(self, source: Path) -> None:
+        if not source.exists():
+            raise FileNotFoundError(
+                f"preprocess bundle not found: {source}"
+            )
+        with source.open("rb") as fh:
+            payload = pickle.load(fh)
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"Invalid preprocess bundle payload type: {type(payload).__name__}"
+            )
+        required_keys = [
+            "train_data",
+            "test_data",
+            "train_oht_scl_data",
+            "test_oht_scl_data",
+            "var_nmes",
+            "num_features",
+            "cat_categories_for_shap",
+            "numeric_scalers",
+        ]
+        missing = [k for k in required_keys if k not in payload]
+        if missing:
+            raise KeyError(
+                f"Preprocess bundle missing keys: {missing}"
+            )
+        self.train_data = payload["train_data"]
+        self.test_data = payload["test_data"]
+        self.train_oht_data = payload.get("train_oht_data")
+        self.test_oht_data = payload.get("test_oht_data")
+        self.train_oht_scl_data = payload["train_oht_scl_data"]
+        self.test_oht_scl_data = payload["test_oht_scl_data"]
+        self.var_nmes = list(payload["var_nmes"])
+        self.num_features = list(payload["num_features"])
+        self.cat_categories_for_shap = dict(payload["cat_categories_for_shap"])
+        self.numeric_scalers = dict(payload["numeric_scalers"])
+        self.ohe_feature_names = list(payload.get("ohe_feature_names", []) or [])
+        self.oht_sparse_csr = bool(payload.get("oht_sparse_csr", False))
+        _log(f"[PreprocessBundle] Loaded: {source}", flush=True)
 
     def _build_cv_splitter(self) -> _ResolvedCVSplitter:
         val_ratio = float(self.prop_test) if self.prop_test is not None else 0.25

@@ -19,6 +19,8 @@ class TrainerContext(Protocol):
     cate_list: list[str]
     var_nmes: list[str]
     num_features: list[str]
+    ohe_feature_names: list[str]
+    oht_sparse_csr: bool
     use_gpu: bool
     prop_test: float
     epochs: int
@@ -45,4 +47,3 @@ class TrainerContext(Protocol):
 
     def default_tweedie_power(self, obj: Optional[str] = None) -> Optional[float]: ...
     def _build_geo_tokens(self, params_override: Optional[dict[str, Any]] = None): ...
-

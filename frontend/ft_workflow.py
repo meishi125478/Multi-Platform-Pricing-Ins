@@ -7,6 +7,7 @@ import json
 import copy
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+import numpy as np
 import pandas as pd
 
 
@@ -167,19 +168,32 @@ class FTWorkflowHelper:
             raise ValueError(
                 "Prediction rows do not match split sizes; check split settings.")
 
-        # Merge embeddings with raw data
-        aug = raw.copy()
-        aug.loc[train_df.index, pred_train.columns] = pred_train.values
-        aug.loc[test_df.index, pred_test.columns] = pred_test.values
+        # Merge embeddings with raw data without duplicating all raw columns first.
+        embed_cols = list(pred_train.columns)
+        emb_full = pd.DataFrame(
+            np.nan,
+            index=raw.index,
+            columns=embed_cols,
+            dtype=np.float32,
+        )
+        emb_full.loc[train_df.index, embed_cols] = pred_train.to_numpy(
+            dtype=np.float32, copy=False
+        )
+        emb_full.loc[test_df.index, embed_cols] = pred_test.to_numpy(
+            dtype=np.float32, copy=False
+        )
+        raw_base = raw.drop(columns=embed_cols, errors="ignore")
+        aug = pd.concat(
+            [raw_base.reset_index(drop=True), emb_full.reset_index(drop=True)],
+            axis=1,
+            copy=False,
+        )
 
         # Save augmented data
         data_out_dir = cfg_path.parent / augmented_data_dir
         data_out_dir.mkdir(parents=True, exist_ok=True)
         aug_path = data_out_dir / f"{model_name}.csv"
         aug.to_csv(aug_path, index=False)
-
-        # Get embedding column names
-        embed_cols = list(pred_train.columns)
 
         # Generate configs
         xgb_config = None
@@ -204,9 +218,11 @@ class FTWorkflowHelper:
     ) -> Dict[str, Any]:
         """Build XGB config for Step 2."""
         xgb_cfg = copy.deepcopy(base_cfg)
+        feature_list, categorical_features = self._resolve_step2_feature_space(base_cfg, embed_cols)
 
         xgb_cfg["data_dir"] = str(data_dir)
-        xgb_cfg["feature_list"] = base_cfg["feature_list"] + embed_cols
+        xgb_cfg["feature_list"] = feature_list
+        xgb_cfg["categorical_features"] = categorical_features
         xgb_cfg["ft_role"] = "model"
         xgb_cfg["stack_model_keys"] = ["xgb"]
         xgb_cfg["cache_predictions"] = False
@@ -245,9 +261,11 @@ class FTWorkflowHelper:
     ) -> Dict[str, Any]:
         """Build ResNet config for Step 2."""
         resn_cfg = copy.deepcopy(base_cfg)
+        feature_list, categorical_features = self._resolve_step2_feature_space(base_cfg, embed_cols)
 
         resn_cfg["data_dir"] = str(data_dir)
-        resn_cfg["feature_list"] = base_cfg["feature_list"] + embed_cols
+        resn_cfg["feature_list"] = feature_list
+        resn_cfg["categorical_features"] = categorical_features
         resn_cfg["ft_role"] = "model"
         resn_cfg["stack_model_keys"] = ["resn"]
         resn_cfg["cache_predictions"] = False
@@ -276,6 +294,55 @@ class FTWorkflowHelper:
         resn_cfg["plot"] = plot_cfg
 
         return resn_cfg
+
+    @staticmethod
+    def _dedup_preserve_order(values: List[str]) -> List[str]:
+        """Deduplicate values while preserving first-seen order."""
+        seen = set()
+        ordered = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
+
+    def _resolve_step2_feature_space(
+        self,
+        base_cfg: Dict[str, Any],
+        embed_cols: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Resolve Step-2 feature/categorical lists after FT embedding.
+
+        By default FT embeddings are assumed to be generated from all base features.
+        Override this via optional config key `ft_embedding_source_features` when
+        embeddings are generated from only a subset of raw features.
+        """
+        base_features = list(base_cfg.get("feature_list", []) or [])
+        embed_source_raw = base_cfg.get("ft_embedding_source_features")
+        if embed_source_raw is None:
+            embed_source_features = base_features
+        else:
+            embed_source_features = [str(col) for col in (embed_source_raw or [])]
+
+        embed_source_set = set(embed_source_features)
+        remaining_raw_features = [
+            col for col in base_features if col not in embed_source_set
+        ]
+
+        feature_list = self._dedup_preserve_order(
+            remaining_raw_features + list(embed_cols)
+        )
+
+        base_categorical = list(base_cfg.get("categorical_features", []) or [])
+        remaining_raw_set = set(remaining_raw_features)
+        categorical_features = [
+            col for col in base_categorical if col in remaining_raw_set
+        ]
+        categorical_features = self._dedup_preserve_order(categorical_features)
+
+        return feature_list, categorical_features
 
     def save_configs(self, output_dir: str = ".") -> Dict[str, str]:
         """

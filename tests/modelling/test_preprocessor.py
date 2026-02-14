@@ -135,3 +135,48 @@ def test_preprocessor_can_disable_unscaled_oht_cache():
     assert result.test_oht_data is None
     assert result.train_oht_scl_data is not None
     assert result.test_oht_scl_data is not None
+
+
+def test_preprocessor_categorical_ohe_uses_csr_and_keeps_feature_names():
+    train = pd.DataFrame(
+        {
+            "x_num": [1.0, 2.0, 3.0, 4.0],
+            "x_cat": ["a", "b", "a", "c"],
+            "y": [10.0, 20.0, 30.0, 40.0],
+            "w": [1.0, 1.0, 2.0, 2.0],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "x_num": [5.0, 6.0],
+            "x_cat": ["b", "z"],  # unseen category in test
+            "y": [50.0, 60.0],
+            "w": [1.0, 1.0],
+        }
+    )
+
+    cfg = BayesOptConfig(
+        model_nme="demo",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x_num", "x_cat"],
+        cate_list=["x_cat"],
+        task_type="regression",
+        oht_sparse_csr=True,
+    )
+    result = DatasetPreprocessor(train, test, cfg).run()
+
+    assert result.oht_sparse_csr is True
+    assert result.train_cat_oht_csr is not None
+    assert result.test_cat_oht_csr is not None
+    assert len(result.ohe_feature_names) == 2
+    assert all(name.startswith("x_cat_") for name in result.ohe_feature_names)
+
+    assert result.train_oht_scl_data is not None
+    dtypes = result.train_oht_scl_data[result.ohe_feature_names].dtypes
+    assert all(str(dtype).startswith("Sparse[") for dtype in dtypes)
+
+    # unseen category should map to all-zero one-hot row
+    unseen_row = result.test_oht_scl_data.iloc[1][result.ohe_feature_names]
+    unseen_sum = float(np.asarray(unseen_row.to_numpy(dtype=np.float32)).sum())
+    assert unseen_sum == 0.0

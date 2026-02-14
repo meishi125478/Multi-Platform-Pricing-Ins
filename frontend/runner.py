@@ -10,6 +10,7 @@ import queue
 import time
 import json
 import subprocess
+import signal
 from pathlib import Path
 from typing import Generator, Optional, Dict, Any, List, Sequence, Tuple
 import logging
@@ -131,6 +132,12 @@ class TaskRunner:
                     _log("=" * 80)
 
                     # Run subprocess with streamed output
+                    creationflags = 0
+                    start_new_session = False
+                    if os.name == "nt":
+                        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    else:
+                        start_new_session = True
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -138,6 +145,8 @@ class TaskRunner:
                         text=True,
                         bufsize=1,
                         cwd=str(Path(config_path).resolve().parent),
+                        creationflags=creationflags,
+                        start_new_session=start_new_session,
                     )
                     self._proc = proc
                     if proc.stdout is not None:
@@ -267,14 +276,29 @@ class TaskRunner:
                         check=False,
                     )
                 else:
-                    proc.terminate()
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except Exception:
-                    proc.kill()
+                    if os.name == "nt":
+                        proc.kill()
+                    else:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
             except Exception:
                 try:
-                    proc.kill()
+                    if os.name != "nt":
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                    else:
+                        proc.kill()
                 except Exception:
                     pass
 

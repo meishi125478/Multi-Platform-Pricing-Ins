@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
+import json
+import os
 from pathlib import Path
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+
+try:  # pragma: no cover
+    import torch.distributed as dist  # type: ignore
+except Exception:  # pragma: no cover
+    dist = None  # type: ignore
+
+from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 
 
 @dataclass(frozen=True)
@@ -38,24 +48,77 @@ class BayesOptRunnerHooks:
     plot_curves_for_model: Callable[[Any, List[str], Dict[str, Any]], None]
 
 
-def _create_ddp_barrier(dist_ctx: Any, ropt: Any):
+def _create_ddp_barrier(dist_ctx: Any):
     """Create a DDP barrier function for distributed training synchronization."""
 
     def _ddp_barrier(reason: str) -> None:
         if not getattr(dist_ctx, "is_distributed", False):
             return
-        torch_mod = getattr(ropt, "torch", None)
-        dist_mod = getattr(torch_mod, "distributed", None)
-        if dist_mod is None:
+        if dist is None:
             return
         try:
-            if not getattr(dist_mod, "is_available", lambda: False)():
+            if not getattr(dist, "is_available", lambda: False)():
                 return
-            if not dist_mod.is_initialized():
-                ddp_ok, _, _, _ = ropt.DistributedUtils.setup_ddp()
-                if not ddp_ok or not dist_mod.is_initialized():
+            if not dist.is_initialized():
+                ddp_ok, _, _, _ = DistributedUtils.setup_ddp()
+                if not ddp_ok or not dist.is_initialized():
                     return
-            dist_mod.barrier()
+        except Exception as exc:
+            print(f"[DDP] barrier pre-check failed during {reason}: {exc}", flush=True)
+            raise
+
+        timeout_seconds = int(os.environ.get("BAYESOPT_DDP_BARRIER_TIMEOUT", "1800"))
+        debug_barrier = os.environ.get("BAYESOPT_DDP_BARRIER_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        rank = None
+        world = None
+        if debug_barrier:
+            try:
+                rank = dist.get_rank()
+                world = dist.get_world_size()
+                print(
+                    f"[DDP] entering barrier({reason}) rank={rank}/{world}",
+                    flush=True,
+                )
+            except Exception:
+                debug_barrier = False
+        try:
+            timeout = timedelta(seconds=max(1, timeout_seconds))
+            backend = None
+            try:
+                backend = dist.get_backend()
+            except Exception:
+                backend = None
+
+            monitored = getattr(dist, "monitored_barrier", None)
+            if backend == "gloo" and callable(monitored):
+                monitored(timeout=timeout)
+            else:
+                work = None
+                try:
+                    work = dist.barrier(async_op=True)
+                except TypeError:
+                    work = None
+                if work is not None:
+                    wait = getattr(work, "wait", None)
+                    if callable(wait):
+                        try:
+                            wait(timeout=timeout)
+                        except TypeError:
+                            wait()
+                    else:
+                        dist.barrier()
+                else:
+                    dist.barrier()
+            if debug_barrier:
+                print(
+                    f"[DDP] exit barrier({reason}) rank={rank}/{world}",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[DDP] barrier failed during {reason}: {exc}", flush=True)
             raise
@@ -69,6 +132,7 @@ def _stream_random_split_csv(
     holdout_ratio: float,
     rand_seed: Optional[int],
     dtype_map: Dict[str, Any],
+    usecols: Optional[List[str]],
     low_memory: bool,
     chunksize: int,
     coerce_dataset_types: Callable[[Any], Any],
@@ -78,12 +142,19 @@ def _stream_random_split_csv(
     if not (0.0 < holdout_ratio < 1.0):
         raise ValueError(
             f"holdout_ratio must be in (0, 1) for streaming random split; got {holdout_ratio}."
-        )
+    )
     chunk_size = max(1, int(chunksize))
     rng = np.random.default_rng(rand_seed if rand_seed is not None else 13)
     read_kwargs: Dict[str, Any] = {"low_memory": bool(low_memory), "chunksize": chunk_size}
+    if usecols:
+        read_kwargs["usecols"] = list(usecols)
     if dtype_map:
-        read_kwargs["dtype"] = dtype_map
+        dtype_selected = dict(dtype_map)
+        if usecols:
+            allowed = set(usecols)
+            dtype_selected = {k: v for k, v in dtype_selected.items() if k in allowed}
+        if dtype_selected:
+            read_kwargs["dtype"] = dtype_selected
 
     train_parts: List[pd.DataFrame] = []
     test_parts: List[pd.DataFrame] = []
@@ -100,10 +171,10 @@ def _stream_random_split_csv(
         total_rows += n_chunk
         mask_test = rng.random(n_chunk) < holdout_ratio
         if mask_test.any():
-            test_parts.append(chunk.loc[mask_test].copy())
+            test_parts.append(chunk.loc[mask_test])
         mask_train = ~mask_test
         if mask_train.any():
-            train_parts.append(chunk.loc[mask_train].copy())
+            train_parts.append(chunk.loc[mask_train])
 
     if total_rows == 0:
         raise ValueError(f"Dataset is empty: {data_path}")
@@ -118,6 +189,176 @@ def _stream_random_split_csv(
             "Adjust holdout_ratio or disable stream_split_csv."
         )
     return train_df, test_df, total_rows
+
+
+def _dedupe_columns(columns: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for col in columns:
+        if not isinstance(col, str):
+            continue
+        key = col.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _resolve_required_columns(
+    cfg: Dict[str, Any],
+    *,
+    split_group_col: Optional[str],
+    split_time_col: Optional[str],
+    cv_group_col: Optional[str],
+    cv_time_col: Optional[str],
+    report_group_cols: Optional[List[str]],
+    report_time_col: Optional[str],
+) -> List[str]:
+    cols: List[str] = []
+    feature_list = cfg.get("feature_list") or []
+    if isinstance(feature_list, (list, tuple)):
+        cols.extend([c for c in feature_list if isinstance(c, str)])
+    target = cfg.get("target")
+    weight = cfg.get("weight")
+    binary_target = cfg.get("binary_target") or cfg.get("binary_resp_nme")
+    for col in [
+        target,
+        weight,
+        binary_target,
+        split_group_col,
+        split_time_col,
+        cv_group_col,
+        cv_time_col,
+        report_time_col,
+    ]:
+        if isinstance(col, str):
+            cols.append(col)
+    if report_group_cols:
+        cols.extend([c for c in report_group_cols if isinstance(c, str)])
+    return _dedupe_columns(cols)
+
+
+def _load_and_split_dataset(
+    *,
+    deps: BayesOptRunnerDeps,
+    data_path: Path,
+    data_format: str,
+    dtype_map: Dict[str, Any],
+    required_columns: Optional[List[str]],
+    use_stream_split: bool,
+    holdout_ratio: float,
+    rand_seed: Optional[int],
+    stream_split_chunksize: int,
+    split_strategy: str,
+    split_group_col: Optional[str],
+    split_time_col: Optional[str],
+    split_time_ascending: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    if use_stream_split:
+        train_df, test_df, dataset_rows = _stream_random_split_csv(
+            data_path,
+            holdout_ratio=holdout_ratio,
+            rand_seed=rand_seed,
+            dtype_map=dtype_map,
+            usecols=required_columns,
+            low_memory=False,
+            chunksize=int(stream_split_chunksize),
+            coerce_dataset_types=deps.coerce_dataset_types,
+        )
+        return train_df, test_df, dataset_rows
+
+    raw = deps.load_dataset(
+        data_path,
+        data_format=data_format,
+        dtype_map=dtype_map,
+        usecols=required_columns,
+        low_memory=False,
+    )
+    train_df, test_df = deps.split_train_test(
+        raw,
+        holdout_ratio=holdout_ratio,
+        strategy=split_strategy,
+        group_col=split_group_col,
+        time_col=split_time_col,
+        time_ascending=split_time_ascending,
+        rand_seed=rand_seed,
+        reset_index_mode="time_group",
+        ratio_label="holdout_ratio",
+    )
+    train_df = deps.coerce_dataset_types(train_df)
+    test_df = deps.coerce_dataset_types(test_df)
+    dataset_rows = int(len(raw))
+    del raw
+    return train_df, test_df, dataset_rows
+
+
+def _resolve_ddp_preprocess_paths(
+    *,
+    output_dir: Optional[str],
+    config_path: Path,
+    model_name: str,
+    config_sha: str,
+) -> Tuple[Path, Path]:
+    base_root = Path(output_dir) if output_dir else (config_path.parent / "Results")
+    cache_root = base_root / "_ddp_preprocess_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    model_tag = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(model_name))
+    token_raw = f"{config_sha}|{model_name}"
+    token = hashlib.sha256(token_raw.encode("utf-8")).hexdigest()[:16]
+    meta_path = cache_root / f"{model_tag}_{token}.meta.json"
+    bundle_path = cache_root / f"{model_tag}_{token}.bundle.pkl"
+    return meta_path, bundle_path
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _read_json_with_retry(
+    path: Path,
+    *,
+    retries: Optional[int] = None,
+    delay_seconds: float = 0.1,
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    delay = max(0.01, float(delay_seconds))
+    if timeout_seconds is None:
+        raw_timeout = os.environ.get("BAYESOPT_DDP_META_READ_TIMEOUT_SECONDS", "300")
+        try:
+            timeout_seconds = float(raw_timeout)
+        except Exception:
+            timeout_seconds = 300.0
+    timeout_seconds = max(delay, float(timeout_seconds))
+    if retries is None:
+        retries = max(1, int(timeout_seconds / delay))
+    else:
+        retries = max(1, int(retries))
+
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                last_error = exc
+        if attempt + 1 < retries:
+            time.sleep(delay)
+    waited_seconds = retries * delay
+    if last_error is not None:
+        raise RuntimeError(
+            f"Failed to read JSON metadata after waiting {waited_seconds:.1f}s: "
+            f"{path} ({last_error})"
+        ) from last_error
+    raise FileNotFoundError(
+        f"Metadata file not found after waiting {waited_seconds:.1f}s: {path}"
+    )
 
 
 def run_bayesopt_entry_training(
@@ -142,7 +383,7 @@ def run_bayesopt_entry_training(
     dist_rank = dist_ctx.rank
     dist_active = dist_ctx.is_distributed
     is_main_process = dist_ctx.is_main_process
-    _ddp_barrier = _create_ddp_barrier(dist_ctx, deps.ropt)
+    _ddp_barrier = _create_ddp_barrier(dist_ctx)
 
     data_dir, data_format, data_path_template, dtype_map = deps.resolve_data_config(
         cfg,
@@ -251,56 +492,169 @@ def run_bayesopt_entry_training(
         is_csv_source = fmt_lower == "csv" or (
             fmt_lower == "auto" and data_path.suffix.lower() == ".csv"
         )
+        resource_profile = str(
+            cfg.get(
+                "resource_profile",
+                (cfg.get("env", {}) or {}).get("BAYESOPT_RESOURCE_PROFILE", "auto"),
+            )
+        ).strip().lower()
+        auto_stream_split = bool(
+            is_csv_source
+            and str(split_strategy).strip().lower() in {"random"}
+            and resource_profile == "memory_saving"
+        )
         use_stream_split = bool(
-            stream_split_csv
+            (stream_split_csv or auto_stream_split)
             and is_csv_source
             and str(split_strategy).strip().lower() in {"random"}
         )
-        if use_stream_split:
+        if auto_stream_split and not stream_split_csv:
             print(
-                f"[Data] streaming random split enabled "
-                f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
+                "[Data] Auto-enabling stream_split_csv for memory_saving profile.",
                 flush=True,
             )
-            train_df, test_df, dataset_rows = _stream_random_split_csv(
-                data_path,
-                holdout_ratio=holdout_ratio,
-                rand_seed=rand_seed,
-                dtype_map=dtype_map,
-                low_memory=False,
-                chunksize=int(stream_split_chunksize),
-                coerce_dataset_types=deps.coerce_dataset_types,
+        required_columns = _resolve_required_columns(
+            cfg,
+            split_group_col=split_group_col,
+            split_time_col=split_time_col,
+            cv_group_col=cv_group_col,
+            cv_time_col=cv_time_col,
+            report_group_cols=report_group_cols,
+            report_time_col=report_time_col,
+        )
+        if required_columns:
+            print(
+                f"[Data] projected column loading enabled: {len(required_columns)} columns",
+                flush=True,
             )
+
+        ddp_requested_by_config = bool(
+            args.use_resn_ddp
+            or cfg.get("use_resn_ddp", False)
+            or args.use_ft_ddp
+            or cfg.get("use_ft_ddp", False)
+        )
+        skip_data_load_for_non_main = bool(
+            dist_active
+            and dist_rank != 0
+            and (
+                (not ddp_requested_by_config)
+                or (not bool(cfg.get("use_gpu", True)))
+            )
+        )
+        use_shared_preprocess = bool(
+            dist_active
+            and cfg.get("use_gpu", True)
+            and ddp_requested_by_config
+        )
+        shared_meta_path: Optional[Path] = None
+        shared_bundle_path: Optional[Path] = None
+        train_df: Optional[pd.DataFrame] = None
+        test_df: Optional[pd.DataFrame] = None
+        dataset_rows = 0
+        ddp_enabled: Optional[bool] = None
+
+        if skip_data_load_for_non_main:
+            ddp_enabled = False
+            print(
+                f"[Data][Rank {dist_rank}] Skip dataset load because no DDP trainer is requested.",
+                flush=True,
+            )
+
+        if use_shared_preprocess:
+            shared_meta_path, shared_bundle_path = _resolve_ddp_preprocess_paths(
+                output_dir=output_dir,
+                config_path=config_path,
+                model_name=model_name,
+                config_sha=config_sha,
+            )
+            if dist_rank == 0:
+                if use_stream_split:
+                    print(
+                        f"[Data] streaming random split enabled "
+                        f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
+                        flush=True,
+                    )
+                train_df, test_df, dataset_rows = _load_and_split_dataset(
+                    deps=deps,
+                    data_path=data_path,
+                    data_format=data_format,
+                    dtype_map=dtype_map,
+                    required_columns=required_columns,
+                    use_stream_split=use_stream_split,
+                    holdout_ratio=holdout_ratio,
+                    rand_seed=rand_seed,
+                    stream_split_chunksize=int(stream_split_chunksize),
+                    split_strategy=split_strategy,
+                    split_group_col=split_group_col,
+                    split_time_col=split_time_col,
+                    split_time_ascending=split_time_ascending,
+                )
+                ddp_enabled = bool(
+                    dist_active
+                    and cfg.get("use_gpu", True)
+                    and (dataset_rows >= int(ddp_min_rows))
+                )
+                _write_json_atomic(
+                    shared_meta_path,
+                    {
+                        "dataset_rows": int(dataset_rows),
+                        "ddp_enabled": bool(ddp_enabled),
+                        "bundle_path": str(shared_bundle_path),
+                    },
+                )
+            _ddp_barrier(f"shared_preprocess_meta_ready_{model_name}")
+            if dist_rank != 0:
+                meta = _read_json_with_retry(shared_meta_path)
+                dataset_rows = int(meta.get("dataset_rows", 0))
+                ddp_enabled = bool(meta.get("ddp_enabled", False))
+                if ddp_enabled:
+                    print(
+                        f"[Data][Rank {dist_rank}] Skip raw split/load; "
+                        f"will load preprocess bundle: {shared_bundle_path}",
+                        flush=True,
+                    )
+                else:
+                    skip_data_load_for_non_main = True
+                    print(
+                        f"[Data][Rank {dist_rank}] Skip dataset load because DDP is disabled "
+                        f"(dataset_rows={dataset_rows}, ddp_min_rows={int(ddp_min_rows)}).",
+                        flush=True,
+                    )
         else:
-            raw = deps.load_dataset(
-                data_path,
-                data_format=data_format,
-                dtype_map=dtype_map,
-                low_memory=False,
-            )
-            raw = deps.coerce_dataset_types(raw)
-            train_df, test_df = deps.split_train_test(
-                raw,
-                holdout_ratio=holdout_ratio,
-                strategy=split_strategy,
-                group_col=split_group_col,
-                time_col=split_time_col,
-                time_ascending=split_time_ascending,
-                rand_seed=rand_seed,
-                reset_index_mode="time_group",
-                ratio_label="holdout_ratio",
-            )
-            dataset_rows = len(raw)
+            if not skip_data_load_for_non_main:
+                if use_stream_split:
+                    print(
+                        f"[Data] streaming random split enabled "
+                        f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
+                        flush=True,
+                    )
+                train_df, test_df, dataset_rows = _load_and_split_dataset(
+                    deps=deps,
+                    data_path=data_path,
+                    data_format=data_format,
+                    dtype_map=dtype_map,
+                    required_columns=required_columns,
+                    use_stream_split=use_stream_split,
+                    holdout_ratio=holdout_ratio,
+                    rand_seed=rand_seed,
+                    stream_split_chunksize=int(stream_split_chunksize),
+                    split_strategy=split_strategy,
+                    split_group_col=split_group_col,
+                    split_time_col=split_time_col,
+                    split_time_ascending=split_time_ascending,
+                )
 
         use_resn_dp = bool((args.use_resn_dp or cfg.get(
             "use_resn_data_parallel", False)) and cfg.get("use_gpu", True))
         use_ft_dp = bool((args.use_ft_dp or cfg.get(
             "use_ft_data_parallel", False)) and cfg.get("use_gpu", True))
-        ddp_enabled = bool(
-            dist_active
-            and cfg.get("use_gpu", True)
-            and (dataset_rows >= int(ddp_min_rows))
-        )
+        if ddp_enabled is None:
+            ddp_enabled = bool(
+                dist_active
+                and cfg.get("use_gpu", True)
+                and (dataset_rows >= int(ddp_min_rows))
+            )
         use_resn_ddp = (args.use_resn_ddp or cfg.get(
             "use_resn_ddp", False)) and ddp_enabled
         use_ft_ddp = (args.use_ft_ddp or cfg.get(
@@ -371,6 +725,18 @@ def run_bayesopt_entry_training(
             for k, v in split_cfg.items()
             if k in allowed_config_keys and v is not None
         })
+        save_preprocess_bundle = bool(
+            use_shared_preprocess
+            and ddp_enabled
+            and dist_rank == 0
+            and shared_bundle_path is not None
+        )
+        load_preprocess_bundle = bool(
+            use_shared_preprocess
+            and ddp_enabled
+            and dist_rank != 0
+            and shared_bundle_path is not None
+        )
         override_payload = {
             "model_nme": model_name,
             "resp_nme": cfg["target"],
@@ -443,6 +809,13 @@ def run_bayesopt_entry_training(
             "ft_oof_shuffle": ft_oof_shuffle,
             "save_preprocess": save_preprocess,
             "preprocess_artifact_path": preprocess_artifact_path,
+            "save_preprocess_bundle": save_preprocess_bundle,
+            "load_preprocess_bundle": load_preprocess_bundle,
+            "preprocess_bundle_path": (
+                str(shared_bundle_path)
+                if use_shared_preprocess and ddp_enabled and shared_bundle_path is not None
+                else None
+            ),
             "plot_path_style": plot_path_style or "nested",
         }
         config_payload.update({
@@ -451,14 +824,6 @@ def run_bayesopt_entry_training(
             if k in allowed_config_keys and v is not None
         })
         config = deps.ropt.BayesOptConfig.from_flat_dict(config_payload)
-        model = deps.ropt.BayesOptModel(train_df, test_df, config=config)
-
-        if plot_requested:
-            plot_cfg = cfg.get("plot", {})
-            plot_enabled = bool(plot_cfg.get("enable", False))
-            if plot_enabled and plot_cfg.get("pre_oneway", False) and plot_cfg.get("oneway", True):
-                n_bins = int(plot_cfg.get("n_bins", 10))
-                model.plot_oneway(n_bins=n_bins, plot_subdir="oneway/pre")
 
         if "all" in args.model_keys:
             requested_keys = ["glm", "xgb", "resn", "ft", "gnn"]
@@ -477,16 +842,52 @@ def run_bayesopt_entry_training(
                     else:
                         requested_keys = [k for k in stack_keys if k != "ft"]
                     requested_keys = deps.dedupe_preserve_order(requested_keys)
-            if dist_active and ddp_enabled:
-                ft_trainer = model.trainers.get("ft")
-                if ft_trainer is None:
-                    raise ValueError("FT trainer is not available.")
-                ft_trainer_uses_ddp = bool(
-                    getattr(ft_trainer, "enable_distributed_optuna", False))
-                if not ft_trainer_uses_ddp:
-                    raise ValueError(
-                        "FT embedding under torchrun requires enabling FT DDP (use --use-ft-ddp or set use_ft_ddp=true)."
-                    )
+        known_model_keys = {"glm", "xgb", "resn", "ft", "gnn"}
+        invalid_requested = [k for k in requested_keys if k not in known_model_keys]
+        if invalid_requested:
+            raise ValueError(
+                f"Unknown requested model key(s): {invalid_requested}. "
+                f"Valid keys: {sorted(known_model_keys)}"
+            )
+
+        # In torchrun non-DDP mode, non-main ranks only coordinate barriers and
+        # skip all heavy dataset/model construction.
+        if dist_active and not ddp_enabled and dist_rank != 0:
+            if ft_role != "model":
+                _ddp_barrier("start_ft_embedding")
+                _ddp_barrier("finish_ft_embedding")
+            for key in requested_keys:
+                _ddp_barrier(f"start_non_ddp_{model_name}_{key}")
+                _ddp_barrier(f"finish_non_ddp_{model_name}_{key}")
+            continue
+
+        if use_shared_preprocess and ddp_enabled and shared_bundle_path is not None and dist_active:
+            if dist_rank == 0:
+                model = deps.ropt.BayesOptModel(train_df, test_df, config=config)
+                _ddp_barrier(f"shared_preprocess_bundle_ready_{model_name}")
+            else:
+                _ddp_barrier(f"shared_preprocess_bundle_ready_{model_name}")
+                model = deps.ropt.BayesOptModel(None, None, config=config)
+        else:
+            model = deps.ropt.BayesOptModel(train_df, test_df, config=config)
+
+        if plot_requested:
+            plot_cfg = cfg.get("plot", {})
+            plot_enabled = bool(plot_cfg.get("enable", False))
+            if plot_enabled and plot_cfg.get("pre_oneway", False) and plot_cfg.get("oneway", True):
+                n_bins = int(plot_cfg.get("n_bins", 10))
+                model.plot_oneway(n_bins=n_bins, plot_subdir="oneway/pre")
+
+        if ft_role != "model" and dist_active and ddp_enabled:
+            ft_trainer = model.trainers.get("ft")
+            if ft_trainer is None:
+                raise ValueError("FT trainer is not available.")
+            ft_trainer_uses_ddp = bool(
+                getattr(ft_trainer, "enable_distributed_optuna", False))
+            if not ft_trainer_uses_ddp:
+                raise ValueError(
+                    "FT embedding under torchrun requires enabling FT DDP (use --use-ft-ddp or set use_ft_ddp=true)."
+                )
         missing = [key for key in requested_keys if key not in model.trainers]
         if missing:
             raise ValueError(

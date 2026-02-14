@@ -491,6 +491,7 @@ class IncrementalUpdateRunner:
                 path,
                 data_format="auto",
                 dtype_map=self.dtype_map,
+                usecols=self._required_columns(),
                 low_memory=False,
             )
         except pd.errors.EmptyDataError:
@@ -528,6 +529,35 @@ class IncrementalUpdateRunner:
                 raise KeyError(f"Merge keys {missing} not found in merged frame for {self.merge_keys}.")
             merged = merged.drop_duplicates(subset=self.merge_keys, keep=self.args.dedupe_keep)
         return merged.reset_index(drop=True)
+
+    def _required_columns(self) -> List[str]:
+        cols: List[str] = []
+        feature_list = self.cfg.get("feature_list") or []
+        if isinstance(feature_list, (list, tuple)):
+            cols.extend([c for c in feature_list if isinstance(c, str)])
+        for col in [
+            self.cfg.get("target"),
+            self.cfg.get("weight"),
+            self.binary_resp,
+            self.split_group_col,
+            self.split_time_col,
+            self.cv_group_col,
+            self.cv_time_col,
+            self.timestamp_col,
+        ]:
+            if isinstance(col, str):
+                cols.append(col)
+        if self.merge_keys:
+            cols.extend([c for c in self.merge_keys if isinstance(c, str)])
+        seen = set()
+        required: List[str] = []
+        for col in cols:
+            key = col.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            required.append(key)
+        return required
 
     def _should_train(self, new_rows: int) -> bool:
         if self.args.train_without_incremental:
@@ -585,7 +615,6 @@ class IncrementalUpdateRunner:
         incremental_path: Optional[Path],
     ) -> Dict[str, Any]:
         merged = merged.copy(deep=True)
-        merged.fillna(0, inplace=True)
         train_df, test_df = self._prepare_splits(merged)
         config_fields = getattr(ropt.BayesOptConfig, "__dataclass_fields__", {})
         allowed_config_keys = set(config_fields.keys())
@@ -786,6 +815,7 @@ class IncrementalUpdateRunner:
             base_path,
             data_format=self.data_format,
             dtype_map=self.dtype_map,
+            usecols=self._required_columns(),
             low_memory=False,
         )
         inc_df, inc_path = self._load_incremental_df(model_name)
@@ -795,7 +825,6 @@ class IncrementalUpdateRunner:
         new_rows = 0 if inc_df is None else len(inc_df)
         _log(f"{model_name}: {len(base_df)} base rows, {new_rows} incremental rows.")
         merged_df = self._merge_frames(base_df, inc_df)
-        merged_df.fillna(0, inplace=True)
 
         if self.args.update_base_data and not self.args.dry_run:
             self._write_dataset(merged_df, base_path, "update_base_data")

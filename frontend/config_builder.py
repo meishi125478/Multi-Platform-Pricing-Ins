@@ -34,6 +34,8 @@ class ConfigBuilder:
             "preprocess_artifact_path": None,
             "bo_sample_limit": None,
             "build_oht": True,
+            "oht_sparse_csr": True,
+            "keep_unscaled_oht": False,
             "cache_predictions": False,
             "prediction_cache_dir": None,
             "prediction_cache_format": "parquet",

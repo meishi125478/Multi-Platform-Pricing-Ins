@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import random
 import numpy as np
-import torch
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
 
 
 EPS = 1e-8
@@ -19,9 +22,10 @@ def set_global_seed(seed: int) -> None:
     """Set random seed for reproducibility across numpy/python/torch."""
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 
 def compute_batch_size(data_size: int, learning_rate: float, batch_num: int, minimum: int) -> int:
@@ -39,6 +43,8 @@ def tweedie_loss(
     max_clip: float = 1e6,
 ):
     """Compute Tweedie deviance loss for PyTorch tensors."""
+    if torch is None:
+        raise ImportError("tweedie_loss requires torch. Install optional dependency 'torch'.")
     pred_clamped = torch.clamp(pred, min=eps)
 
     if p == 1:

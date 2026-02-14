@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, TYPE_CHECKING
 
 import joblib
 import numpy as np
@@ -640,15 +640,18 @@ def predict_from_config(
         DataFrame with predictions from all models
     """
     input_path = Path(input_path).resolve()
-    data = load_dataset(input_path, data_format="auto", low_memory=False, chunksize=chunksize)
+    data_obj = load_dataset(
+        input_path,
+        data_format="auto",
+        low_memory=False,
+        chunksize=chunksize,
+    )
 
-    result = data.copy()
-
-    # Option 1: Parallel model loading (faster when loading multiple models)
+    predictors: List[tuple[str, Predictor]] = []
     if parallel_load and len(model_keys) > 1:
         from joblib import Parallel, delayed
 
-        def load_and_score(key):
+        def _load_one(key: str) -> tuple[str, Predictor]:
             predictor = load_predictor_from_config(
                 config_path,
                 key,
@@ -656,24 +659,12 @@ def predict_from_config(
                 device=device,
                 registry=registry,
             )
-            output_col = f"{output_col_prefix}{key}"
-            scored = batch_score(
-                predictor.predict,
-                data,
-                output_col=output_col,
-                batch_size=batch_size,
-                keep_input=False,
-            )
-            return output_col, scored[output_col].values
+            return str(key), predictor
 
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(load_and_score)(key) for key in model_keys
+        predictors = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_load_one)(str(key)) for key in model_keys
         )
-
-        for output_col, predictions in results:
-            result[output_col] = predictions
     else:
-        # Option 2: Sequential loading (original behavior)
         for key in model_keys:
             predictor = load_predictor_from_config(
                 config_path,
@@ -682,15 +673,29 @@ def predict_from_config(
                 device=device,
                 registry=registry,
             )
+            predictors.append((str(key), predictor))
+
+    def _score_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        for key, predictor in predictors:
             output_col = f"{output_col_prefix}{key}"
             scored = batch_score(
                 predictor.predict,
-                data,
+                frame,
                 output_col=output_col,
                 batch_size=batch_size,
                 keep_input=False,
             )
             result[output_col] = scored[output_col].values
+        return result
+
+    if isinstance(data_obj, pd.DataFrame):
+        result = _score_frame(data_obj)
+    else:
+        chunks: List[pd.DataFrame] = []
+        for chunk in data_obj:
+            chunks.append(_score_frame(chunk))
+        result = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
     if output_path:
         output_path = Path(output_path)
