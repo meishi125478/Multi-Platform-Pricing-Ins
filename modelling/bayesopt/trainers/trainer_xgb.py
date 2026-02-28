@@ -631,20 +631,19 @@ class XGBTrainer(TrainerBase):
         self._cache_predictions("xgb", preds_train, preds_test)
 
     def cross_val(self, trial: optuna.trial.Trial) -> float:
-        learning_rate = trial.suggest_float(
-            'learning_rate', 1e-5, 1e-1, log=True)
-        gamma = trial.suggest_float('gamma', 0, 10000)
-        max_depth_max = max(
-            3, int(getattr(self.config, "xgb_max_depth_max", 25)))
-        n_estimators_max = max(
-            10, int(getattr(self.config, "xgb_n_estimators_max", 500)))
-        max_depth = trial.suggest_int('max_depth', 3, max_depth_max)
-        n_estimators = trial.suggest_int(
-            'n_estimators', 10, n_estimators_max, step=10)
-        min_child_weight = trial.suggest_int(
-            'min_child_weight', 100, 10000, step=100)
-        reg_alpha = trial.suggest_float('reg_alpha', 1e-10, 1, log=True)
-        reg_lambda = trial.suggest_float('reg_lambda', 1e-10, 1, log=True)
+        search_space = self._get_search_space_config("xgb_search_space")
+        params: Dict[str, Any] = {}
+        for param_name, spec in (search_space or {}).items():
+            params[param_name] = self._sample_from_spec(
+                trial=trial,
+                model_key="xgb",
+                param_name=param_name,
+                spec=spec,
+            )
+
+        estimator_defaults = self._build_estimator().get_params()
+        max_depth = int(params.get("max_depth", estimator_defaults.get("max_depth", 6)))
+        n_estimators = int(params.get("n_estimators", estimator_defaults.get("n_estimators", 100)))
         if trial is not None:
             _log(
                 f"[Optuna][Xgboost] trial_id={trial.number} max_depth={max_depth} "
@@ -658,22 +657,11 @@ class XGBTrainer(TrainerBase):
             raise optuna.TrialPruned(
                 "XGB config is likely too slow (max_depth>=20 & n_estimators>=300)")
         clf = self._build_estimator()
-        params = {
-            'learning_rate': learning_rate,
-            'gamma': gamma,
-            'max_depth': max_depth,
-            'n_estimators': n_estimators,
-            'min_child_weight': min_child_weight,
-            'reg_alpha': reg_alpha,
-            'reg_lambda': reg_lambda
-        }
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
         tweedie_variance_power = None
         if self.ctx.task_type != 'classification':
             if loss_name == "tweedie":
-                tweedie_variance_power = trial.suggest_float(
-                    'tweedie_variance_power', 1, 2)
-                params['tweedie_variance_power'] = tweedie_variance_power
+                tweedie_variance_power = params.get("tweedie_variance_power")
             elif loss_name == "poisson":
                 tweedie_variance_power = 1.0
             elif loss_name == "gamma":

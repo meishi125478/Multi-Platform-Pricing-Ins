@@ -17,7 +17,10 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     dist = None  # type: ignore
 
-from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
+from ins_pricing.modelling.bayesopt.utils.distributed_utils import (
+    DistributedUtils,
+    free_cuda as distributed_free_cuda,
+)
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,15 @@ def _create_ddp_barrier(dist_ctx: Any):
             raise
 
     return _ddp_barrier
+
+
+def _free_cuda_safe(ropt_module: Any) -> None:
+    """Release CUDA memory using the best available compatibility path."""
+    free_fn = getattr(ropt_module, "free_cuda", None)
+    if callable(free_fn):
+        free_fn()
+        return
+    distributed_free_cuda()
 
 
 def _stream_random_split_csv(
@@ -904,8 +916,7 @@ def run_bayesopt_entry_training(
                 f"Optimizing ft as {ft_role} for {model_name} (max_evals={args.max_evals})")
             model.optimize_model("ft", max_evals=args.max_evals)
             model.trainers["ft"].save()
-            if getattr(deps.ropt, "torch", None) is not None and deps.ropt.torch.cuda.is_available():
-                deps.ropt.free_cuda()
+            _free_cuda_safe(deps.ropt)
             if dist_active and not ddp_enabled:
                 _ddp_barrier("finish_ft_embedding")
         for key in requested_keys:
@@ -928,7 +939,7 @@ def run_bayesopt_entry_training(
             model.trainers[key].save()
             hooks.plot_loss_curve_for_trainer(model_name, model.trainers[key])
             if key in deps.pytorch_trainers:
-                deps.ropt.free_cuda()
+                _free_cuda_safe(deps.ropt)
             if dist_active and not trainer_uses_ddp:
                 _ddp_barrier(f"finish_non_ddp_{model_name}_{key}")
             executed_keys.append(key)

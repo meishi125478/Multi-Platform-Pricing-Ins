@@ -91,6 +91,23 @@ class ResNetTrainer(TrainerBase):
             loss_name=loss_name,
             distribution=getattr(self.ctx, "distribution", None),
         )
+        handled_keys = {
+            "hidden_dim",
+            "block_num",
+            "learning_rate",
+            "patience",
+            "dropout",
+            "residual_scale",
+            "stochastic_depth",
+            "weight_decay",
+            "tw_power",
+        }
+        extra_params = {
+            key: value for key, value in params.items()
+            if key not in handled_keys
+        }
+        if extra_params:
+            model.set_params(extra_params)
         return self._apply_dataloader_overrides(model)
 
     # ========= Cross-validation (for BayesOpt) =========
@@ -149,19 +166,18 @@ class ResNetTrainer(TrainerBase):
 
         sample_cap = data_provider()[0]
         max_rows_for_resnet_bo = min(100000, int(len(sample_cap)/5))
+        search_space = self._get_search_space_config("resn_search_space")
+        param_space: Dict[str, Any] = {}
+
+        param_space = self._augment_param_space_with_search_space(
+            model_key="resn",
+            param_space=param_space,
+            search_space=search_space,
+        )
 
         return self.cross_val_generic(
             trial=trial,
-            hyperparameter_space={
-                "learning_rate": lambda t: t.suggest_float('learning_rate', 1e-6, 1e-2, log=True),
-                "hidden_dim": lambda t: t.suggest_int('hidden_dim', 8, 32, step=2),
-                "block_num": lambda t: t.suggest_int('block_num', 2, 10),
-                "dropout": lambda t: t.suggest_float('dropout', 0.0, 0.3, step=0.05),
-                "residual_scale": lambda t: t.suggest_float('residual_scale', 0.05, 0.3, step=0.05),
-                "patience": lambda t: t.suggest_int('patience', 3, 12),
-                "stochastic_depth": lambda t: t.suggest_float('stochastic_depth', 0.0, 0.2, step=0.05),
-                **({"tw_power": lambda t: t.suggest_float('tw_power', 1.0, 2.0)} if self.ctx.task_type == 'regression' and loss_name == 'tweedie' else {})
-            },
+            hyperparameter_space=param_space,
             data_provider=data_provider,
             model_builder=model_builder,
             metric_fn=metric_fn,

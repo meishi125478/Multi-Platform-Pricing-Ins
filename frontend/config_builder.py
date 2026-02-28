@@ -80,8 +80,12 @@ class ConfigBuilder:
             "reuse_best_params": False,
             "best_params_files": {},
             "xgb_chunk_size": None,
+            "xgb_search_space": {},
             "resn_use_lazy_dataset": True,
             "resn_predict_batch_size": None,
+            "resn_search_space": {},
+            "ft_search_space": {},
+            "ft_unsupervised_search_space": {},
             "gnn_use_approx_knn": True,
             "gnn_approx_knn_threshold": 50000,
             "gnn_graph_cache": None,
@@ -138,6 +142,65 @@ class ConfigBuilder:
             "data_fingerprint_max_bytes": 10485760,
         }
 
+    @staticmethod
+    def _default_xgb_search_space(
+        max_depth_max: int = 25,
+        n_estimators_max: int = 500,
+    ) -> Dict[str, Any]:
+        return {
+            "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-1, "log": True},
+            "gamma": {"type": "float", "low": 0.0, "high": 10000.0},
+            "max_depth": {"type": "int", "low": 3, "high": int(max_depth_max), "step": 1},
+            "n_estimators": {"type": "int", "low": 10, "high": int(n_estimators_max), "step": 10},
+            "min_child_weight": {"type": "int", "low": 100, "high": 10000, "step": 100},
+            "reg_alpha": {"type": "float", "low": 1e-10, "high": 1.0, "log": True},
+            "reg_lambda": {"type": "float", "low": 1e-10, "high": 1.0, "log": True},
+            "tweedie_variance_power": {"type": "float", "low": 1.0, "high": 2.0},
+        }
+
+    @staticmethod
+    def _default_resn_search_space() -> Dict[str, Any]:
+        return {
+            "learning_rate": {"type": "float", "low": 1e-6, "high": 1e-2, "log": True},
+            "hidden_dim": {"type": "int", "low": 8, "high": 32, "step": 2},
+            "block_num": {"type": "int", "low": 2, "high": 10, "step": 1},
+            "dropout": {"type": "float", "low": 0.0, "high": 0.3, "step": 0.05},
+            "residual_scale": {"type": "float", "low": 0.05, "high": 0.3, "step": 0.05},
+            "patience": {"type": "int", "low": 3, "high": 12, "step": 1},
+            "stochastic_depth": {"type": "float", "low": 0.0, "high": 0.2, "step": 0.05},
+            "tw_power": {"type": "float", "low": 1.0, "high": 2.0},
+        }
+
+    @staticmethod
+    def _default_ft_search_space() -> Dict[str, Any]:
+        return {
+            "learning_rate": {"type": "float", "low": 1e-5, "high": 5e-4, "log": True},
+            "d_model": {"type": "int", "low": 16, "high": 128, "step": 16},
+            "n_layers": {"type": "int", "low": 2, "high": 8, "step": 1},
+            "dropout": {"type": "float", "low": 0.0, "high": 0.2},
+            "weight_decay": {"type": "float", "low": 1e-6, "high": 1e-2, "log": True},
+            "tw_power": {"type": "float", "low": 1.0, "high": 2.0},
+            "geo_token_hidden_dim": {"type": "int", "low": 16, "high": 128, "step": 16},
+            "geo_token_layers": {"type": "int", "low": 1, "high": 4, "step": 1},
+            "geo_token_k_neighbors": {"type": "int", "low": 5, "high": 20, "step": 1},
+            "geo_token_dropout": {"type": "float", "low": 0.0, "high": 0.3},
+            "geo_token_learning_rate": {"type": "float", "low": 1e-4, "high": 5e-3, "log": True},
+        }
+
+    @staticmethod
+    def _default_ft_unsupervised_search_space() -> Dict[str, Any]:
+        return {
+            "learning_rate": {"type": "float", "low": 1e-5, "high": 5e-3, "log": True},
+            "d_model": {"type": "int", "low": 16, "high": 128, "step": 16},
+            "n_layers": {"type": "int", "low": 2, "high": 8, "step": 1},
+            "dropout": {"type": "float", "low": 0.0, "high": 0.3},
+            "weight_decay": {"type": "float", "low": 1e-6, "high": 1e-2, "log": True},
+            "mask_prob_num": {"type": "float", "low": 0.05, "high": 0.4},
+            "mask_prob_cat": {"type": "float", "low": 0.05, "high": 0.4},
+            "num_loss_weight": {"type": "float", "low": 0.25, "high": 4.0, "log": True},
+            "cat_loss_weight": {"type": "float", "low": 0.25, "high": 4.0, "log": True},
+        }
+
     def build_config(
         self,
         data_dir: str,
@@ -166,16 +229,20 @@ class ConfigBuilder:
         xgb_cleanup_synchronize: bool = False,
         xgb_use_dmatrix: bool = True,
         xgb_chunk_size: Optional[int] = None,
+        xgb_search_space: Optional[Dict[str, Any]] = None,
         stream_split_csv: bool = False,
         stream_split_chunksize: int = 200000,
         ft_cleanup_per_fold: bool = False,
         ft_cleanup_synchronize: bool = False,
         ft_use_lazy_dataset: bool = True,
         ft_predict_batch_size: Optional[int] = None,
+        ft_search_space: Optional[Dict[str, Any]] = None,
+        ft_unsupervised_search_space: Optional[Dict[str, Any]] = None,
         resn_cleanup_per_fold: bool = False,
         resn_cleanup_synchronize: bool = False,
         resn_use_lazy_dataset: bool = True,
         resn_predict_batch_size: Optional[int] = None,
+        resn_search_space: Optional[Dict[str, Any]] = None,
         gnn_cleanup_per_fold: bool = False,
         gnn_cleanup_synchronize: bool = False,
         gnn_max_fit_rows: Optional[int] = None,
@@ -214,16 +281,20 @@ class ConfigBuilder:
             xgb_cleanup_synchronize: Synchronize CUDA during XGBoost cleanup
             xgb_use_dmatrix: Use xgb.train with DMatrix/QuantileDMatrix
             xgb_chunk_size: Rows per chunk for XGBoost chunked incremental training
+            xgb_search_space: Optional JSON search space for XGBoost Optuna params
             stream_split_csv: Stream CSV chunks during random split to avoid full-file loading
             stream_split_chunksize: Rows per CSV chunk when stream_split_csv is enabled
             ft_cleanup_per_fold: Cleanup GPU memory per FT fold
             ft_cleanup_synchronize: Synchronize CUDA during FT cleanup
             ft_use_lazy_dataset: Use lazy dataset for FT supervised training
             ft_predict_batch_size: Optional batch size for FT prediction
+            ft_search_space: Optional JSON search space for FT supervised Optuna params
+            ft_unsupervised_search_space: Optional JSON search space for FT unsupervised Optuna params
             resn_cleanup_per_fold: Cleanup GPU memory per ResNet fold
             resn_cleanup_synchronize: Synchronize CUDA during ResNet cleanup
             resn_use_lazy_dataset: Use lazy dataset for ResNet to avoid full tensor materialization
             resn_predict_batch_size: Optional batch size for ResNet prediction
+            resn_search_space: Optional JSON search space for ResNet Optuna params
             gnn_cleanup_per_fold: Cleanup GPU memory per GNN fold
             gnn_cleanup_synchronize: Synchronize CUDA during GNN cleanup
             gnn_max_fit_rows: Optional cap for GNN fit rows (subsamples when exceeded)
@@ -237,6 +308,14 @@ class ConfigBuilder:
         """
         if model_keys is None:
             model_keys = ["xgb", "resn"]
+        if xgb_search_space is None:
+            xgb_search_space = {}
+        if resn_search_space is None:
+            resn_search_space = {}
+        if ft_search_space is None:
+            ft_search_space = {}
+        if ft_unsupervised_search_space is None:
+            ft_unsupervised_search_space = {}
 
         config = self.default_config.copy()
 
@@ -266,16 +345,20 @@ class ConfigBuilder:
             "xgb_cleanup_synchronize": xgb_cleanup_synchronize,
             "xgb_use_dmatrix": xgb_use_dmatrix,
             "xgb_chunk_size": xgb_chunk_size,
+            "xgb_search_space": xgb_search_space,
             "stream_split_csv": stream_split_csv,
             "stream_split_chunksize": stream_split_chunksize,
             "ft_cleanup_per_fold": ft_cleanup_per_fold,
             "ft_cleanup_synchronize": ft_cleanup_synchronize,
             "ft_use_lazy_dataset": ft_use_lazy_dataset,
             "ft_predict_batch_size": ft_predict_batch_size,
+            "ft_search_space": ft_search_space,
+            "ft_unsupervised_search_space": ft_unsupervised_search_space,
             "resn_cleanup_per_fold": resn_cleanup_per_fold,
             "resn_cleanup_synchronize": resn_cleanup_synchronize,
             "resn_use_lazy_dataset": resn_use_lazy_dataset,
             "resn_predict_batch_size": resn_predict_batch_size,
+            "resn_search_space": resn_search_space,
             "gnn_cleanup_per_fold": gnn_cleanup_per_fold,
             "gnn_cleanup_synchronize": gnn_cleanup_synchronize,
             "gnn_max_fit_rows": gnn_max_fit_rows,

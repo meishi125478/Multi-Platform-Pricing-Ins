@@ -15,7 +15,9 @@ A Gradio-based web interface for configuring and running all insurance pricing m
 - **Config Export**: Save current configuration as JSON file for reuse
 - **User-friendly Interface**: Intuitive web UI without writing code
 - **Auto-Detection**: Automatically detects task mode from `config.runner.mode`
-- **Plotting & Prediction Tools**: Run the plotting, prediction, and compare steps from the example notebooks
+- **Plotting & Prediction Tools**: Run the plotting, prediction, compare, and standalone double-lift workflows from the example notebooks
+- **Workflow Config Tab**: Run pre-oneway, plotting, prediction, and compare from a single workflow JSON (`workflow.mode`)
+- **Working Directory Control**: Set a frontend working folder for relative config/data/output paths
 
 ## Supported Examples
 
@@ -107,6 +109,11 @@ demo.launch(
 
 ## Usage Guide
 
+### 0. Set Working Directory (Optional but Recommended)
+
+At the top of the UI, set **Working Directory** to the folder that contains your configs/data.
+Relative paths in manual configs, workflow configs, generated FT Step-2 configs, and saved config files will use this folder.
+
 ### 1. Configure Model Parameters
 
 #### Option A: Upload JSON Config File (Recommended)
@@ -165,6 +172,11 @@ Fill in parameters in the **"Manual Configuration"** section:
 - **XGB Max Estimators**: XGBoost maximum number of estimators
 - **XGB Chunk Size (rows, 0=off)**: Enable chunked incremental XGBoost training to lower peak memory
 
+**Bayesian Optimization Search Spaces**
+- **XGB Search Space / ResNet Search Space / FT Supervised Search Space / FT Unsupervised Search Space**:
+  JSON objects for Optuna parameter ranges.
+- Leave default templates as-is for current built-in ranges, or edit min/max/step/log/value/choices directly in the UI.
+
 ### 2. Build Configuration
 
 1. After filling parameters, click **"Build Configuration"** button
@@ -187,13 +199,46 @@ Fill in parameters in the **"Manual Configuration"** section:
 
 **The system automatically detects the task mode from your config and runs the appropriate task!**
 
-### 5. Plotting / Prediction / Compare
+### 5. Plotting / Prediction / Compare / Double Lift
 
 Use the **Plotting**, **Prediction**, and **Compare** tabs to run:
 - Pre-model oneway plots
 - Post-model plots (direct or FT-embed workflows)
 - FT-embed predictions
 - Direct vs FT-embed model comparisons
+- Standalone double-lift plots from any CSV file (choose two prediction columns)
+
+### 6. Workflow Config (Recommended for Frontend Workflows)
+
+Use the **Workflow Config** tab when you want plotting/prediction/compare to be fully config-driven (same style as `runner.mode` tasks).
+
+1. Prepare a workflow JSON file (or paste JSON in the textbox)
+2. Set `workflow.mode`
+3. Fill mode-specific fields (paths are resolved relative to the workflow config file)
+4. Click **Run Workflow Config**
+
+Supported `workflow.mode` values:
+- `pre_oneway`
+- `plot_direct`
+- `plot_embed`
+- `predict_ft_embed`
+- `compare_xgb`
+- `compare_resn`
+- `compare` (requires `model_key` = `xgb` or `resn`)
+- `double_lift`
+
+Example:
+
+```json
+{
+  "workflow": {
+    "mode": "plot_direct",
+    "cfg_path": "config_plot.json",
+    "xgb_cfg_path": "config_xgb_direct.json",
+    "resn_cfg_path": "config_resn_direct.json"
+  }
+}
+```
 
 ## Task Modes Explained
 
@@ -400,7 +445,6 @@ ins_pricing/frontend/
 - requirements.txt      # Dependencies
 - README.md             # This document
 - Quick Start Guide     # Quick start guide
-- example_config.json   # Example configuration
 - start_app.bat         # Windows launcher
 - start_app.sh          # Linux/Mac launcher
 ```
@@ -500,7 +544,12 @@ For advanced FT-Transformer -> XGB/ResN training:
 4. **Step 2 - Train XGB/ResN**:
    - After Step 1 completes, click "Prepare Step 2 Configs"
    - Choose which models to train (XGB, ResN, or both)
-   - Copy the generated configs and run them
+   - Optionally edit **Augmented Data Directory** and **XGB/ResN Step 2 Overrides (JSON)** before generation
+   - Override defaults follow `02 Train_FT_Embed_XGBResN.ipynb` and can be adjusted as needed
+   - Frontend auto-generates and saves:
+     - `config_xgb_from_ft_unsupervised.json`
+     - `config_resn_from_ft_unsupervised.json`
+   - Run these generated config files in the **Run Task** tab
 
 #### Open Results Folder
 

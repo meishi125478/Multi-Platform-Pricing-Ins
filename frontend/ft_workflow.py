@@ -22,6 +22,7 @@ class FTWorkflowHelper:
     def __init__(self):
         self.step1_config = None
         self.step2_configs = {}
+        self._supported_step2_models = {"xgb", "resn"}
 
     def prepare_step1_config(
         self,
@@ -84,11 +85,77 @@ class FTWorkflowHelper:
         self.step1_config = config
         return config
 
+    def _resolve_prediction_alignment_indices(
+        self,
+        raw: pd.DataFrame,
+        cfg: Dict[str, Any],
+        *,
+        pred_train_rows: int,
+        pred_test_rows: int,
+    ) -> Tuple[pd.Index, pd.Index]:
+        """Rebuild the Step 1 holdout split so cached embeddings can be reattached.
+
+        Falls back to the streaming random split mask used by the runtime when
+        `memory_saving` auto-enables `stream_split_csv`.
+        """
+        try:
+            from ins_pricing.cli.utils.cli_common import (
+                split_train_test,
+                resolve_split_config,
+            )
+        except ImportError:
+            raise ImportError(
+                "Cannot import split_train_test/resolve_split_config. "
+                "Ensure ins_pricing is installed."
+            )
+
+        split_cfg = resolve_split_config(cfg)
+        holdout_ratio = float(split_cfg["holdout_ratio"])
+        split_strategy = str(split_cfg["split_strategy"] or "random").strip().lower()
+        split_group_col = split_cfg["split_group_col"]
+        split_time_col = split_cfg["split_time_col"]
+        split_time_ascending = bool(split_cfg["split_time_ascending"])
+        rand_seed = cfg.get("rand_seed", 13)
+
+        # Keep original row indices for embedding reattachment.
+        train_df, test_df = split_train_test(
+            raw,
+            holdout_ratio=holdout_ratio,
+            strategy=split_strategy,
+            group_col=split_group_col,
+            time_col=split_time_col,
+            time_ascending=split_time_ascending,
+            rand_seed=rand_seed,
+            reset_index_mode="none",
+            ratio_label="holdout_ratio",
+        )
+        if len(train_df) == pred_train_rows and len(test_df) == pred_test_rows:
+            return train_df.index, test_df.index
+
+        if split_strategy == "random":
+            # Runtime may auto-enable stream_split_csv for memory_saving profile.
+            rng = np.random.default_rng(rand_seed if rand_seed is not None else 13)
+            mask_test = rng.random(len(raw)) < holdout_ratio
+            train_index = raw.index[~mask_test]
+            test_index = raw.index[mask_test]
+            if len(train_index) == pred_train_rows and len(test_index) == pred_test_rows:
+                return train_index, test_index
+
+        raise ValueError(
+            "Prediction rows do not match reconstructed split sizes. "
+            f"cached train/test=({pred_train_rows}, {pred_test_rows}), "
+            f"reconstructed train/test=({len(train_df)}, {len(test_df)}). "
+            "Check split settings (and whether Step 1 used stream_split_csv or "
+            "memory_saving auto-stream split)."
+        )
+
     def generate_step2_configs(
         self,
         step1_config_path: str,
         target_models: List[str] = None,
-        augmented_data_dir: str = "./DataFTUnsupervised"
+        augmented_data_dir: str = "./DataFTUnsupervised",
+        xgb_overrides: Optional[Dict[str, Any]] = None,
+        resn_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """
         Generate Step 2 configurations for XGB and/or ResN.
@@ -99,12 +166,13 @@ class FTWorkflowHelper:
             step1_config_path: Path to the Step 1 config file
             target_models: Models to train in step 2 (e.g., ['xgb', 'resn'])
             augmented_data_dir: Directory to save augmented data with embeddings
+            xgb_overrides: Optional overrides merged into generated XGB Step-2 config
+            resn_overrides: Optional overrides merged into generated ResN Step-2 config
 
         Returns:
             Tuple of (xgb_config, resn_config) - None if not in target_models
         """
-        if target_models is None:
-            target_models = ['xgb', 'resn']
+        target_models = self._normalize_target_models(target_models)
 
         # Load step 1 config
         cfg_path = Path(step1_config_path)
@@ -120,32 +188,6 @@ class FTWorkflowHelper:
             raise FileNotFoundError(f"Data file not found: {raw_path}")
 
         raw = pd.read_csv(raw_path)
-
-        # Import split function
-        try:
-            from ins_pricing.cli.utils.cli_common import split_train_test
-        except ImportError:
-            raise ImportError("Cannot import split_train_test. Ensure ins_pricing is installed.")
-
-        # Split data using same settings as step 1
-        holdout_ratio = cfg.get("holdout_ratio", cfg.get("prop_test", 0.25))
-        split_strategy = cfg.get("split_strategy", "random")
-        split_group_col = cfg.get("split_group_col")
-        split_time_col = cfg.get("split_time_col")
-        split_time_ascending = cfg.get("split_time_ascending", True)
-        rand_seed = cfg.get("rand_seed", 13)
-
-        train_df, test_df = split_train_test(
-            raw,
-            holdout_ratio=holdout_ratio,
-            strategy=split_strategy,
-            group_col=split_group_col,
-            time_col=split_time_col,
-            time_ascending=split_time_ascending,
-            rand_seed=rand_seed,
-            reset_index_mode="time_group",
-            ratio_label="holdout_ratio",
-        )
 
         # Load cached embeddings
         out_root = (cfg_path.parent / cfg["output_dir"]).resolve()
@@ -163,10 +205,12 @@ class FTWorkflowHelper:
 
         pred_train = pd.read_csv(train_pred_path)
         pred_test = pd.read_csv(test_pred_path)
-
-        if len(pred_train) != len(train_df) or len(pred_test) != len(test_df):
-            raise ValueError(
-                "Prediction rows do not match split sizes; check split settings.")
+        train_index, test_index = self._resolve_prediction_alignment_indices(
+            raw,
+            cfg,
+            pred_train_rows=len(pred_train),
+            pred_test_rows=len(pred_test),
+        )
 
         # Merge embeddings with raw data without duplicating all raw columns first.
         embed_cols = list(pred_train.columns)
@@ -176,10 +220,10 @@ class FTWorkflowHelper:
             columns=embed_cols,
             dtype=np.float32,
         )
-        emb_full.loc[train_df.index, embed_cols] = pred_train.to_numpy(
+        emb_full.loc[train_index, embed_cols] = pred_train.to_numpy(
             dtype=np.float32, copy=False
         )
-        emb_full.loc[test_df.index, embed_cols] = pred_test.to_numpy(
+        emb_full.loc[test_index, embed_cols] = pred_test.to_numpy(
             dtype=np.float32, copy=False
         )
         raw_base = raw.drop(columns=embed_cols, errors="ignore")
@@ -200,11 +244,21 @@ class FTWorkflowHelper:
         resn_config = None
 
         if 'xgb' in target_models:
-            xgb_config = self._build_xgb_config(cfg, cfg_path, embed_cols, augmented_data_dir)
+            xgb_config = self._build_xgb_config(
+                cfg,
+                embed_cols,
+                augmented_data_dir,
+                overrides=xgb_overrides,
+            )
             self.step2_configs['xgb'] = xgb_config
 
         if 'resn' in target_models:
-            resn_config = self._build_resn_config(cfg, cfg_path, embed_cols, augmented_data_dir)
+            resn_config = self._build_resn_config(
+                cfg,
+                embed_cols,
+                augmented_data_dir,
+                overrides=resn_overrides,
+            )
             self.step2_configs['resn'] = resn_config
 
         return xgb_config, resn_config
@@ -212,88 +266,145 @@ class FTWorkflowHelper:
     def _build_xgb_config(
         self,
         base_cfg: Dict[str, Any],
-        cfg_path: Path,
         embed_cols: List[str],
-        data_dir: str
+        data_dir: str,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build XGB config for Step 2."""
-        xgb_cfg = copy.deepcopy(base_cfg)
-        feature_list, categorical_features = self._resolve_step2_feature_space(base_cfg, embed_cols)
-
-        xgb_cfg["data_dir"] = str(data_dir)
-        xgb_cfg["feature_list"] = feature_list
-        xgb_cfg["categorical_features"] = categorical_features
-        xgb_cfg["ft_role"] = "model"
-        xgb_cfg["stack_model_keys"] = ["xgb"]
-        xgb_cfg["cache_predictions"] = False
-
-        # Disable DDP for XGB
-        xgb_cfg["use_resn_ddp"] = False
-        xgb_cfg["use_ft_ddp"] = False
-        xgb_cfg["use_resn_data_parallel"] = False
-        xgb_cfg["use_ft_data_parallel"] = False
-        xgb_cfg["use_gnn_data_parallel"] = False
-
-        xgb_cfg["output_dir"] = "./ResultsXGBFromFTUnsupervised"
-        xgb_cfg["optuna_storage"] = "./ResultsXGBFromFTUnsupervised/optuna/bayesopt.sqlite3"
-        xgb_cfg["optuna_study_prefix"] = "pricing_ft_unsup_xgb"
-        xgb_cfg["loss_name"] = "mse"
-
-        runner_cfg = xgb_cfg.get("runner", {})
-        runner_cfg["model_keys"] = ["xgb"]
-        runner_cfg["nproc_per_node"] = 1
-        runner_cfg["plot_curves"] = False
-        xgb_cfg["runner"] = runner_cfg
-
-        xgb_cfg["plot_curves"] = False
-        plot_cfg = xgb_cfg.get("plot", {})
-        plot_cfg["enable"] = False
-        xgb_cfg["plot"] = plot_cfg
-
-        return xgb_cfg
+        return self._build_step2_model_config(
+            base_cfg=base_cfg,
+            embed_cols=embed_cols,
+            data_dir=data_dir,
+            model_key="xgb",
+            output_dir="./ResultsXGBFromFTUnsupervised",
+            study_prefix="pricing_ft_unsup_xgb",
+            runner_nproc=1,
+            use_resn_ddp=False,
+            build_oht=False,
+            final_refit=False,
+            overrides=overrides,
+        )
 
     def _build_resn_config(
         self,
         base_cfg: Dict[str, Any],
-        cfg_path: Path,
         embed_cols: List[str],
-        data_dir: str
+        data_dir: str,
+        overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build ResNet config for Step 2."""
-        resn_cfg = copy.deepcopy(base_cfg)
-        feature_list, categorical_features = self._resolve_step2_feature_space(base_cfg, embed_cols)
+        return self._build_step2_model_config(
+            base_cfg=base_cfg,
+            embed_cols=embed_cols,
+            data_dir=data_dir,
+            model_key="resn",
+            output_dir="./ResultsResNFromFTUnsupervised",
+            study_prefix="pricing_ft_unsup_resn_ddp",
+            runner_nproc=2,
+            use_resn_ddp=True,
+            build_oht=True,
+            final_refit=None,
+            overrides=overrides,
+        )
 
-        resn_cfg["data_dir"] = str(data_dir)
-        resn_cfg["feature_list"] = feature_list
-        resn_cfg["categorical_features"] = categorical_features
-        resn_cfg["ft_role"] = "model"
-        resn_cfg["stack_model_keys"] = ["resn"]
-        resn_cfg["cache_predictions"] = False
+    def _build_step2_model_config(
+        self,
+        *,
+        base_cfg: Dict[str, Any],
+        embed_cols: List[str],
+        data_dir: str,
+        model_key: str,
+        output_dir: str,
+        study_prefix: str,
+        runner_nproc: int,
+        use_resn_ddp: bool,
+        build_oht: Optional[bool],
+        final_refit: Optional[bool],
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cfg = copy.deepcopy(base_cfg)
+        feature_list, categorical_features = self._resolve_step2_feature_space(
+            base_cfg, embed_cols
+        )
 
-        # Enable DDP for ResNet
-        resn_cfg["use_resn_ddp"] = True
-        resn_cfg["use_ft_ddp"] = False
-        resn_cfg["use_resn_data_parallel"] = False
-        resn_cfg["use_ft_data_parallel"] = False
-        resn_cfg["use_gnn_data_parallel"] = False
+        cfg["data_dir"] = str(data_dir)
+        cfg["feature_list"] = feature_list
+        cfg["categorical_features"] = categorical_features
+        cfg["ft_role"] = "model"
+        cfg["stack_model_keys"] = [model_key]
+        cfg["cache_predictions"] = False
 
-        resn_cfg["output_dir"] = "./ResultsResNFromFTUnsupervised"
-        resn_cfg["optuna_storage"] = "./ResultsResNFromFTUnsupervised/optuna/bayesopt.sqlite3"
-        resn_cfg["optuna_study_prefix"] = "pricing_ft_unsup_resn_ddp"
-        resn_cfg["loss_name"] = "mse"
+        cfg["use_resn_ddp"] = bool(use_resn_ddp)
+        cfg["use_ft_ddp"] = False
+        cfg["use_resn_data_parallel"] = False
+        cfg["use_ft_data_parallel"] = False
+        cfg["use_gnn_data_parallel"] = False
 
-        runner_cfg = resn_cfg.get("runner", {})
-        runner_cfg["model_keys"] = ["resn"]
-        runner_cfg["nproc_per_node"] = 2
+        cfg["output_dir"] = output_dir
+        cfg["optuna_storage"] = f"{output_dir}/optuna/bayesopt.sqlite3"
+        cfg["optuna_study_prefix"] = study_prefix
+        cfg["loss_name"] = "mse"
+        if build_oht is not None:
+            cfg["build_oht"] = bool(build_oht)
+        if final_refit is not None:
+            cfg["final_refit"] = bool(final_refit)
+
+        runner_cfg = dict(cfg.get("runner", {}) or {})
+        runner_cfg["model_keys"] = [model_key]
+        runner_cfg["nproc_per_node"] = int(runner_nproc)
         runner_cfg["plot_curves"] = False
-        resn_cfg["runner"] = runner_cfg
+        cfg["runner"] = runner_cfg
 
-        resn_cfg["plot_curves"] = False
-        plot_cfg = resn_cfg.get("plot", {})
+        cfg["plot_curves"] = False
+        plot_cfg = dict(cfg.get("plot", {}) or {})
         plot_cfg["enable"] = False
-        resn_cfg["plot"] = plot_cfg
+        cfg["plot"] = plot_cfg
 
-        return resn_cfg
+        if overrides:
+            self._deep_update(cfg, overrides)
+
+        return cfg
+
+    @staticmethod
+    def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge updates into base dictionary in-place."""
+        for key, value in (updates or {}).items():
+            if (
+                isinstance(value, dict)
+                and isinstance(base.get(key), dict)
+            ):
+                FTWorkflowHelper._deep_update(base[key], value)
+            else:
+                base[key] = value
+        return base
+
+    def _normalize_target_models(self, target_models: Optional[List[str]]) -> List[str]:
+        if target_models is None:
+            return ["xgb", "resn"]
+
+        normalized = []
+        seen = set()
+        invalid = []
+        for model in target_models:
+            key = str(model or "").strip().lower()
+            if not key:
+                continue
+            if key not in self._supported_step2_models:
+                invalid.append(key)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+
+        if invalid:
+            supported = ", ".join(sorted(self._supported_step2_models))
+            raise ValueError(
+                f"Unsupported Step 2 models: {invalid}. Supported values: {supported}."
+            )
+        if not normalized:
+            raise ValueError("No valid target_models provided for Step 2 config generation.")
+        return normalized
 
     @staticmethod
     def _dedup_preserve_order(values: List[str]) -> List[str]:

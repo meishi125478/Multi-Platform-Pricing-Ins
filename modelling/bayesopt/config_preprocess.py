@@ -133,14 +133,18 @@ class BayesOptConfig:
         xgb_cleanup_synchronize: Whether to synchronize CUDA during XGBoost cleanup
         xgb_use_dmatrix: Whether to use xgb.train with DMatrix/QuantileDMatrix
         xgb_chunk_size: Rows per chunk for XGBoost chunked incremental training
+        xgb_search_space: Optional XGBoost Optuna search-space override (JSON object)
         ft_cleanup_per_fold: Whether to cleanup GPU memory after each FT fold
         ft_cleanup_synchronize: Whether to synchronize CUDA during FT cleanup
         resn_cleanup_per_fold: Whether to cleanup GPU memory after each ResNet fold
         resn_cleanup_synchronize: Whether to synchronize CUDA during ResNet cleanup
         resn_use_lazy_dataset: Whether ResNet uses lazy row-wise dataset to avoid full tensor materialization
         resn_predict_batch_size: Optional batch size for ResNet prediction (None = auto)
+        resn_search_space: Optional ResNet Optuna search-space override (JSON object)
         ft_use_lazy_dataset: Whether FT-Transformer uses lazy row-wise dataset to avoid full tensor materialization
         ft_predict_batch_size: Optional batch size for FT-Transformer prediction (None = auto)
+        ft_search_space: Optional FT supervised Optuna search-space override (JSON object)
+        ft_unsupervised_search_space: Optional FT unsupervised Optuna search-space override (JSON object)
         gnn_cleanup_per_fold: Whether to cleanup GPU memory after each GNN fold
         gnn_cleanup_synchronize: Whether to synchronize CUDA during GNN cleanup
         optuna_cleanup_synchronize: Whether to synchronize CUDA during Optuna cleanup
@@ -193,14 +197,18 @@ class BayesOptConfig:
     xgb_cleanup_synchronize: bool = False
     xgb_use_dmatrix: bool = True
     xgb_chunk_size: Optional[int] = None
+    xgb_search_space: Optional[Dict[str, Any]] = None
     ft_cleanup_per_fold: bool = False
     ft_cleanup_synchronize: bool = False
     resn_cleanup_per_fold: bool = False
     resn_cleanup_synchronize: bool = False
     resn_use_lazy_dataset: bool = True
     resn_predict_batch_size: Optional[int] = None
+    resn_search_space: Optional[Dict[str, Any]] = None
     ft_use_lazy_dataset: bool = True
     ft_predict_batch_size: Optional[int] = None
+    ft_search_space: Optional[Dict[str, Any]] = None
+    ft_unsupervised_search_space: Optional[Dict[str, Any]] = None
     gnn_cleanup_per_fold: bool = False
     gnn_cleanup_synchronize: bool = False
     optuna_cleanup_synchronize: bool = False
@@ -592,6 +600,34 @@ class BayesOptConfig:
                     errors.append(
                         f"gnn_predict_chunk_rows must be >= 1 when provided, got {gnn_predict_chunk_rows}"
                     )
+
+        # Validate JSON-driven Optuna search spaces.
+        for field_name in (
+            "xgb_search_space",
+            "resn_search_space",
+            "ft_search_space",
+            "ft_unsupervised_search_space",
+        ):
+            raw_space = getattr(self, field_name, None)
+            if raw_space is None:
+                continue
+            if not isinstance(raw_space, dict):
+                errors.append(f"{field_name} must be a JSON object when provided.")
+                continue
+            for param_name, param_spec in raw_space.items():
+                if not isinstance(param_name, str) or not param_name.strip():
+                    errors.append(f"{field_name} has an invalid parameter name: {param_name!r}")
+                    continue
+                if isinstance(param_spec, dict):
+                    param_type = str(param_spec.get("type", "")).strip().lower()
+                    if param_type and param_type not in {"int", "float", "categorical"}:
+                        errors.append(
+                            f"{field_name}.{param_name}.type must be one of int/float/categorical."
+                        )
+                elif isinstance(param_spec, (list, tuple)):
+                    if len(param_spec) == 0:
+                        errors.append(f"{field_name}.{param_name} categorical choices cannot be empty.")
+                # Scalars are treated as fixed values in trainer sampling.
 
         if errors:
             raise ConfigurationError(

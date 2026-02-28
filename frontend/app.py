@@ -6,8 +6,9 @@ A Gradio-based web interface for configuring and running insurance pricing model
 import os
 import platform
 import subprocess
-from ins_pricing.frontend.example_workflows import (
+from ins_pricing.frontend.workflows import (
     run_compare_ft_embed,
+    run_double_lift_from_file,
     run_plot_direct,
     run_plot_embed,
     run_predict_ft_embed,
@@ -18,14 +19,10 @@ from ins_pricing.frontend.runner import TaskRunner
 from ins_pricing.frontend.config_builder import ConfigBuilder
 import json
 import tempfile
-import sys
 import inspect
 import importlib.util
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable, Iterable, Tuple, Generator
-import threading
-import queue
-import time
+from typing import Optional, Dict, Any, Callable, Iterable, Generator
 
 def _ensure_repo_root() -> None:
     if __package__ not in {None, ""}:
@@ -84,10 +81,15 @@ class PricingApp:
         self.config_builder = ConfigBuilder()
         self.runner = TaskRunner()
         self.ft_workflow = FTWorkflowHelper()
+        self.working_dir: Path = Path.cwd().resolve()
         self.current_config = {}
         self.current_step1_config = None
+        self.current_step2_config_paths: Dict[str, str] = {}
         self.current_config_path: Optional[Path] = None
         self.current_config_dir: Optional[Path] = None
+        self.current_workflow_config: Dict[str, Any] = {}
+        self.current_workflow_config_path: Optional[Path] = None
+        self.current_workflow_config_dir: Optional[Path] = None
 
     def load_json_config(self, file_path) -> tuple[str, Dict[str, Any], str]:
         """Load configuration from uploaded JSON file."""
@@ -105,6 +107,105 @@ class PricingApp:
             return f"Configuration loaded successfully from {path.name}", config, config_json
         except Exception as e:
             return f"Error loading config: {str(e)}", {}, ""
+
+    def set_working_dir(self, working_dir: str) -> tuple[str, str]:
+        """Set working directory used for relative paths and generated configs."""
+        try:
+            raw = str(working_dir or "").strip()
+            if not raw:
+                resolved = Path.cwd().resolve()
+            else:
+                candidate = Path(raw).expanduser()
+                if not candidate.is_absolute():
+                    candidate = (self.working_dir / candidate).resolve()
+                else:
+                    candidate = candidate.resolve()
+                if not candidate.exists():
+                    return f"Working directory does not exist: {candidate}", str(self.working_dir)
+                if not candidate.is_dir():
+                    return f"Working directory is not a folder: {candidate}", str(self.working_dir)
+                resolved = candidate
+
+            self.working_dir = resolved
+            return f"Working directory set to: {resolved}", str(resolved)
+        except Exception as e:
+            return f"Error setting working directory: {str(e)}", str(self.working_dir)
+
+    def list_directory_candidates(
+        self,
+        root_dir: str,
+        *,
+        max_depth: int = 2,
+        max_items: int = 300,
+    ) -> tuple[str, list[str], str]:
+        """List directories for manual working-directory selection."""
+        try:
+            raw_root = str(root_dir or "").strip()
+            candidate = Path(raw_root).expanduser() if raw_root else self.working_dir
+            if not candidate.is_absolute():
+                candidate = (self.working_dir / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+
+            if not candidate.exists():
+                fallback = str(self.working_dir)
+                return f"Browse root does not exist: {candidate}", [fallback], fallback
+            if not candidate.is_dir():
+                fallback = str(self.working_dir)
+                return f"Browse root is not a folder: {candidate}", [fallback], fallback
+
+            depth_limit = max(0, int(max_depth))
+            item_limit = max(1, int(max_items))
+            root = candidate
+            root_parts = len(root.parts)
+            dirs: list[str] = []
+
+            for current, child_dirs, _ in os.walk(root):
+                current_path = Path(current).resolve()
+                rel_depth = len(current_path.parts) - root_parts
+                dirs.append(str(current_path))
+
+                if rel_depth >= depth_limit:
+                    child_dirs[:] = []
+
+                if len(dirs) >= item_limit:
+                    break
+
+            dirs = sorted(dict.fromkeys(dirs))
+            selected = str(self.working_dir) if str(self.working_dir) in dirs else str(root)
+            truncated = len(dirs) >= item_limit
+            status = f"Found {len(dirs)} folders under: {root}"
+            if truncated:
+                status += f" (limited to first {item_limit})"
+            return status, dirs, selected
+        except Exception as e:
+            fallback = str(self.working_dir)
+            return f"Error listing folders: {str(e)}", [fallback], fallback
+
+    def _resolve_user_path(self, value: str, *, base_dir: Optional[Path] = None) -> Path:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("Path value is empty.")
+        path = Path(raw).expanduser()
+        root = (base_dir or self.working_dir or Path.cwd()).resolve()
+        if not path.is_absolute():
+            path = (root / path).resolve()
+        else:
+            path = path.resolve()
+        return path
+
+    def _default_base_dir(self, preferred: Optional[Path] = None) -> Path:
+        return (preferred or self.working_dir or Path.cwd()).resolve()
+
+    @staticmethod
+    def _parse_json_dict(raw_json: str, field_name: str) -> Dict[str, Any]:
+        text = str(raw_json or "").strip()
+        if not text:
+            return {}
+        obj = json.loads(text)
+        if not isinstance(obj, dict):
+            raise ValueError(f"{field_name} must be a JSON object.")
+        return obj
 
     def build_config_from_ui(
         self,
@@ -133,6 +234,10 @@ class PricingApp:
         xgb_cleanup_synchronize: bool,
         xgb_use_dmatrix: bool,
         xgb_chunk_size: int,
+        xgb_search_space_json: str,
+        resn_search_space_json: str,
+        ft_search_space_json: str,
+        ft_unsupervised_search_space_json: str,
         ft_cleanup_per_fold: bool,
         ft_cleanup_synchronize: bool,
         resn_cleanup_per_fold: bool,
@@ -170,6 +275,22 @@ class PricingApp:
                 resn_pred_bs_val = 0
             if resn_pred_bs_val > 0:
                 parsed_resn_predict_batch_size = resn_pred_bs_val
+            xgb_search_space = self._parse_json_dict(
+                xgb_search_space_json,
+                "xgb_search_space_json",
+            )
+            resn_search_space = self._parse_json_dict(
+                resn_search_space_json,
+                "resn_search_space_json",
+            )
+            ft_search_space = self._parse_json_dict(
+                ft_search_space_json,
+                "ft_search_space_json",
+            )
+            ft_unsupervised_search_space = self._parse_json_dict(
+                ft_unsupervised_search_space_json,
+                "ft_unsupervised_search_space_json",
+            )
 
             config = self.config_builder.build_config(
                 data_dir=data_dir,
@@ -197,6 +318,10 @@ class PricingApp:
                 xgb_cleanup_synchronize=xgb_cleanup_synchronize,
                 xgb_use_dmatrix=xgb_use_dmatrix,
                 xgb_chunk_size=parsed_xgb_chunk_size,
+                xgb_search_space=xgb_search_space,
+                resn_search_space=resn_search_space,
+                ft_search_space=ft_search_space,
+                ft_unsupervised_search_space=ft_unsupervised_search_space,
                 ft_cleanup_per_fold=ft_cleanup_per_fold,
                 ft_cleanup_synchronize=ft_cleanup_synchronize,
                 resn_cleanup_per_fold=resn_cleanup_per_fold,
@@ -214,7 +339,7 @@ class PricingApp:
 
             self.current_config = config
             self.current_config_path = None
-            self.current_config_dir = None
+            self.current_config_dir = self.working_dir
             config_json = json.dumps(config, indent=2, ensure_ascii=False)
             return "Configuration built successfully", config_json
 
@@ -227,13 +352,214 @@ class PricingApp:
             return "No configuration to save"
 
         try:
-            config_path = Path(filename)
+            config_path = self._resolve_user_path(filename, base_dir=self._default_base_dir(self.current_config_dir))
+            config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(json.loads(config_json), f,
                           indent=2, ensure_ascii=False)
             return f"Configuration saved to {config_path}"
         except Exception as e:
             return f"Error saving config: {str(e)}"
+
+    def load_workflow_config(self, file_path) -> tuple[str, str]:
+        """Load workflow configuration (plot/predict/compare/pre-oneway)."""
+        if not file_path:
+            return "No file uploaded", ""
+
+        try:
+            path = Path(file_path).resolve()
+            with open(path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            self.current_workflow_config = config
+            self.current_workflow_config_path = path
+            self.current_workflow_config_dir = path.parent
+            config_json = json.dumps(config, indent=2, ensure_ascii=False)
+            return f"Workflow config loaded from {path.name}", config_json
+        except Exception as e:
+            return f"Error loading workflow config: {str(e)}", ""
+
+    @staticmethod
+    def _to_csv(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(x).strip() for x in value if str(x).strip())
+        return str(value)
+
+    @staticmethod
+    def _resolve_path_value(
+        base_dir: Path,
+        value: Any,
+        field_name: str,
+        *,
+        required: bool = True,
+    ) -> Optional[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            if required:
+                raise ValueError(f"{field_name} is required.")
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        else:
+            path = path.resolve()
+        return str(path)
+
+    def _run_workflow_from_config(self, config: Dict[str, Any], base_dir: Path) -> str:
+        workflow_cfg = config.get("workflow", config)
+        if not isinstance(workflow_cfg, dict):
+            raise ValueError("workflow must be a JSON object.")
+
+        mode = str(workflow_cfg.get("mode", "")).strip().lower()
+        if not mode:
+            raise ValueError(
+                "workflow.mode is required. Supported modes: "
+                "pre_oneway, plot_direct, plot_embed, predict_ft_embed, compare_xgb, compare_resn, compare, double_lift."
+            )
+
+        if mode in {"pre_oneway", "pre-oneway", "oneway_pre"}:
+            holdout_ratio_raw = workflow_cfg.get("holdout_ratio", 0.25)
+            holdout_ratio = None if holdout_ratio_raw is None else float(holdout_ratio_raw)
+            output_dir = self._resolve_path_value(
+                base_dir, workflow_cfg.get("output_dir"), "output_dir", required=False
+            )
+            return run_pre_oneway(
+                data_path=self._resolve_path_value(base_dir, workflow_cfg.get("data_path"), "data_path"),
+                model_name=str(workflow_cfg.get("model_name", "")).strip(),
+                target_col=str(workflow_cfg.get("target_col", "")).strip(),
+                weight_col=str(workflow_cfg.get("weight_col", "")).strip(),
+                feature_list=self._to_csv(workflow_cfg.get("feature_list", "")),
+                categorical_features=self._to_csv(workflow_cfg.get("categorical_features", "")),
+                n_bins=int(workflow_cfg.get("n_bins", 10)),
+                holdout_ratio=holdout_ratio,
+                rand_seed=int(workflow_cfg.get("rand_seed", 13)),
+                output_dir=output_dir,
+            )
+
+        if mode == "plot_direct":
+            cfg_path = workflow_cfg.get("cfg_path", workflow_cfg.get("plot_cfg_path"))
+            return run_plot_direct(
+                cfg_path=self._resolve_path_value(base_dir, cfg_path, "cfg_path"),
+                xgb_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("xgb_cfg_path"), "xgb_cfg_path"),
+                resn_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("resn_cfg_path"), "resn_cfg_path"),
+            )
+
+        if mode == "plot_embed":
+            cfg_path = workflow_cfg.get("cfg_path", workflow_cfg.get("plot_cfg_path"))
+            return run_plot_embed(
+                cfg_path=self._resolve_path_value(base_dir, cfg_path, "cfg_path"),
+                xgb_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("xgb_cfg_path"), "xgb_cfg_path"),
+                resn_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("resn_cfg_path"), "resn_cfg_path"),
+                ft_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("ft_cfg_path"), "ft_cfg_path"),
+                use_runtime_ft_embedding=bool(workflow_cfg.get("use_runtime_ft_embedding", False)),
+            )
+
+        if mode in {"predict_ft_embed", "predict"}:
+            xgb_cfg_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("xgb_cfg_path"), "xgb_cfg_path", required=False
+            )
+            resn_cfg_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("resn_cfg_path"), "resn_cfg_path", required=False
+            )
+            return run_predict_ft_embed(
+                ft_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("ft_cfg_path"), "ft_cfg_path"),
+                xgb_cfg_path=xgb_cfg_path,
+                resn_cfg_path=resn_cfg_path,
+                input_path=self._resolve_path_value(base_dir, workflow_cfg.get("input_path"), "input_path"),
+                output_path=self._resolve_path_value(base_dir, workflow_cfg.get("output_path"), "output_path"),
+                model_name=(str(workflow_cfg.get("model_name", "")).strip() or None),
+                model_keys=self._to_csv(workflow_cfg.get("model_keys", "")),
+            )
+
+        if mode in {"compare_xgb", "compare_resn", "compare"}:
+            if mode == "compare_xgb":
+                model_key = "xgb"
+            elif mode == "compare_resn":
+                model_key = "resn"
+            else:
+                model_key = str(workflow_cfg.get("model_key", "xgb")).strip().lower()
+            if model_key not in {"xgb", "resn"}:
+                raise ValueError("compare mode only supports model_key in {'xgb', 'resn'}.")
+
+            n_bins_override_raw = workflow_cfg.get("n_bins_override", 10)
+            n_bins_override = None if n_bins_override_raw is None else int(n_bins_override_raw)
+            return run_compare_ft_embed(
+                direct_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("direct_cfg_path"), "direct_cfg_path"),
+                ft_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("ft_cfg_path"), "ft_cfg_path"),
+                ft_embed_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("ft_embed_cfg_path"), "ft_embed_cfg_path"),
+                model_key=model_key,
+                label_direct=str(workflow_cfg.get("label_direct", "Direct")).strip(),
+                label_ft=str(workflow_cfg.get("label_ft", "FT")).strip(),
+                use_runtime_ft_embedding=bool(workflow_cfg.get("use_runtime_ft_embedding", False)),
+                n_bins_override=n_bins_override,
+            )
+
+        if mode in {"double_lift", "double-lift"}:
+            holdout_ratio_raw = workflow_cfg.get("holdout_ratio", 0.0)
+            holdout_ratio = None if holdout_ratio_raw is None else float(holdout_ratio_raw)
+            output_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("output_path"), "output_path", required=False
+            )
+            return run_double_lift_from_file(
+                data_path=self._resolve_path_value(base_dir, workflow_cfg.get("data_path"), "data_path"),
+                pred_col_1=str(workflow_cfg.get("pred_col_1", workflow_cfg.get("pred_col1", ""))).strip(),
+                pred_col_2=str(workflow_cfg.get("pred_col_2", workflow_cfg.get("pred_col2", ""))).strip(),
+                target_col=str(workflow_cfg.get("target_col", workflow_cfg.get("target", ""))).strip(),
+                weight_col=str(workflow_cfg.get("weight_col", workflow_cfg.get("weight", "weights"))).strip(),
+                n_bins=int(workflow_cfg.get("n_bins", 10)),
+                label1=str(workflow_cfg.get("label1", "")).strip() or None,
+                label2=str(workflow_cfg.get("label2", "")).strip() or None,
+                pred1_weighted=bool(workflow_cfg.get("pred1_weighted", False)),
+                pred2_weighted=bool(workflow_cfg.get("pred2_weighted", False)),
+                actual_weighted=bool(workflow_cfg.get("actual_weighted", False)),
+                holdout_ratio=holdout_ratio,
+                split_strategy=str(workflow_cfg.get("split_strategy", "random")).strip(),
+                split_group_col=str(workflow_cfg.get("split_group_col", "")).strip() or None,
+                split_time_col=str(workflow_cfg.get("split_time_col", "")).strip() or None,
+                split_time_ascending=bool(workflow_cfg.get("split_time_ascending", True)),
+                rand_seed=int(workflow_cfg.get("rand_seed", 13)),
+                output_path=output_path,
+            )
+
+        raise ValueError(
+            f"Unsupported workflow mode: {mode}. "
+            "Supported: pre_oneway, plot_direct, plot_embed, predict_ft_embed, compare_xgb, compare_resn, compare, double_lift."
+        )
+
+    def run_workflow_config_ui(self, workflow_config_json: str) -> Generator[tuple[str, str], None, None]:
+        """Run plotting/prediction/compare/pre-oneway from workflow JSON config."""
+        try:
+            if workflow_config_json:
+                workflow_config = json.loads(workflow_config_json)
+                base_dir = self._default_base_dir(self.current_workflow_config_dir)
+                self.current_workflow_config = workflow_config
+            elif self.current_workflow_config:
+                workflow_config = self.current_workflow_config
+                base_dir = self._default_base_dir(self.current_workflow_config_dir)
+            else:
+                yield "No workflow configuration provided", ""
+                return
+
+            mode = str(workflow_config.get("workflow", workflow_config).get("mode", "unknown")).strip().lower()
+            log_generator = self.runner.run_callable(
+                self._run_workflow_from_config,
+                workflow_config,
+                base_dir,
+            )
+
+            full_log = ""
+            for log_line in log_generator:
+                full_log += log_line + "\n"
+                yield f"Workflow [{mode}] in progress...", full_log
+
+            yield f"Workflow [{mode}] completed!", full_log
+
+        except Exception as e:
+            error_msg = f"Workflow config execution error: {str(e)}"
+            yield error_msg, error_msg
 
     def run_training(self, config_json: str) -> Generator[tuple[str, str], None, None]:
         """
@@ -247,7 +573,7 @@ class PricingApp:
             if config_json:
                 config = json.loads(config_json)
                 task_mode = config.get('runner', {}).get('mode', 'entry')
-                base_dir = self.current_config_dir or Path.cwd()
+                base_dir = self._default_base_dir(self.current_config_dir)
                 fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
                 temp_config_path = Path(temp_path)
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -260,7 +586,7 @@ class PricingApp:
             elif self.current_config:
                 config = self.current_config
                 task_mode = config.get('runner', {}).get('mode', 'entry')
-                base_dir = Path.cwd()
+                base_dir = self._default_base_dir(self.current_config_dir)
                 fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
                 temp_config_path = Path(temp_path)
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -304,7 +630,8 @@ class PricingApp:
             )
 
             # Save to temp file
-            temp_path = Path("temp_ft_step1_config.json")
+            base_dir = self._default_base_dir(self.current_config_dir)
+            temp_path = (base_dir / "temp_ft_step1_config.json").resolve()
             with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(step1_config, f, indent=2)
 
@@ -316,19 +643,89 @@ class PricingApp:
         except Exception as e:
             return f"Error preparing Step 1 config: {str(e)}", ""
 
-    def prepare_ft_step2(self, step1_config_path: str, target_models: str) -> tuple[str, str, str]:
+    def prepare_ft_step2(
+        self,
+        step1_config_path: str,
+        target_models: str,
+        augmented_data_dir: str,
+        xgb_overrides_json: str,
+        resn_overrides_json: str,
+    ) -> tuple[str, str, str]:
         """Prepare FT Step 2 configurations."""
-        if not step1_config_path or not os.path.exists(step1_config_path):
+        if not step1_config_path:
             return "Step 1 config not found. Run Step 1 first.", "", ""
 
         try:
-            models = [m.strip() for m in target_models.split(',') if m.strip()]
-            xgb_cfg, resn_cfg = self.ft_workflow.generate_step2_configs(
-                step1_config_path=step1_config_path,
-                target_models=models
-            )
+            step1_path = Path(step1_config_path).expanduser()
+            if not step1_path.is_absolute():
+                candidate_dirs: Iterable[Path] = (
+                    self.current_config_dir,
+                    self.working_dir,
+                    Path.cwd(),
+                )
+                resolved_candidate = None
+                for root in candidate_dirs:
+                    if root is None:
+                        continue
+                    candidate = (Path(root).resolve() / step1_path).resolve()
+                    if candidate.exists():
+                        resolved_candidate = candidate
+                        break
+                if resolved_candidate is None:
+                    return "Step 1 config not found. Run Step 1 first.", "", ""
+                step1_path = resolved_candidate
+            else:
+                step1_path = step1_path.resolve()
+                if not step1_path.exists():
+                    return "Step 1 config not found. Run Step 1 first.", "", ""
 
-            status_msg = f"Step 2 configs prepared for: {', '.join(models)}"
+            models = [m.strip() for m in target_models.split(',') if m.strip()]
+            data_dir_value = str(augmented_data_dir or "").strip() or "./DataFTUnsupervised"
+            xgb_overrides = self._parse_json_dict(
+                xgb_overrides_json,
+                "xgb_overrides_json",
+            )
+            resn_overrides = self._parse_json_dict(
+                resn_overrides_json,
+                "resn_overrides_json",
+            )
+            xgb_cfg, resn_cfg = self.ft_workflow.generate_step2_configs(
+                step1_config_path=str(step1_path),
+                target_models=models,
+                augmented_data_dir=data_dir_value,
+                xgb_overrides=xgb_overrides,
+                resn_overrides=resn_overrides,
+            )
+            save_dir = step1_path.parent
+            saved_paths: Dict[str, str] = {}
+
+            if xgb_cfg:
+                xgb_cfg_path = save_dir / "config_xgb_from_ft_unsupervised.json"
+                xgb_cfg_path.write_text(
+                    json.dumps(xgb_cfg, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                saved_paths["xgb"] = str(xgb_cfg_path)
+
+            if resn_cfg:
+                resn_cfg_path = save_dir / "config_resn_from_ft_unsupervised.json"
+                resn_cfg_path.write_text(
+                    json.dumps(resn_cfg, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                saved_paths["resn"] = str(resn_cfg_path)
+
+            self.current_step2_config_paths = saved_paths
+
+            status_lines = [
+                f"Step 2 configs prepared for: {', '.join(models)}",
+                f"Augmented data dir: {data_dir_value}",
+            ]
+            if "xgb" in saved_paths:
+                status_lines.append(f"Saved XGB config: {saved_paths['xgb']}")
+            if "resn" in saved_paths:
+                status_lines.append(f"Saved ResN config: {saved_paths['resn']}")
+            status_msg = "\n".join(status_lines)
             xgb_json = json.dumps(
                 xgb_cfg, indent=2, ensure_ascii=False) if xgb_cfg else ""
             resn_json = json.dumps(
@@ -347,7 +744,11 @@ class PricingApp:
             if config_json:
                 config = json.loads(config_json)
                 output_dir = config.get('output_dir', './Results')
-                results_path = Path(output_dir).resolve()
+                out = Path(str(output_dir))
+                if out.is_absolute():
+                    results_path = out.resolve()
+                else:
+                    results_path = (self._default_base_dir(self.current_config_dir) / out).resolve()
             elif self.current_config_path and self.current_config_path.exists():
                 config = json.loads(
                     self.current_config_path.read_text(encoding="utf-8"))
@@ -356,7 +757,11 @@ class PricingApp:
                     self.current_config_path.parent / output_dir).resolve()
             elif self.current_config:
                 output_dir = self.current_config.get('output_dir', './Results')
-                results_path = Path(output_dir).resolve()
+                out = Path(str(output_dir))
+                if out.is_absolute():
+                    results_path = out.resolve()
+                else:
+                    results_path = (self._default_base_dir(self.current_config_dir) / out).resolve()
             else:
                 return "No configuration loaded"
 
@@ -467,8 +872,9 @@ class PricingApp:
             model_keys=model_keys,
         )
 
-    def run_compare_xgb_ui(
+    def run_compare_ui(
         self,
+        model_key: str,
         direct_cfg_path: str,
         ft_cfg_path: str,
         ft_embed_cfg_path: str,
@@ -477,21 +883,27 @@ class PricingApp:
         use_runtime_ft_embedding: bool,
         n_bins_override: int,
     ):
-        yield from self._run_workflow(
-            "Compare XGB",
-            run_compare_ft_embed,
+        model_key_norm = str(model_key or "").strip().lower()
+        if model_key_norm not in {"xgb", "resn"}:
+            raise ValueError("model_key must be one of: xgb, resn.")
+        label = "Compare XGB" if model_key_norm == "xgb" else "Compare ResNet"
+        yield from self._run_compare_ui(
+            model_key=model_key_norm,
+            label=label,
             direct_cfg_path=direct_cfg_path,
             ft_cfg_path=ft_cfg_path,
             ft_embed_cfg_path=ft_embed_cfg_path,
-            model_key="xgb",
             label_direct=label_direct,
             label_ft=label_ft,
             use_runtime_ft_embedding=use_runtime_ft_embedding,
             n_bins_override=n_bins_override,
         )
 
-    def run_compare_resn_ui(
+    def _run_compare_ui(
         self,
+        *,
+        model_key: str,
+        label: str,
         direct_cfg_path: str,
         ft_cfg_path: str,
         ft_embed_cfg_path: str,
@@ -501,16 +913,60 @@ class PricingApp:
         n_bins_override: int,
     ):
         yield from self._run_workflow(
-            "Compare ResNet",
+            label,
             run_compare_ft_embed,
             direct_cfg_path=direct_cfg_path,
             ft_cfg_path=ft_cfg_path,
             ft_embed_cfg_path=ft_embed_cfg_path,
-            model_key="resn",
+            model_key=model_key,
             label_direct=label_direct,
             label_ft=label_ft,
             use_runtime_ft_embedding=use_runtime_ft_embedding,
             n_bins_override=n_bins_override,
+        )
+
+    def run_double_lift_ui(
+        self,
+        data_path: str,
+        pred_col_1: str,
+        pred_col_2: str,
+        target_col: str,
+        weight_col: str,
+        n_bins: int,
+        label1: str,
+        label2: str,
+        pred1_weighted: bool,
+        pred2_weighted: bool,
+        actual_weighted: bool,
+        holdout_ratio: float,
+        split_strategy: str,
+        split_group_col: str,
+        split_time_col: str,
+        split_time_ascending: bool,
+        rand_seed: int,
+        output_path: str,
+    ):
+        yield from self._run_workflow(
+            "Double Lift",
+            run_double_lift_from_file,
+            data_path=data_path,
+            pred_col_1=pred_col_1,
+            pred_col_2=pred_col_2,
+            target_col=target_col,
+            weight_col=weight_col,
+            n_bins=n_bins,
+            label1=label1 or None,
+            label2=label2 or None,
+            pred1_weighted=pred1_weighted,
+            pred2_weighted=pred2_weighted,
+            actual_weighted=actual_weighted,
+            holdout_ratio=holdout_ratio,
+            split_strategy=split_strategy,
+            split_group_col=split_group_col or None,
+            split_time_col=split_time_col or None,
+            split_time_ascending=split_time_ascending,
+            rand_seed=rand_seed,
+            output_path=output_path or None,
         )
 
 
@@ -520,8 +976,137 @@ def create_ui():
     import gradio as gr
 
     app = PricingApp()
+    xgb_search_space_template = json.dumps(
+        app.config_builder._default_xgb_search_space(),
+        indent=2,
+        ensure_ascii=False,
+    )
+    resn_search_space_template = json.dumps(
+        app.config_builder._default_resn_search_space(),
+        indent=2,
+        ensure_ascii=False,
+    )
+    ft_search_space_template = json.dumps(
+        app.config_builder._default_ft_search_space(),
+        indent=2,
+        ensure_ascii=False,
+    )
+    ft_unsupervised_search_space_template = json.dumps(
+        app.config_builder._default_ft_unsupervised_search_space(),
+        indent=2,
+        ensure_ascii=False,
+    )
+    workflow_template = json.dumps(
+        {
+            "workflow": {
+                "mode": "plot_direct",
+                "cfg_path": "config_plot.json",
+                "xgb_cfg_path": "config_xgb_direct.json",
+                "resn_cfg_path": "config_resn_direct.json",
+            }
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    xgb_step2_overrides_template = json.dumps(
+        {
+            "output_dir": "./ResultsXGBFromFTUnsupervised",
+            "optuna_storage": "./ResultsXGBFromFTUnsupervised/optuna/bayesopt.sqlite3",
+            "optuna_study_prefix": "pricing_ft_unsup_xgb",
+            "loss_name": "mse",
+            "build_oht": False,
+            "final_refit": False,
+            "runner": {
+                "model_keys": ["xgb"],
+                "nproc_per_node": 1,
+                "plot_curves": False,
+            },
+            "plot_curves": False,
+            "plot": {"enable": False},
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    resn_step2_overrides_template = json.dumps(
+        {
+            "use_resn_ddp": True,
+            "output_dir": "./ResultsResNFromFTUnsupervised",
+            "optuna_storage": "./ResultsResNFromFTUnsupervised/optuna/bayesopt.sqlite3",
+            "optuna_study_prefix": "pricing_ft_unsup_resn_ddp",
+            "loss_name": "mse",
+            "build_oht": True,
+            "runner": {
+                "model_keys": ["resn"],
+                "nproc_per_node": 2,
+                "plot_curves": False,
+            },
+            "plot_curves": False,
+            "plot": {"enable": False},
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    dir_status_init, dir_choices_init, dir_value_init = app.list_directory_candidates(
+        str(app.working_dir)
+    )
 
-    with gr.Blocks(title="Insurance Pricing Model Training", theme=gr.themes.Soft()) as demo:
+    def _set_working_dir_ui(path_text: str):
+        status, resolved = app.set_working_dir(path_text)
+        _, choices, selected = app.list_directory_candidates(resolved)
+        return (
+            status,
+            resolved,
+            resolved,
+            gr.update(choices=choices, value=selected),
+        )
+
+    def _refresh_working_dir_choices_ui(root_dir: str):
+        status, choices, selected = app.list_directory_candidates(root_dir)
+        return status, gr.update(choices=choices, value=selected)
+
+    def _suggest_compare_defaults(model_key: str):
+        key = str(model_key or "").strip().lower()
+        if key == "resn":
+            return (
+                "config_resn_direct.json",
+                "config_resn_from_ft_unsupervised.json",
+                "ResN_raw",
+                "ResN_ft_embed",
+            )
+        return (
+            "config_xgb_direct.json",
+            "config_xgb_from_ft_unsupervised.json",
+            "XGB_raw",
+            "XGB_ft_embed",
+        )
+
+    layout_css = """
+    .gradio-container {
+        max-width: 1480px !important;
+        margin: 0 auto !important;
+    }
+    .gradio-container .tabitem {
+        padding-top: 8px;
+    }
+    .gradio-container .gr-form {
+        gap: 10px !important;
+    }
+    .gradio-container .gr-row {
+        align-items: stretch;
+    }
+    .gradio-container .gr-column {
+        min-width: 0;
+    }
+    .gradio-container textarea {
+        line-height: 1.35;
+    }
+    """
+
+    with gr.Blocks(
+        title="Insurance Pricing Model Training",
+        theme=gr.themes.Soft(),
+        css=layout_css,
+    ) as demo:
         gr.Markdown(
             """
             # Insurance Pricing Model Training Interface
@@ -533,9 +1118,44 @@ def create_ui():
             """
         )
 
+        with gr.Row():
+            working_dir_input = gr.Textbox(
+                label="Working Directory",
+                value=str(app.working_dir),
+                placeholder="Type a path, or select from the folder list below",
+                scale=3,
+            )
+            set_working_dir_btn = gr.Button(
+                "Set Working Directory", variant="secondary", scale=1)
+
+        with gr.Row():
+            working_dir_browse_root = gr.Textbox(
+                label="Browse Root",
+                value=str(app.working_dir),
+                placeholder="List folders under this path (depth=2)",
+                scale=3,
+            )
+            refresh_working_dir_btn = gr.Button(
+                "Refresh Folder List", variant="secondary", scale=1
+            )
+
+        with gr.Row():
+            working_dir_picker = gr.Dropdown(
+                label="Select Existing Folder",
+                choices=dir_choices_init,
+                value=dir_value_init,
+                scale=3,
+            )
+            use_selected_working_dir_btn = gr.Button(
+                "Use Selected Folder", variant="secondary", scale=1
+            )
+
+        working_dir_status = gr.Textbox(
+            label="Working Directory Status", value=dir_status_init, interactive=False)
+
         with gr.Tab("Configuration"):
-            with gr.Row():
-                with gr.Column(scale=1):
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=2):
                     gr.Markdown("### Load Configuration")
                     json_file = gr.File(
                         label="Upload JSON Config File",
@@ -546,15 +1166,15 @@ def create_ui():
                     load_status = gr.Textbox(
                         label="Load Status", interactive=False)
 
-                with gr.Column(scale=2):
+                with gr.Column(scale=5):
                     gr.Markdown("### Current Configuration")
                     config_display = gr.JSON(label="Configuration", value={})
 
             gr.Markdown("---")
             gr.Markdown("### Manual Configuration")
 
-            with gr.Row():
-                with gr.Column():
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=1):
                     gr.Markdown("#### Data Settings")
                     data_dir = gr.Textbox(
                         label="Data Directory", value="./Data")
@@ -570,27 +1190,21 @@ def create_ui():
                     feature_list = gr.Textbox(
                         label="Feature List (comma-separated)",
                         placeholder="feature_1, feature_2, feature_3",
-                        lines=3
+                        lines=4
                     )
                     categorical_features = gr.Textbox(
                         label="Categorical Features (comma-separated)",
                         placeholder="feature_2, feature_3",
-                        lines=2
+                        lines=3
                     )
 
-                with gr.Column():
+                with gr.Column(scale=1):
                     gr.Markdown("#### Model Settings")
                     task_type = gr.Dropdown(
                         label="Task Type",
                         choices=["regression", "binary", "multiclass"],
                         value="regression"
                     )
-                    prop_test = gr.Slider(
-                        label="Test Proportion", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
-                    holdout_ratio = gr.Slider(
-                        label="Holdout Ratio", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
-                    val_ratio = gr.Slider(
-                        label="Validation Ratio", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
                     split_strategy = gr.Dropdown(
                         label="Split Strategy",
                         choices=["random", "stratified", "time", "group"],
@@ -599,9 +1213,13 @@ def create_ui():
                     rand_seed = gr.Number(
                         label="Random Seed", value=13, precision=0)
                     epochs = gr.Number(label="Epochs", value=50, precision=0)
+                    prop_test = gr.Slider(
+                        label="Test Proportion", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
+                    holdout_ratio = gr.Slider(
+                        label="Holdout Ratio", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
+                    val_ratio = gr.Slider(
+                        label="Validation Ratio", minimum=0.1, maximum=0.5, value=0.25, step=0.05)
 
-            with gr.Row():
-                with gr.Column():
                     gr.Markdown("#### Training Settings")
                     output_dir = gr.Textbox(
                         label="Output Directory", value="./Results")
@@ -614,41 +1232,76 @@ def create_ui():
                     max_evals = gr.Number(
                         label="Max Evaluations", value=50, precision=0)
 
-                with gr.Column():
-                    gr.Markdown("#### XGBoost Settings")
-                    xgb_max_depth_max = gr.Number(
-                        label="XGB Max Depth", value=25, precision=0)
-                    xgb_n_estimators_max = gr.Number(
-                        label="XGB Max Estimators", value=500, precision=0)
-                    xgb_gpu_id = gr.Number(
-                        label="XGB GPU ID", value=0, precision=0)
-                    xgb_cleanup_per_fold = gr.Checkbox(
-                        label="XGB Cleanup Per Fold", value=False)
-                    xgb_cleanup_synchronize = gr.Checkbox(
-                        label="XGB Cleanup Synchronize", value=False)
-                    xgb_use_dmatrix = gr.Checkbox(
-                        label="XGB Use DMatrix", value=True)
-                    xgb_chunk_size = gr.Number(
-                        label="XGB Chunk Size (rows, 0=off)", value=0, precision=0)
-                    gr.Markdown("#### Fold Cleanup")
-                    ft_cleanup_per_fold = gr.Checkbox(
-                        label="FT Cleanup Per Fold", value=False)
-                    ft_cleanup_synchronize = gr.Checkbox(
-                        label="FT Cleanup Synchronize", value=False)
-                    resn_cleanup_per_fold = gr.Checkbox(
-                        label="ResNet Cleanup Per Fold", value=False)
-                    resn_cleanup_synchronize = gr.Checkbox(
-                        label="ResNet Cleanup Synchronize", value=False)
-                    resn_use_lazy_dataset = gr.Checkbox(
-                        label="ResNet Lazy Dataset", value=True)
-                    resn_predict_batch_size = gr.Number(
-                        label="ResNet Predict Batch Size (0=auto)", value=0, precision=0)
-                    gnn_cleanup_per_fold = gr.Checkbox(
-                        label="GNN Cleanup Per Fold", value=False)
-                    gnn_cleanup_synchronize = gr.Checkbox(
-                        label="GNN Cleanup Synchronize", value=False)
-                    optuna_cleanup_synchronize = gr.Checkbox(
-                        label="Optuna Cleanup Synchronize", value=False)
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("#### XGBoost Runtime")
+                            xgb_max_depth_max = gr.Number(
+                                label="XGB Max Depth", value=25, precision=0)
+                            xgb_n_estimators_max = gr.Number(
+                                label="XGB Max Estimators", value=500, precision=0)
+                            xgb_gpu_id = gr.Number(
+                                label="XGB GPU ID", value=0, precision=0)
+                            xgb_use_dmatrix = gr.Checkbox(
+                                label="XGB Use DMatrix", value=True)
+                            xgb_chunk_size = gr.Number(
+                                label="XGB Chunk Size (rows, 0=off)", value=0, precision=0)
+                            resn_use_lazy_dataset = gr.Checkbox(
+                                label="ResNet Lazy Dataset", value=True)
+                            resn_predict_batch_size = gr.Number(
+                                label="ResNet Predict Batch Size (0=auto)", value=0, precision=0)
+
+                        with gr.Column(scale=1):
+                            gr.Markdown("#### Cleanup Controls")
+                            xgb_cleanup_per_fold = gr.Checkbox(
+                                label="XGB Cleanup Per Fold", value=False)
+                            xgb_cleanup_synchronize = gr.Checkbox(
+                                label="XGB Cleanup Synchronize", value=False)
+                            ft_cleanup_per_fold = gr.Checkbox(
+                                label="FT Cleanup Per Fold", value=False)
+                            ft_cleanup_synchronize = gr.Checkbox(
+                                label="FT Cleanup Synchronize", value=False)
+                            resn_cleanup_per_fold = gr.Checkbox(
+                                label="ResNet Cleanup Per Fold", value=False)
+                            resn_cleanup_synchronize = gr.Checkbox(
+                                label="ResNet Cleanup Synchronize", value=False)
+                            gnn_cleanup_per_fold = gr.Checkbox(
+                                label="GNN Cleanup Per Fold", value=False)
+                            gnn_cleanup_synchronize = gr.Checkbox(
+                                label="GNN Cleanup Synchronize", value=False)
+                            optuna_cleanup_synchronize = gr.Checkbox(
+                                label="Optuna Cleanup Synchronize", value=False)
+
+            gr.Markdown("#### Bayesian Optimization Search Spaces (JSON)")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1):
+                    xgb_search_space_json = gr.Textbox(
+                        label="XGB Search Space",
+                        value=xgb_search_space_template,
+                        lines=10,
+                        max_lines=20,
+                    )
+                with gr.Column(scale=1):
+                    resn_search_space_json = gr.Textbox(
+                        label="ResNet Search Space",
+                        value=resn_search_space_template,
+                        lines=10,
+                        max_lines=20,
+                    )
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1):
+                    ft_search_space_json = gr.Textbox(
+                        label="FT Supervised Search Space",
+                        value=ft_search_space_template,
+                        lines=10,
+                        max_lines=20,
+                    )
+                with gr.Column(scale=1):
+                    ft_unsupervised_search_space_json = gr.Textbox(
+                        label="FT Unsupervised Search Space",
+                        value=ft_unsupervised_search_space_template,
+                        lines=10,
+                        max_lines=20,
+                    )
 
             with gr.Row():
                 build_btn = gr.Button(
@@ -656,14 +1309,15 @@ def create_ui():
                 save_config_btn = gr.Button(
                     "Save Configuration", variant="secondary", size="lg")
 
-            with gr.Row():
-                build_status = gr.Textbox(label="Status", interactive=False)
-                config_json = gr.Textbox(
-                    label="Generated Config (JSON)", lines=10, max_lines=20)
+            build_status = gr.Textbox(label="Status", interactive=False)
+            config_json = gr.Textbox(
+                label="Generated Config (JSON)", lines=12, max_lines=24)
 
-            save_filename = gr.Textbox(
-                label="Save Filename", value="my_config.json")
-            save_status = gr.Textbox(label="Save Status", interactive=False)
+            with gr.Row(equal_height=True):
+                save_filename = gr.Textbox(
+                    label="Save Filename", value="my_config.json", scale=3)
+                save_status = gr.Textbox(
+                    label="Save Status", interactive=False, scale=4)
 
         with gr.Tab("Run Task"):
             gr.Markdown(
@@ -742,6 +1396,27 @@ def create_ui():
                         value="xgb, resn",
                         placeholder="xgb, resn"
                     )
+                    augmented_data_dir_input = gr.Textbox(
+                        label="Augmented Data Directory",
+                        value="./DataFTUnsupervised",
+                        placeholder="./DataFTUnsupervised",
+                    )
+                    gr.Markdown(
+                        "Step-2 parameter overrides (JSON). "
+                        "Defaults match `02 Train_FT_Embed_XGBResN.ipynb`."
+                    )
+                    xgb_overrides_input = gr.Textbox(
+                        label="XGB Step 2 Overrides (JSON)",
+                        value=xgb_step2_overrides_template,
+                        lines=10,
+                        max_lines=20,
+                    )
+                    resn_overrides_input = gr.Textbox(
+                        label="ResN Step 2 Overrides (JSON)",
+                        value=resn_step2_overrides_template,
+                        lines=10,
+                        max_lines=20,
+                    )
 
                     prepare_step2_btn = gr.Button(
                         "Prepare Step 2 Configs", variant="primary")
@@ -769,8 +1444,61 @@ def create_ui():
                 After preparing configs, you can:
                 - Copy the Step 1 config and paste it in the **Configuration** tab, then run it in **Run Task** tab
                 - After Step 1 completes, click **Prepare Step 2 Configs**
-                - Copy the Step 2 configs (XGB or ResN) and run them in **Run Task** tab
+                - Step 2 configs are auto-saved as:
+                  - `config_xgb_from_ft_unsupervised.json`
+                  - `config_resn_from_ft_unsupervised.json`
+                - You can edit XGB/ResN override JSONs before generation to customize Step-2 parameters
+                - Run those configs in **Run Task** tab (or keep using the JSON text boxes below)
                 """
+            )
+
+        with gr.Tab("Workflow Config"):
+            gr.Markdown(
+                """
+                ### Config-Driven Plotting / Prediction / Compare / Pre-Oneway
+                Use a JSON config file to run frontend workflows without manual field-by-field input.
+
+                Supported `workflow.mode` values:
+                - `pre_oneway`
+                - `plot_direct`
+                - `plot_embed`
+                - `predict_ft_embed`
+                - `compare_xgb`
+                - `compare_resn`
+                - `compare` (requires `model_key`: `xgb` or `resn`)
+                - `double_lift`
+                """
+            )
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    workflow_file = gr.File(
+                        label="Upload Workflow Config",
+                        file_types=[".json"],
+                        type="filepath",
+                    )
+                    workflow_load_btn = gr.Button(
+                        "Load Workflow Config", variant="secondary")
+                    workflow_load_status = gr.Textbox(
+                        label="Load Status", interactive=False)
+
+                with gr.Column(scale=2):
+                    workflow_config_json = gr.Textbox(
+                        label="Workflow Config (JSON)",
+                        value=workflow_template,
+                        lines=18,
+                        max_lines=30,
+                    )
+
+            workflow_run_btn = gr.Button(
+                "Run Workflow Config", variant="primary", size="lg")
+            workflow_status = gr.Textbox(label="Workflow Status", interactive=False)
+            workflow_log = gr.Textbox(
+                label="Workflow Logs",
+                lines=18,
+                max_lines=40,
+                interactive=False,
+                autoscroll=True,
             )
 
         with gr.Tab("Plotting"):
@@ -823,100 +1551,199 @@ def create_ui():
                                      max_lines=40, interactive=False)
 
             with gr.Tab("Direct Plot"):
-                direct_cfg_path = gr.Textbox(
-                    label="Plot Config", value="config_plot.json")
-                direct_xgb_cfg = gr.Textbox(
-                    label="XGB Config", value="config_xgb_direct.json")
-                direct_resn_cfg = gr.Textbox(
-                    label="ResN Config", value="config_resn_direct.json")
-                direct_run_btn = gr.Button(
-                    "Run Direct Plot", variant="primary")
-                direct_status = gr.Textbox(label="Status", interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        direct_cfg_path = gr.Textbox(
+                            label="Plot Config", value="config_plot.json")
+                        direct_run_btn = gr.Button(
+                            "Run Direct Plot", variant="primary")
+                        direct_status = gr.Textbox(
+                            label="Status", interactive=False)
+                    with gr.Column(scale=4):
+                        direct_xgb_cfg = gr.Textbox(
+                            label="XGB Config", value="config_xgb_direct.json")
+                        direct_resn_cfg = gr.Textbox(
+                            label="ResN Config", value="config_resn_direct.json")
                 direct_log = gr.Textbox(
                     label="Logs", lines=15, max_lines=40, interactive=False)
 
             with gr.Tab("Embed Plot"):
-                embed_cfg_path = gr.Textbox(
-                    label="Plot Config", value="config_plot.json")
-                embed_xgb_cfg = gr.Textbox(
-                    label="XGB Embed Config", value="config_xgb_from_ft_unsupervised.json")
-                embed_resn_cfg = gr.Textbox(
-                    label="ResN Embed Config", value="config_resn_from_ft_unsupervised.json")
-                embed_ft_cfg = gr.Textbox(
-                    label="FT Embed Config", value="config_ft_unsupervised_ddp_embed.json")
-                embed_runtime = gr.Checkbox(
-                    label="Use Runtime FT Embedding", value=False)
-                embed_run_btn = gr.Button("Run Embed Plot", variant="primary")
-                embed_status = gr.Textbox(label="Status", interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        embed_cfg_path = gr.Textbox(
+                            label="Plot Config", value="config_plot.json")
+                        embed_ft_cfg = gr.Textbox(
+                            label="FT Embed Config", value="config_ft_unsupervised_ddp_embed.json")
+                        embed_runtime = gr.Checkbox(
+                            label="Use Runtime FT Embedding", value=False)
+                        embed_run_btn = gr.Button(
+                            "Run Embed Plot", variant="primary")
+                        embed_status = gr.Textbox(
+                            label="Status", interactive=False)
+                    with gr.Column(scale=4):
+                        embed_xgb_cfg = gr.Textbox(
+                            label="XGB Embed Config", value="config_xgb_from_ft_unsupervised.json")
+                        embed_resn_cfg = gr.Textbox(
+                            label="ResN Embed Config", value="config_resn_from_ft_unsupervised.json")
                 embed_log = gr.Textbox(
+                    label="Logs", lines=15, max_lines=40, interactive=False)
+
+            with gr.Tab("Double Lift"):
+                gr.Markdown(
+                    """
+                    Draw a double-lift curve from any CSV file with two prediction columns.
+                    """
+                )
+                with gr.Row():
+                    with gr.Column():
+                        dl_data_path = gr.Textbox(
+                            label="Data Path (CSV)", value="./Data/od_bc.csv")
+                        dl_pred_col_1 = gr.Textbox(
+                            label="Prediction Column 1", value="pred_xgb")
+                        dl_pred_col_2 = gr.Textbox(
+                            label="Prediction Column 2", value="pred_resn")
+                        dl_target_col = gr.Textbox(
+                            label="Target Column", value="reponse")
+                        dl_weight_col = gr.Textbox(
+                            label="Weight Column", value="weights")
+                        dl_output_path = gr.Textbox(
+                            label="Output Image Path (optional)", value="")
+                    with gr.Column():
+                        dl_label1 = gr.Textbox(label="Label 1", value="Model 1")
+                        dl_label2 = gr.Textbox(label="Label 2", value="Model 2")
+                        dl_n_bins = gr.Number(label="Bins", value=10, precision=0)
+                        dl_holdout_ratio = gr.Slider(
+                            label="Holdout Ratio (0 = all data, >0 = train/test split)",
+                            minimum=0.0,
+                            maximum=0.5,
+                            value=0.0,
+                            step=0.05,
+                        )
+                        dl_split_strategy = gr.Dropdown(
+                            label="Split Strategy",
+                            choices=["random", "stratified", "time", "group"],
+                            value="random",
+                        )
+                        dl_split_group_col = gr.Textbox(
+                            label="Group Column (optional, for group split)",
+                            value="",
+                        )
+                        dl_split_time_col = gr.Textbox(
+                            label="Time Column (optional, for time split)",
+                            value="",
+                        )
+                        dl_split_time_ascending = gr.Checkbox(
+                            label="Time Ascending",
+                            value=True,
+                        )
+                        dl_rand_seed = gr.Number(
+                            label="Random Seed", value=13, precision=0)
+                        dl_pred1_weighted = gr.Checkbox(
+                            label="Prediction 1 Is Weighted",
+                            value=False,
+                        )
+                        dl_pred2_weighted = gr.Checkbox(
+                            label="Prediction 2 Is Weighted",
+                            value=False,
+                        )
+                        dl_actual_weighted = gr.Checkbox(
+                            label="Actual Is Weighted",
+                            value=False,
+                        )
+
+                dl_run_btn = gr.Button("Run Double Lift", variant="primary")
+                dl_status = gr.Textbox(label="Status", interactive=False)
+                dl_log = gr.Textbox(
+                    label="Logs", lines=15, max_lines=40, interactive=False)
+
+            with gr.Tab("FT-Embed Compare"):
+                gr.Markdown("Compare Direct vs FT-Embed models and draw double-lift curves.")
+                with gr.Row():
+                    with gr.Column(scale=4):
+                        cmp_model_key = gr.Dropdown(
+                            label="Model Key",
+                            choices=["xgb", "resn"],
+                            value="xgb",
+                        )
+                        cmp_direct_cfg = gr.Textbox(
+                            label="Direct Model Config", value="config_xgb_direct.json")
+                        cmp_ft_cfg = gr.Textbox(
+                            label="FT Config", value="config_ft_unsupervised_ddp_embed.json")
+                        cmp_embed_cfg = gr.Textbox(
+                            label="FT-Embed Model Config", value="config_xgb_from_ft_unsupervised.json")
+                    with gr.Column(scale=3):
+                        cmp_label_direct = gr.Textbox(
+                            label="Direct Label", value="XGB_raw")
+                        cmp_label_ft = gr.Textbox(
+                            label="FT Label", value="XGB_ft_embed")
+                        cmp_runtime = gr.Checkbox(
+                            label="Use Runtime FT Embedding", value=False)
+                        cmp_bins = gr.Number(
+                            label="Bins Override", value=10, precision=0)
+                        cmp_run_btn = gr.Button("Run Compare", variant="primary")
+                        cmp_status = gr.Textbox(label="Status", interactive=False)
+                cmp_log = gr.Textbox(
                     label="Logs", lines=15, max_lines=40, interactive=False)
 
         with gr.Tab("Prediction"):
             gr.Markdown("### FT Embed Prediction")
-            pred_ft_cfg = gr.Textbox(
-                label="FT Config", value="config_ft_unsupervised_ddp_embed.json")
-            pred_xgb_cfg = gr.Textbox(
-                label="XGB Config (optional)", value="config_xgb_from_ft_unsupervised.json")
-            pred_resn_cfg = gr.Textbox(
-                label="ResN Config (optional)", value="config_resn_from_ft_unsupervised.json")
-            pred_input = gr.Textbox(
-                label="Input Data", value="./Data/od_bc_new.csv")
-            pred_output = gr.Textbox(
-                label="Output CSV", value="./Results/predictions_ft_xgb.csv")
-            pred_model_name = gr.Textbox(
-                label="Model Name (optional)", value="")
-            pred_model_keys = gr.Textbox(label="Model Keys", value="xgb, resn")
-            pred_run_btn = gr.Button("Run Prediction", variant="primary")
-            pred_status = gr.Textbox(label="Status", interactive=False)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    pred_ft_cfg = gr.Textbox(
+                        label="FT Config", value="config_ft_unsupervised_ddp_embed.json")
+                    pred_xgb_cfg = gr.Textbox(
+                        label="XGB Config (optional)", value="config_xgb_from_ft_unsupervised.json")
+                    pred_resn_cfg = gr.Textbox(
+                        label="ResN Config (optional)", value="config_resn_from_ft_unsupervised.json")
+                    pred_model_name = gr.Textbox(
+                        label="Model Name (optional)", value="")
+                    pred_model_keys = gr.Textbox(
+                        label="Model Keys", value="xgb, resn")
+                with gr.Column(scale=3):
+                    pred_input = gr.Textbox(
+                        label="Input Data", value="./Data/od_bc_new.csv")
+                    pred_output = gr.Textbox(
+                        label="Output CSV", value="./Results/predictions_ft_xgb.csv")
+                    pred_run_btn = gr.Button("Run Prediction", variant="primary")
+                    pred_status = gr.Textbox(label="Status", interactive=False)
             pred_log = gr.Textbox(label="Logs", lines=15,
                                   max_lines=40, interactive=False)
 
-        with gr.Tab("Compare"):
-            gr.Markdown("### Compare Direct vs FT-Embed Models")
-
-            with gr.Tab("Compare XGB"):
-                cmp_xgb_direct_cfg = gr.Textbox(
-                    label="Direct XGB Config", value="config_xgb_direct.json")
-                cmp_xgb_ft_cfg = gr.Textbox(
-                    label="FT Config", value="config_ft_unsupervised_ddp_embed.json")
-                cmp_xgb_embed_cfg = gr.Textbox(
-                    label="FT-Embed XGB Config", value="config_xgb_from_ft_unsupervised.json")
-                cmp_xgb_label_direct = gr.Textbox(
-                    label="Direct Label", value="XGB_raw")
-                cmp_xgb_label_ft = gr.Textbox(
-                    label="FT Label", value="XGB_ft_embed")
-                cmp_xgb_runtime = gr.Checkbox(
-                    label="Use Runtime FT Embedding", value=False)
-                cmp_xgb_bins = gr.Number(
-                    label="Bins Override", value=10, precision=0)
-                cmp_xgb_run_btn = gr.Button(
-                    "Run XGB Compare", variant="primary")
-                cmp_xgb_status = gr.Textbox(label="Status", interactive=False)
-                cmp_xgb_log = gr.Textbox(
-                    label="Logs", lines=15, max_lines=40, interactive=False)
-
-            with gr.Tab("Compare ResNet"):
-                cmp_resn_direct_cfg = gr.Textbox(
-                    label="Direct ResN Config", value="config_resn_direct.json")
-                cmp_resn_ft_cfg = gr.Textbox(
-                    label="FT Config", value="config_ft_unsupervised_ddp_embed.json")
-                cmp_resn_embed_cfg = gr.Textbox(
-                    label="FT-Embed ResN Config", value="config_resn_from_ft_unsupervised.json")
-                cmp_resn_label_direct = gr.Textbox(
-                    label="Direct Label", value="ResN_raw")
-                cmp_resn_label_ft = gr.Textbox(
-                    label="FT Label", value="ResN_ft_embed")
-                cmp_resn_runtime = gr.Checkbox(
-                    label="Use Runtime FT Embedding", value=False)
-                cmp_resn_bins = gr.Number(
-                    label="Bins Override", value=10, precision=0)
-                cmp_resn_run_btn = gr.Button(
-                    "Run ResNet Compare", variant="primary")
-                cmp_resn_status = gr.Textbox(label="Status", interactive=False)
-                cmp_resn_log = gr.Textbox(
-                    label="Logs", lines=15, max_lines=40, interactive=False)
-
         # Event handlers
+        set_working_dir_btn.click(
+            fn=_set_working_dir_ui,
+            inputs=[working_dir_input],
+            outputs=[
+                working_dir_status,
+                working_dir_input,
+                working_dir_browse_root,
+                working_dir_picker,
+            ],
+        )
+
+        refresh_working_dir_btn.click(
+            fn=_refresh_working_dir_choices_ui,
+            inputs=[working_dir_browse_root],
+            outputs=[working_dir_status, working_dir_picker],
+        )
+
+        use_selected_working_dir_btn.click(
+            fn=_set_working_dir_ui,
+            inputs=[working_dir_picker],
+            outputs=[
+                working_dir_status,
+                working_dir_input,
+                working_dir_browse_root,
+                working_dir_picker,
+            ],
+        )
+
+        working_dir_picker.change(
+            fn=lambda path: str(path or ""),
+            inputs=[working_dir_picker],
+            outputs=[working_dir_input],
+        )
+
         load_btn.click(
             fn=app.load_json_config,
             inputs=[json_file],
@@ -933,6 +1760,8 @@ def create_ui():
                 xgb_max_depth_max, xgb_n_estimators_max,
                 xgb_gpu_id, xgb_cleanup_per_fold, xgb_cleanup_synchronize,
                 xgb_use_dmatrix, xgb_chunk_size,
+                xgb_search_space_json, resn_search_space_json,
+                ft_search_space_json, ft_unsupervised_search_space_json,
                 ft_cleanup_per_fold, ft_cleanup_synchronize,
                 resn_cleanup_per_fold, resn_cleanup_synchronize,
                 resn_use_lazy_dataset, resn_predict_batch_size,
@@ -960,6 +1789,18 @@ def create_ui():
             outputs=[folder_status]
         )
 
+        workflow_load_btn.click(
+            fn=app.load_workflow_config,
+            inputs=[workflow_file],
+            outputs=[workflow_load_status, workflow_config_json]
+        )
+
+        workflow_run_btn.click(
+            fn=app.run_workflow_config_ui,
+            inputs=[workflow_config_json],
+            outputs=[workflow_status, workflow_log]
+        )
+
         prepare_step1_btn.click(
             fn=app.prepare_ft_step1,
             inputs=[config_json, ft_use_ddp, ft_nproc],
@@ -969,7 +1810,12 @@ def create_ui():
         prepare_step2_btn.click(
             fn=app.prepare_ft_step2,
             inputs=[gr.State(
-                lambda: app.current_step1_config or "temp_ft_step1_config.json"), target_models_input],
+                lambda: app.current_step1_config or "temp_ft_step1_config.json"),
+                target_models_input,
+                augmented_data_dir_input,
+                xgb_overrides_input,
+                resn_overrides_input,
+            ],
             outputs=[step2_status, xgb_config_display, resn_config_display]
         )
 
@@ -996,6 +1842,18 @@ def create_ui():
             outputs=[embed_status, embed_log]
         )
 
+        dl_run_btn.click(
+            fn=app.run_double_lift_ui,
+            inputs=[
+                dl_data_path, dl_pred_col_1, dl_pred_col_2, dl_target_col, dl_weight_col,
+                dl_n_bins, dl_label1, dl_label2,
+                dl_pred1_weighted, dl_pred2_weighted, dl_actual_weighted,
+                dl_holdout_ratio, dl_split_strategy, dl_split_group_col, dl_split_time_col,
+                dl_split_time_ascending, dl_rand_seed, dl_output_path
+            ],
+            outputs=[dl_status, dl_log]
+        )
+
         pred_run_btn.click(
             fn=app.run_predict_ui,
             inputs=[
@@ -1005,24 +1863,30 @@ def create_ui():
             outputs=[pred_status, pred_log]
         )
 
-        cmp_xgb_run_btn.click(
-            fn=app.run_compare_xgb_ui,
-            inputs=[
-                cmp_xgb_direct_cfg, cmp_xgb_ft_cfg, cmp_xgb_embed_cfg,
-                cmp_xgb_label_direct, cmp_xgb_label_ft,
-                cmp_xgb_runtime, cmp_xgb_bins
+        cmp_model_key.change(
+            fn=_suggest_compare_defaults,
+            inputs=[cmp_model_key],
+            outputs=[
+                cmp_direct_cfg,
+                cmp_embed_cfg,
+                cmp_label_direct,
+                cmp_label_ft,
             ],
-            outputs=[cmp_xgb_status, cmp_xgb_log]
         )
 
-        cmp_resn_run_btn.click(
-            fn=app.run_compare_resn_ui,
+        cmp_run_btn.click(
+            fn=app.run_compare_ui,
             inputs=[
-                cmp_resn_direct_cfg, cmp_resn_ft_cfg, cmp_resn_embed_cfg,
-                cmp_resn_label_direct, cmp_resn_label_ft,
-                cmp_resn_runtime, cmp_resn_bins
+                cmp_model_key,
+                cmp_direct_cfg,
+                cmp_ft_cfg,
+                cmp_embed_cfg,
+                cmp_label_direct,
+                cmp_label_ft,
+                cmp_runtime,
+                cmp_bins,
             ],
-            outputs=[cmp_resn_status, cmp_resn_log]
+            outputs=[cmp_status, cmp_log]
         )
 
     return demo

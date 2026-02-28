@@ -111,17 +111,13 @@ class FTTrainer(TrainerBase):
     def cross_val_unsupervised(self, trial: Optional[optuna.trial.Trial]) -> float:
         """Optuna objective A: minimize validation loss for masked reconstruction."""
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
-        param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {
-            "learning_rate": lambda t: t.suggest_float('learning_rate', 1e-5, 5e-3, log=True),
-            "d_model": lambda t: t.suggest_int('d_model', 16, 128, step=16),
-            "n_layers": lambda t: t.suggest_int('n_layers', 2, 8),
-            "dropout": lambda t: t.suggest_float('dropout', 0.0, 0.3),
-            "weight_decay": lambda t: t.suggest_float('weight_decay', 1e-6, 1e-2, log=True),
-            "mask_prob_num": lambda t: t.suggest_float('mask_prob_num', 0.05, 0.4),
-            "mask_prob_cat": lambda t: t.suggest_float('mask_prob_cat', 0.05, 0.4),
-            "num_loss_weight": lambda t: t.suggest_float('num_loss_weight', 0.25, 4.0, log=True),
-            "cat_loss_weight": lambda t: t.suggest_float('cat_loss_weight', 0.25, 4.0, log=True),
-        }
+        search_space = self._get_search_space_config("ft_unsupervised_search_space")
+        param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {}
+        param_space = self._augment_param_space_with_search_space(
+            model_key="ft_unsupervised",
+            param_space=param_space,
+            search_space=search_space,
+        )
 
         params: Optional[Dict[str, Any]] = None
         if self._distributed_forced_params is not None:
@@ -168,8 +164,8 @@ class FTTrainer(TrainerBase):
                 )
                 self._cv_geo_warned = True
 
-        d_model = int(params["d_model"])
-        n_layers = int(params["n_layers"])
+        d_model = int(params.get("d_model", 64))
+        n_layers = int(params.get("n_layers", 4))
         num_numeric_tokens = self._resolve_numeric_tokens()
         token_count = num_numeric_tokens + len(self.ctx.cate_list)
         if geo_train is not None:
@@ -231,29 +227,16 @@ class FTTrainer(TrainerBase):
         #   - Shrink search space to avoid oversized models.
         #   - Release GPU memory after each fold so the next trial can run.
         # Slightly shrink hyperparameter space to avoid oversized models.
-        param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {
-            "learning_rate": lambda t: t.suggest_float('learning_rate', 1e-5, 5e-4, log=True),
-            # "d_model": lambda t: t.suggest_int('d_model', 8, 64, step=8),
-            "d_model": lambda t: t.suggest_int('d_model', 16, 128, step=16),
-            "n_layers": lambda t: t.suggest_int('n_layers', 2, 8),
-            "dropout": lambda t: t.suggest_float('dropout', 0.0, 0.2),
-            "weight_decay": lambda t: t.suggest_float('weight_decay', 1e-6, 1e-2, log=True),
-        }
+        search_space = self._get_search_space_config("ft_search_space")
+        param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {}
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
-        if self.ctx.task_type == 'regression' and loss_name == 'tweedie':
-            param_space["tw_power"] = lambda t: t.suggest_float(
-                'tw_power', 1.0, 2.0)
         geo_enabled = bool(
             self.ctx.geo_token_cols or self._geo_feature_names())
-        if geo_enabled:
-            # Only tune GNN-related hyperparams when geo tokens are enabled.
-            param_space.update({
-                "geo_token_hidden_dim": lambda t: t.suggest_int('geo_token_hidden_dim', 16, 128, step=16),
-                "geo_token_layers": lambda t: t.suggest_int('geo_token_layers', 1, 4),
-                "geo_token_k_neighbors": lambda t: t.suggest_int('geo_token_k_neighbors', 5, 20),
-                "geo_token_dropout": lambda t: t.suggest_float('geo_token_dropout', 0.0, 0.3),
-                "geo_token_learning_rate": lambda t: t.suggest_float('geo_token_learning_rate', 1e-4, 5e-3, log=True),
-            })
+        param_space = self._augment_param_space_with_search_space(
+            model_key="ft",
+            param_space=param_space,
+            search_space=search_space,
+        )
 
         metric_ctx: Dict[str, Any] = {}
 
@@ -262,8 +245,8 @@ class FTTrainer(TrainerBase):
             return data[self.ctx.factor_nmes], data[self.ctx.resp_nme], data[self.ctx.weight_nme]
 
         def model_builder(params):
-            d_model = int(params["d_model"])
-            n_layers = int(params["n_layers"])
+            d_model = int(params.get("d_model", 64))
+            n_layers = int(params.get("n_layers", 4))
             num_numeric_tokens = self._resolve_numeric_tokens()
             token_count = num_numeric_tokens + len(self.ctx.cate_list)
             if geo_enabled:
@@ -300,11 +283,11 @@ class FTTrainer(TrainerBase):
                 d_model=d_model,
                 n_heads=adaptive_heads,
                 n_layers=n_layers,
-                dropout=params["dropout"],
+                dropout=float(params.get("dropout", 0.1)),
                 task_type=self.ctx.task_type,
                 epochs=self.ctx.epochs,
                 tweedie_power=tw_power,
-                learning_rate=params["learning_rate"],
+                learning_rate=float(params.get("learning_rate", 1e-3)),
                 patience=5,
                 weight_decay=float(params.get("weight_decay", 0.0)),
                 use_data_parallel=self._use_ft_data_parallel(),
@@ -315,8 +298,22 @@ class FTTrainer(TrainerBase):
                 distribution=getattr(self.ctx, "distribution", None),
             )
             model = self._apply_dataloader_overrides(model)
-            model.set_params({"_geo_params": geo_params_local}
-                             if geo_enabled else {})
+            handled_keys = {
+                "d_model",
+                "n_heads",
+                "n_layers",
+                "dropout",
+                "learning_rate",
+                "weight_decay",
+                "tw_power",
+            }
+            extra_params = {
+                key: value for key, value in params.items()
+                if key not in handled_keys and not key.startswith("geo_token_")
+            }
+            if extra_params:
+                model.set_params(extra_params)
+            model.set_params({"_geo_params": geo_params_local} if geo_enabled else {})
             return model
 
         def fit_predict(model, X_train, y_train, w_train, X_val, y_val, w_val, trial_obj):
