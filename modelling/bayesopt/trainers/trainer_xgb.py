@@ -570,9 +570,14 @@ class XGBTrainer(TrainerBase):
         # Avoid pruning away the full search budget when max_evals is tiny.
         return self._resolve_optuna_total_trials() > 2
 
+    def _sanitize_tuned_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep tuned params unchanged so XGBoost can surface unused-parameter warnings."""
+        return dict(params or {})
+
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best XGB parameters.")
+        tuned_best_params = self._sanitize_tuned_params(self.best_params)
         k = max(2, int(k))
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
         y_all = self.ctx.train_data[self.ctx.resp_nme].values
@@ -599,13 +604,13 @@ class XGBTrainer(TrainerBase):
             w_val = w_all[val_idx]
 
             clf = self._build_estimator()
-            clf.set_params(**self.best_params)
+            clf.set_params(**tuned_best_params)
             fit_kwargs = self._build_fit_kwargs(
                 w_train=w_train,
                 X_val=X_val,
                 y_val=y_val,
                 w_val=w_val,
-                n_estimators=self.best_params.get("n_estimators", 100),
+                n_estimators=tuned_best_params.get("n_estimators", 100),
             )
             clf.fit(X_train, y_train, **fit_kwargs)
 
@@ -640,6 +645,7 @@ class XGBTrainer(TrainerBase):
                 param_name=param_name,
                 spec=spec,
             )
+        params = self._sanitize_tuned_params(params)
 
         estimator_defaults = self._build_estimator().get_params()
         max_depth = int(params.get("max_depth", estimator_defaults.get("max_depth", 6)))
@@ -711,8 +717,9 @@ class XGBTrainer(TrainerBase):
     def train(self) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best XGB parameters.")
+        tuned_best_params = self._sanitize_tuned_params(self.best_params)
         self.model = self._build_estimator()
-        self.model.set_params(**self.best_params)
+        self.model.set_params(**tuned_best_params)
         use_refit = bool(getattr(self.ctx.config, "final_refit", True))
         predict_fn = None
         if self.ctx.task_type == 'classification':
@@ -737,13 +744,13 @@ class XGBTrainer(TrainerBase):
                 X_val=X_val,
                 y_val=y_val,
                 w_val=w_val,
-                n_estimators=self.best_params.get("n_estimators", 100),
+                n_estimators=tuned_best_params.get("n_estimators", 100),
             )
             self.model.fit(X_train, y_train, **fit_kwargs)
             best_iter = getattr(self.model, "best_iteration", None)
             if use_refit and best_iter is not None:
                 refit_model = self._build_estimator()
-                refit_params = dict(self.best_params)
+                refit_params = dict(tuned_best_params)
                 refit_params["n_estimators"] = int(best_iter) + 1
                 refit_model.set_params(**refit_params)
                 refit_kwargs = dict(self.ctx.fit_params or {})

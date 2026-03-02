@@ -89,6 +89,8 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type
+        configured_distribution = getattr(cfg, "distribution", None)
+        configured_loss_name = getattr(cfg, "loss_name", None)
         normalized_distribution = normalize_distribution_name(
             getattr(cfg, "distribution", None),
             self.task_type,
@@ -180,6 +182,18 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             self.obj = 'binary:logistic'
         else:  # regression task
             self.obj = resolve_xgb_objective(self.loss_name)
+        _log(
+            "[RunConfig] "
+            f"model={self.model_nme} "
+            f"task_type={self.task_type} "
+            f"distribution_cfg={configured_distribution!r} "
+            f"distribution_resolved={(self.distribution if self.distribution is not None else 'auto')!r} "
+            f"loss_name_cfg={configured_loss_name!r} "
+            f"loss_name_resolved={self.loss_name!r} "
+            f"xgb_objective={self.obj!r} "
+            f"ft_role={getattr(cfg, 'ft_role', None)!r}",
+            flush=True,
+        )
         self.fit_params = {
             'sample_weight': self.train_data[self.weight_nme].values
         }
