@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import hashlib
+import threading
+import warnings
 from typing import Optional, Tuple
 
 import numpy as np
@@ -12,6 +14,7 @@ _BIN_CACHE_MAXSIZE = 128
 _BIN_CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 _BIN_CACHE_HITS = 0
 _BIN_CACHE_MISSES = 0
+_BIN_CACHE_LOCK = threading.Lock()
 
 
 def _cache_key(series: pd.Series, n_bins: int, method: str) -> Optional[tuple]:
@@ -28,19 +31,21 @@ def _cache_key(series: pd.Series, n_bins: int, method: str) -> Optional[tuple]:
 
 def _cache_get(key: tuple) -> Optional[np.ndarray]:
     global _BIN_CACHE_HITS, _BIN_CACHE_MISSES
-    if key in _BIN_CACHE:
-        _BIN_CACHE_HITS += 1
-        _BIN_CACHE.move_to_end(key)
-        return _BIN_CACHE[key].copy()
-    _BIN_CACHE_MISSES += 1
-    return None
+    with _BIN_CACHE_LOCK:
+        if key in _BIN_CACHE:
+            _BIN_CACHE_HITS += 1
+            _BIN_CACHE.move_to_end(key)
+            return _BIN_CACHE[key].copy()
+        _BIN_CACHE_MISSES += 1
+        return None
 
 
 def _cache_set(key: tuple, edges: np.ndarray) -> None:
-    _BIN_CACHE[key] = np.asarray(edges, dtype=float)
-    _BIN_CACHE.move_to_end(key)
-    if len(_BIN_CACHE) > _BIN_CACHE_MAXSIZE:
-        _BIN_CACHE.popitem(last=False)
+    with _BIN_CACHE_LOCK:
+        _BIN_CACHE[key] = np.asarray(edges, dtype=float)
+        _BIN_CACHE.move_to_end(key)
+        if len(_BIN_CACHE) > _BIN_CACHE_MAXSIZE:
+            _BIN_CACHE.popitem(last=False)
 
 
 def bin_numeric(
@@ -122,9 +127,10 @@ def clear_binning_cache() -> None:
         >>> clear_binning_cache()
     """
     global _BIN_CACHE_HITS, _BIN_CACHE_MISSES
-    _BIN_CACHE.clear()
-    _BIN_CACHE_HITS = 0
-    _BIN_CACHE_MISSES = 0
+    with _BIN_CACHE_LOCK:
+        _BIN_CACHE.clear()
+        _BIN_CACHE_HITS = 0
+        _BIN_CACHE_MISSES = 0
 
 
 def get_cache_info() -> dict:
@@ -142,12 +148,13 @@ def get_cache_info() -> dict:
         >>> info = get_cache_info()
         >>> print(f"Cache hit rate: {info['hits'] / (info['hits'] + info['misses']):.2%}")
     """
-    return {
-        "hits": _BIN_CACHE_HITS,
-        "misses": _BIN_CACHE_MISSES,
-        "maxsize": _BIN_CACHE_MAXSIZE,
-        "currsize": len(_BIN_CACHE),
-    }
+    with _BIN_CACHE_LOCK:
+        return {
+            "hits": _BIN_CACHE_HITS,
+            "misses": _BIN_CACHE_MISSES,
+            "maxsize": _BIN_CACHE_MAXSIZE,
+            "currsize": len(_BIN_CACHE),
+        }
 
 
 def build_factor_table(
@@ -203,11 +210,20 @@ def build_factor_table(
                 "exposure": exposure,
             }
         )
-        grouped = data.groupby(bin_col, dropna=False).agg(
-            loss=("loss", "sum"),
-            exposure=("exposure", "sum"),
-            claim_count=("loss", "size"),
-        )
+        if weights is not None:
+            data["_weight"] = weights
+            grouped = data.groupby(bin_col, dropna=False).agg(
+                loss=("loss", "sum"),
+                exposure=("exposure", "sum"),
+                claim_count=("loss", "size"),
+                weighted_claim_count=("_weight", "sum"),
+            )
+        else:
+            grouped = data.groupby(bin_col, dropna=False).agg(
+                loss=("loss", "sum"),
+                exposure=("exposure", "sum"),
+                claim_count=("loss", "size"),
+            )
         grouped = grouped.reset_index()
         grouped["level"] = grouped[bin_col]
         if len(grouped) > 0 and pd.api.types.is_interval_dtype(grouped[bin_col]):
@@ -221,11 +237,20 @@ def build_factor_table(
                 "exposure": exposure,
             }
         )
-        grouped = data.groupby(factor_col, dropna=False).agg(
-            loss=("loss", "sum"),
-            exposure=("exposure", "sum"),
-            claim_count=("loss", "size"),
-        )
+        if weights is not None:
+            data["_weight"] = weights
+            grouped = data.groupby(factor_col, dropna=False).agg(
+                loss=("loss", "sum"),
+                exposure=("exposure", "sum"),
+                claim_count=("loss", "size"),
+                weighted_claim_count=("_weight", "sum"),
+            )
+        else:
+            grouped = data.groupby(factor_col, dropna=False).agg(
+                loss=("loss", "sum"),
+                exposure=("exposure", "sum"),
+                claim_count=("loss", "size"),
+            )
         grouped = grouped.reset_index()
         grouped["level"] = grouped[factor_col]
     else:
@@ -252,7 +277,17 @@ def build_factor_table(
     grouped["base_rate"] = float(base_rate)
     if "claim_count" not in grouped.columns:
         grouped["claim_count"] = 0
-    grouped["claim_count"] = grouped["claim_count"].astype(int)
+    grouped["record_count"] = pd.to_numeric(
+        grouped["claim_count"], errors="coerce"
+    ).fillna(0).astype(int)
+    if "weighted_claim_count" in grouped.columns:
+        grouped["weighted_claim_count"] = pd.to_numeric(
+            grouped["weighted_claim_count"], errors="coerce"
+        ).fillna(0.0)
+        # Keep claim_count aligned with weighted loss/exposure semantics.
+        grouped["claim_count"] = grouped["weighted_claim_count"]
+    else:
+        grouped["claim_count"] = grouped["record_count"].astype(float)
 
     if min_exposure is not None:
         low_exposure = grouped["exposure"] < float(min_exposure)
@@ -298,8 +333,36 @@ def apply_neighbor_smoothing(
     out = factor_table.copy()
     if "relativity" not in out.columns:
         raise ValueError("factor_table must include 'relativity'.")
+    order_col: Optional[str] = None
+    temp_order_col = "_neighbor_order"
+    level_col = out.get("level")
+
+    if {"bin_left", "bin_right"}.issubset(out.columns):
+        order_col = "bin_left"
+    elif "bin" in out.columns and pd.api.types.is_numeric_dtype(out["bin"]):
+        order_col = "bin"
+    elif level_col is not None and pd.api.types.is_interval_dtype(level_col):
+        out[temp_order_col] = level_col.apply(
+            lambda x: float(x.left) if pd.notna(x) else np.nan
+        )
+        order_col = temp_order_col
+    elif level_col is not None and pd.api.types.is_numeric_dtype(level_col):
+        order_col = "level"
+
+    if order_col is None:
+        warnings.warn(
+            "apply_neighbor_smoothing skipped: factor table has no natural ordering "
+            "(expected bin_left/bin_right or interval level).",
+            UserWarning,
+            stacklevel=2,
+        )
+        return out
+
+    out = out.sort_values(order_col)
     rel = pd.to_numeric(out["relativity"], errors="coerce").fillna(1.0)
     out["relativity"] = rel.rolling(window=window, center=True, min_periods=1).mean()
+    if temp_order_col in out.columns:
+        out = out.drop(columns=[temp_order_col])
     return out
 
 

@@ -179,15 +179,16 @@ def plot_curves_for_model(
             )
             for model_key in oneway_pred_models:
                 label, pred_nme = plot_model_labels[model_key]
-                if pred_nme not in model.train_data.columns:
+                resolved_pred = model.resolve_plot_prediction_column(pred_nme)
+                if resolved_pred not in model.train_data.columns:
                     print(
-                        f"[Oneway] Missing prediction column '{pred_nme}'; skip.",
+                        f"[Oneway] Missing prediction column '{resolved_pred}'; skip.",
                         flush=True,
                     )
                     continue
                 model.plot_oneway(
                     n_bins=n_bins,
-                    pred_col=pred_nme,
+                    pred_col=resolved_pred,
                     pred_label=label,
                     plot_subdir="oneway/post",
                 )

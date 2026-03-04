@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime
 import os
@@ -29,8 +30,10 @@ from ins_pricing.utils.losses import (
     resolve_tweedie_power,
     resolve_xgb_objective,
 )
+from ins_pricing.utils.safe_pickle import restricted_pickle_load
 
 _logger = get_logger("ins_pricing.modelling.bayesopt.core")
+_LEGACY_ALIASES_BOUND = False
 
 
 def _log(*args, **kwargs) -> None:
@@ -85,7 +88,9 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
             raise TypeError(
                 f"config must be a BayesOptConfig instance, got {type(config).__name__}"
             )
-        cfg = config
+        _ensure_legacy_trainer_aliases()
+        # Work on an internal copy so caller-provided config object is never mutated.
+        cfg = deepcopy(config)
         self.config = cfg
         self.model_nme = cfg.model_nme
         self.task_type = cfg.task_type
@@ -249,7 +254,7 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
                 f"preprocess bundle not found: {source}"
             )
         with source.open("rb") as fh:
-            payload = pickle.load(fh)
+            payload = restricted_pickle_load(fh)
         if not isinstance(payload, dict):
             raise TypeError(
                 f"Invalid preprocess bundle payload type: {type(payload).__name__}"
@@ -662,12 +667,25 @@ class BayesOptModel(BayesOptPlottingMixin, BayesOptExplainMixin):
         if study_name is None and trainer.best_trial is not None:
             study_obj = getattr(trainer.best_trial, "study", None)
             study_name = getattr(study_obj, "study_name", None)
+        try:
+            config_snapshot = asdict(self.config)
+        except Exception as exc:
+            _log(
+                f"[VersionManager] Failed to serialize config with asdict: {exc}. "
+                "Saving fallback config snapshot.",
+                flush=True,
+            )
+            config_snapshot = {
+                "model_nme": self.model_nme,
+                "task_type": self.task_type,
+                "error": f"asdict_failed: {type(exc).__name__}",
+            }
         snapshot = {
             "model_key": model_key,
             "timestamp": datetime.now().isoformat(),
             "best_params": trainer.best_params,
             "study_name": study_name,
-            "config": asdict(self.config),
+            "config": config_snapshot,
         }
         self.version_manager.save(f"{model_key}_best", snapshot)
 
@@ -883,4 +901,15 @@ def _bind_legacy_trainer_aliases() -> None:
         setattr(BayesOptModel, alias_name, _make_alias(model_key, trainer_attr))
 
 
-_bind_legacy_trainer_aliases()
+def _ensure_legacy_trainer_aliases() -> None:
+    global _LEGACY_ALIASES_BOUND
+    if _LEGACY_ALIASES_BOUND:
+        return
+    try:
+        _bind_legacy_trainer_aliases()
+        _LEGACY_ALIASES_BOUND = True
+    except Exception as exc:  # pragma: no cover - runtime fallback
+        _log(
+            f"[Compatibility] Failed to bind legacy trainer aliases: {exc}",
+            flush=True,
+        )

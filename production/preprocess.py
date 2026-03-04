@@ -41,6 +41,7 @@ import pandas as pd
 from sklearn.preprocessing import OneHotEncoder
 
 from ins_pricing.exceptions import DataValidationError, PreprocessingError
+from ins_pricing.utils.safe_pickle import restricted_pickle_load
 from ins_pricing.utils.validation import validate_column_types
 
 
@@ -629,7 +630,7 @@ class Preprocessor:
         obj = cls()
         if state_path.exists():
             with state_path.open("rb") as fh:
-                payload = pickle.load(fh)
+                payload = restricted_pickle_load(fh)
             if isinstance(payload, dict):
                 obj.__dict__.update(payload)
         return obj

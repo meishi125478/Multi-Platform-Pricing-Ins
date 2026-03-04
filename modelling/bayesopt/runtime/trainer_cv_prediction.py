@@ -19,6 +19,54 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerCVPredictionMixin:
+    def _classification_prediction_outputs(self) -> str:
+        cfg = getattr(self.ctx, "config", None)
+        raw = getattr(cfg, "classification_prediction_outputs", "score")
+        mode = str(raw or "score").strip().lower()
+        return mode if mode in {"score", "both"} else "score"
+
+    def _classification_label_threshold(self) -> float:
+        cfg = getattr(self.ctx, "config", None)
+        raw = getattr(cfg, "classification_label_threshold", 0.5)
+        try:
+            threshold = float(raw)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        return min(1.0, max(0.0, threshold))
+
+    def _derive_classification_labels(self, preds: Any) -> np.ndarray:
+        arr = np.asarray(preds)
+        threshold = self._classification_label_threshold()
+        if arr.ndim <= 1:
+            return (arr.reshape(-1) >= threshold).astype(int)
+        if arr.ndim == 2:
+            if arr.shape[1] == 1:
+                return (arr[:, 0] >= threshold).astype(int)
+            return np.argmax(arr, axis=1).astype(int)
+        raise ValueError(f"Unexpected classification prediction shape: {arr.shape}")
+
+    def _store_classification_label_predictions(
+        self,
+        pred_prefix: str,
+        preds_train: Any,
+        preds_test: Any,
+    ) -> None:
+        if str(getattr(self.ctx, "task_type", "")).lower() != "classification":
+            return
+        if self._classification_prediction_outputs() != "both":
+            return
+        label_col = f"pred_label_{pred_prefix}"
+        train_labels = self._derive_classification_labels(preds_train)
+        test_labels = self._derive_classification_labels(preds_test)
+        self.ctx.train_data[label_col] = train_labels
+        self.ctx.test_data[label_col] = test_labels
+        self.ctx.train_data[f"w_{label_col}"] = (
+            self.ctx.train_data[label_col] * self.ctx.train_data[self.ctx.weight_nme]
+        )
+        self.ctx.test_data[f"w_{label_col}"] = (
+            self.ctx.test_data[label_col] * self.ctx.test_data[self.ctx.weight_nme]
+        )
+
     def _clean_gpu(
         self,
         *,
@@ -59,7 +107,8 @@ class TrainerCVPredictionMixin:
         if len(X_all) < 10:
             return None
 
-        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        base_data = self.ctx.train_data.loc[X_all.index]
+        resolver = CVStrategyResolver(self.ctx.config, base_data, self.ctx.rand_seed)
         (train_idx, val_idx), _ = resolver.create_train_val_splitter(X_all, val_ratio)
         return train_idx, val_idx
 
@@ -72,7 +121,8 @@ class TrainerCVPredictionMixin:
         if sample_limit <= 0:
             return None
 
-        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        base_data = self.ctx.train_data.loc[X_all.index]
+        resolver = CVStrategyResolver(self.ctx.config, base_data, self.ctx.rand_seed)
         if not resolver.is_time_strategy():
             return None
 
@@ -92,7 +142,8 @@ class TrainerCVPredictionMixin:
         k: int,
     ) -> Tuple[Optional[Iterable[Tuple[np.ndarray, np.ndarray]]], int]:
         """Resolve K-fold splits for ensemble training based on configured CV strategy."""
-        resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+        base_data = self.ctx.train_data.loc[X_all.index]
+        resolver = CVStrategyResolver(self.ctx.config, base_data, self.ctx.rand_seed)
         return resolver.create_kfold_splitter(X_all, k)
 
     def cross_val_generic(
@@ -152,7 +203,8 @@ class TrainerCVPredictionMixin:
                 cv_splits = max(2, int(round(1 / val_ratio)))
             cv_splits = max(2, int(cv_splits))
 
-            resolver = CVStrategyResolver(self.ctx.config, self.ctx.train_data, self.ctx.rand_seed)
+            base_data = self.ctx.train_data.loc[X_all.index]
+            resolver = CVStrategyResolver(self.ctx.config, base_data, self.ctx.rand_seed)
             split_iter, actual_splits = resolver.create_cv_splitter(X_all, y_all, cv_splits, val_ratio)
             if actual_splits < 2:
                 raise ValueError("Not enough samples for cross-validation.")
@@ -255,6 +307,9 @@ class TrainerCVPredictionMixin:
         )
         if is_vector:
             self._assign_vector_predictions(pred_prefix, train_arr, test_arr)
+            self._store_classification_label_predictions(
+                pred_prefix, train_arr, test_arr
+            )
             return train_arr, test_arr
 
         col_name = f'pred_{pred_prefix}'
@@ -267,6 +322,9 @@ class TrainerCVPredictionMixin:
         self.ctx.test_data[f'w_{col_name}'] = (
             self.ctx.test_data[col_name] *
             self.ctx.test_data[self.ctx.weight_nme]
+        )
+        self._store_classification_label_predictions(
+            pred_prefix, train_arr, test_arr
         )
         return train_arr, test_arr
 
@@ -328,8 +386,11 @@ class TrainerCVPredictionMixin:
                     frame.to_csv(path, index=False)
                 else:
                     frame.to_parquet(path, index=False)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log(
+                    f"[PredictionCache] Failed to persist {path}: {exc}",
+                    flush=True,
+                )
 
     def _resolve_best_epoch(self,
                             history: Optional[Dict[str, List[float]]],

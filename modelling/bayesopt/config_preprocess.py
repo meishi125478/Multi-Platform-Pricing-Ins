@@ -285,6 +285,10 @@ class BayesOptConfig:
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"
+    classification_predict_api: str = "label"
+    classification_prediction_outputs: str = "score"
+    classification_plot_prediction: str = "score"
+    classification_label_threshold: float = 0.5
     dataloader_workers: Optional[int] = None
 
     # Nested configuration views (synced from flat fields in __post_init__).
@@ -564,6 +568,45 @@ class BayesOptConfig:
                 f"prediction_cache_format must be one of {valid_cache_formats}, "
                 f"got '{self.prediction_cache_format}'"
             )
+        valid_predict_api = {"label", "score"}
+        predict_api = str(self.classification_predict_api).strip().lower()
+        if predict_api not in valid_predict_api:
+            errors.append(
+                "classification_predict_api must be one of "
+                f"{valid_predict_api}, got '{self.classification_predict_api}'"
+            )
+        else:
+            self.classification_predict_api = predict_api
+        valid_pred_outputs = {"score", "both"}
+        pred_outputs = str(self.classification_prediction_outputs).strip().lower()
+        if pred_outputs not in valid_pred_outputs:
+            errors.append(
+                "classification_prediction_outputs must be one of "
+                f"{valid_pred_outputs}, got '{self.classification_prediction_outputs}'"
+            )
+        else:
+            self.classification_prediction_outputs = pred_outputs
+        valid_plot_pred = {"score", "label"}
+        plot_pred = str(self.classification_plot_prediction).strip().lower()
+        if plot_pred not in valid_plot_pred:
+            errors.append(
+                "classification_plot_prediction must be one of "
+                f"{valid_plot_pred}, got '{self.classification_plot_prediction}'"
+            )
+        else:
+            self.classification_plot_prediction = plot_pred
+        try:
+            label_threshold = float(self.classification_label_threshold)
+        except (TypeError, ValueError):
+            errors.append("classification_label_threshold must be a float in [0, 1].")
+        else:
+            if not (0.0 <= label_threshold <= 1.0):
+                errors.append(
+                    "classification_label_threshold must be in [0, 1], "
+                    f"got {label_threshold}"
+                )
+            else:
+                self.classification_label_threshold = label_threshold
 
         # Validate GNN memory settings
         if self.gnn_knn_gpu_mem_ratio <= 0 or self.gnn_knn_gpu_mem_ratio > 1.0:

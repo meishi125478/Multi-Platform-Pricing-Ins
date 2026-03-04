@@ -64,12 +64,21 @@ class _XGBDMatrixWrapper:
         *,
         task_type: str,
         use_gpu: bool,
+        classification_predict_api: str = "label",
+        classification_label_threshold: float = 0.5,
         chunk_size: Optional[int] = None,
         allow_cpu_fallback: bool = True,
     ) -> None:
         self.params = dict(params)
         self.task_type = task_type
         self.use_gpu = bool(use_gpu)
+        mode = str(classification_predict_api or "label").strip().lower()
+        self.classification_predict_api = mode if mode in {"label", "score"} else "label"
+        try:
+            threshold = float(classification_label_threshold)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        self.classification_label_threshold = min(1.0, max(0.0, threshold))
         self.chunk_size = self._coerce_chunk_size(chunk_size)
         self.allow_cpu_fallback = allow_cpu_fallback
         self._booster: Optional[xgb.Booster] = None
@@ -368,9 +377,15 @@ class _XGBDMatrixWrapper:
     def predict(self, X, **_kwargs) -> np.ndarray:
         pred = self._predict_raw(X)
         if self.task_type == "classification":
+            if self.classification_predict_api == "score":
+                if pred.ndim == 1:
+                    return pred
+                if pred.shape[1] == 2:
+                    return pred[:, 1]
+                return pred
             if pred.ndim == 1:
-                return (pred > 0.5).astype(int)
-            return np.argmax(pred, axis=1)
+                return (pred >= self.classification_label_threshold).astype(int)
+            return np.argmax(pred, axis=1).astype(int)
         return pred
 
     def predict_proba(self, X, **_kwargs) -> np.ndarray:
@@ -470,6 +485,12 @@ class XGBTrainer(TrainerBase):
                 params,
                 task_type=self.ctx.task_type,
                 use_gpu=use_gpu,
+                classification_predict_api=getattr(
+                    self.config, "classification_predict_api", "label"
+                ),
+                classification_label_threshold=getattr(
+                    self.config, "classification_label_threshold", 0.5
+                ),
                 chunk_size=chunk_size,
             )
         return self._build_sklearn_estimator(params)
@@ -673,17 +694,31 @@ class XGBTrainer(TrainerBase):
             elif loss_name == "gamma":
                 tweedie_variance_power = 2.0
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
-        y_all = self.ctx.train_data[self.ctx.resp_nme].values
-        w_all = self.ctx.train_data[self.ctx.weight_nme].values
+        y_all = self.ctx.train_data[self.ctx.resp_nme]
+        w_all = self.ctx.train_data[self.ctx.weight_nme]
+
+        ctx_config = getattr(self.ctx, "config", None)
+        cfg_limit = getattr(ctx_config, "bo_sample_limit", None)
+        if cfg_limit is not None:
+            cfg_limit = int(cfg_limit)
+            if 0 < cfg_limit < len(X_all):
+                sampled_idx = self._resolve_time_sample_indices(X_all, cfg_limit)
+                if sampled_idx is None:
+                    sampled_idx = X_all.sample(
+                        n=cfg_limit, random_state=self.ctx.rand_seed
+                    ).index
+                X_all = X_all.loc[sampled_idx]
+                y_all = y_all.loc[sampled_idx]
+                w_all = w_all.loc[sampled_idx]
 
         losses: List[float] = []
         for train_idx, val_idx in self.ctx.cv.split(X_all):
             X_train = X_all.iloc[train_idx]
-            y_train = y_all[train_idx]
-            w_train = w_all[train_idx]
+            y_train = y_all.iloc[train_idx].to_numpy(copy=False)
+            w_train = w_all.iloc[train_idx].to_numpy(copy=False)
             X_val = X_all.iloc[val_idx]
-            y_val = y_all[val_idx]
-            w_val = w_all[val_idx]
+            y_val = y_all.iloc[val_idx].to_numpy(copy=False)
+            w_val = w_all.iloc[val_idx].to_numpy(copy=False)
 
             clf = self._build_estimator()
             clf.set_params(**params)

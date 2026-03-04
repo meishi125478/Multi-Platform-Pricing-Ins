@@ -43,6 +43,32 @@ def _plot_skip(label: str) -> None:
 
 
 class BayesOptPlottingMixin:
+    def _classification_plot_prediction_mode(self) -> str:
+        cfg = getattr(self, "config", None)
+        raw = getattr(cfg, "classification_plot_prediction", "score")
+        mode = str(raw or "score").strip().lower()
+        return mode if mode in {"score", "label"} else "score"
+
+    def resolve_plot_prediction_column(self, base_col: Optional[str]) -> Optional[str]:
+        if not base_col:
+            return base_col
+        if str(getattr(self, "task_type", "")).lower() != "classification":
+            return base_col
+        if not str(base_col).startswith("pred_"):
+            return base_col
+        if self._classification_plot_prediction_mode() != "label":
+            return base_col
+        prefix = str(base_col)[len("pred_"):]
+        label_col = f"pred_label_{prefix}"
+        if label_col in self.train_data.columns:
+            return label_col
+        _log(
+            f"[Plot] classification_plot_prediction=label but '{label_col}' is missing; "
+            f"fallback to '{base_col}'.",
+            flush=True,
+        )
+        return base_col
+
     def plot_oneway(
         self,
         n_bins=10,
@@ -54,6 +80,7 @@ class BayesOptPlottingMixin:
         if plt is None and plot_diagnostics is None:
             _plot_skip("oneway plot")
             return
+        pred_col = self.resolve_plot_prediction_column(pred_col)
         if pred_col is not None and pred_col not in self.train_data.columns:
             _log(
                 f"[Oneway] Missing prediction column '{pred_col}'; skip predicted line.",
@@ -205,6 +232,7 @@ class BayesOptPlottingMixin:
             if model_label.startswith(k):
                 pred_nme = v
                 break
+        pred_nme = self.resolve_plot_prediction_column(pred_nme)
         safe_label = (
             str(model_label)
             .replace(" ", "_")
@@ -342,25 +370,26 @@ class BayesOptPlottingMixin:
             pred1 = None
             pred2 = None
 
-            pred1_col = f"pred_{name1}"
-            pred2_col = f"pred_{name2}"
+            pred1_col = self.resolve_plot_prediction_column(f"pred_{name1}")
+            pred2_col = self.resolve_plot_prediction_column(f"pred_{name2}")
             if pred1_col in data.columns:
                 pred1 = data[pred1_col].values
             else:
-                w_pred1_col = f"w_pred_{name1}"
+                w_pred1_col = f"w_{pred1_col}"
                 if w_pred1_col in data.columns:
                     pred1 = data[w_pred1_col].values / np.maximum(weight_vals, EPS)
 
             if pred2_col in data.columns:
                 pred2 = data[pred2_col].values
             else:
-                w_pred2_col = f"w_pred_{name2}"
+                w_pred2_col = f"w_{pred2_col}"
                 if w_pred2_col in data.columns:
                     pred2 = data[w_pred2_col].values / np.maximum(weight_vals, EPS)
 
             if pred1 is None or pred2 is None:
                 _log(
-                    f"Warning: missing pred_{name1}/pred_{name2} or w_pred columns in {data_name}. Skip plot.")
+                    f"Warning: missing '{pred1_col}'/'{pred2_col}' (or weighted variants) in "
+                    f"{data_name}. Skip plot.")
                 continue
 
             plot_curves.plot_double_lift_curve(

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +54,32 @@ class BayesOptRunnerHooks:
 
 def _create_ddp_barrier(dist_ctx: Any):
     """Create a DDP barrier function for distributed training synchronization."""
+
+    def _wait_with_deadline_fallback(
+        wait_fn: Callable[[], Any],
+        *,
+        timeout_seconds: int,
+        reason: str,
+    ) -> None:
+        done = threading.Event()
+        holder: Dict[str, Any] = {"exc": None}
+
+        def _target() -> None:
+            try:
+                wait_fn()
+            except BaseException as exc:  # pragma: no cover - passthrough guard
+                holder["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_target, daemon=True).start()
+        if not done.wait(timeout=max(1, int(timeout_seconds))):
+            raise TimeoutError(
+                f"DDP barrier timed out after {timeout_seconds}s during {reason} "
+                "(legacy wait() without timeout support)."
+            )
+        if holder["exc"] is not None:
+            raise holder["exc"]
 
     def _ddp_barrier(reason: str) -> None:
         if not getattr(dist_ctx, "is_distributed", False):
@@ -112,7 +139,11 @@ def _create_ddp_barrier(dist_ctx: Any):
                         try:
                             wait(timeout=timeout)
                         except TypeError:
-                            wait()
+                            _wait_with_deadline_fallback(
+                                wait,
+                                timeout_seconds=timeout_seconds,
+                                reason=reason,
+                            )
                     else:
                         dist.barrier()
                 else:
@@ -156,7 +187,14 @@ def _stream_random_split_csv(
             f"holdout_ratio must be in (0, 1) for streaming random split; got {holdout_ratio}."
     )
     chunk_size = max(1, int(chunksize))
-    rng = np.random.default_rng(rand_seed if rand_seed is not None else 13)
+    effective_seed = rand_seed if rand_seed is not None else 13
+    if rand_seed is None:
+        print(
+            "[WARNING] rand_seed is not set; streaming CSV split defaults to seed=13 "
+            "for reproducibility. Set rand_seed explicitly to control randomness.",
+            flush=True,
+        )
+    rng = np.random.default_rng(effective_seed)
     read_kwargs: Dict[str, Any] = {"low_memory": bool(low_memory), "chunksize": chunk_size}
     if usecols:
         read_kwargs["usecols"] = list(usecols)

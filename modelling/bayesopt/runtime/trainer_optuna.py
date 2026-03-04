@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 import os
 from pathlib import Path
+import threading
 from typing import Any, Callable, Dict, Optional
 
 import optuna
@@ -25,6 +26,33 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerOptunaMixin:
+    def _wait_with_deadline_fallback(
+        self,
+        wait_fn: Callable[[], Any],
+        *,
+        timeout_seconds: int,
+        reason: str,
+    ) -> None:
+        done = threading.Event()
+        holder: Dict[str, Any] = {"exc": None}
+
+        def _target() -> None:
+            try:
+                wait_fn()
+            except BaseException as exc:  # pragma: no cover - passthrough guard
+                holder["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_target, daemon=True).start()
+        if not done.wait(timeout=max(1, int(timeout_seconds))):
+            raise TimeoutError(
+                f"[DDP][{self.label}] barrier timed out after {timeout_seconds}s "
+                f"during {reason} (legacy wait() without timeout support)."
+            )
+        if holder["exc"] is not None:
+            raise holder["exc"]
+
     def _dist_barrier(self, reason: str) -> None:
         """DDP barrier wrapper used by distributed Optuna."""
         if dist is None:
@@ -71,7 +99,11 @@ class TrainerOptunaMixin:
                         try:
                             wait(timeout=timeout)
                         except TypeError:
-                            wait()
+                            self._wait_with_deadline_fallback(
+                                wait,
+                                timeout_seconds=timeout_seconds,
+                                reason=reason,
+                            )
                     else:
                         dist.barrier()
                 else:
