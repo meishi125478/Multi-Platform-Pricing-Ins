@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence, Union
 
 import pandas as pd
+
+_MODEL_FILE_SPEC = {
+    "xgb": ("Xgboost", "pkl"),
+    "glm": ("GLM", "pkl"),
+    "resn": ("ResNet", "pth"),
+    "ft": ("FTTransformer", "pth"),
+    "gnn": ("GNN", "pth"),
+}
 
 
 def _parse_csv_list(value: str) -> List[str]:
@@ -67,6 +75,111 @@ def _resolve_data_path(cfg: dict, cfg_path: Path, model_name: str) -> Path:
     data_path_template = cfg.get("data_path_template", "{model_name}.{ext}")
     filename = data_path_template.format(model_name=model_name, ext=data_format)
     return (cfg_path.parent / data_dir / filename).resolve()
+
+
+def _resolve_model_output_dir(path_value: Optional[str], label: str) -> Optional[Path]:
+    raw_val = str(path_value or "").strip()
+    if not raw_val:
+        return None
+    path_obj = Path(raw_val).resolve()
+    if not path_obj.exists():
+        raise FileNotFoundError(f"{label} not found: {path_obj}")
+    if path_obj.is_file():
+        if path_obj.parent.name.lower() == "model":
+            return path_obj.parent.parent.resolve()
+        return path_obj.parent.resolve()
+    return path_obj.resolve()
+
+
+def _model_artifact_filename(model_name: str, model_key: str) -> str:
+    spec = _MODEL_FILE_SPEC.get(str(model_key or "").strip().lower())
+    if spec is None:
+        raise ValueError(f"Unsupported model key for artifact lookup: {model_key!r}")
+    prefix, ext = spec
+    return f"01_{model_name}_{prefix}.{ext}"
+
+
+def _build_search_roots(*roots: Optional[Union[str, Path]]) -> List[Path]:
+    out: List[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if root is None:
+            continue
+        path_obj = Path(str(root)).expanduser().resolve()
+        key = str(path_obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path_obj)
+    return out
+
+
+def _discover_model_file(
+    *,
+    model_name: str,
+    model_key: str,
+    search_roots: Sequence[Path],
+    output_roots: Optional[Sequence[Path]] = None,
+) -> Optional[Path]:
+    filename = _model_artifact_filename(model_name, model_key)
+    candidates: List[Path] = []
+    seen: set[str] = set()
+
+    def _add_candidate(path_obj: Path) -> None:
+        try:
+            resolved = path_obj.resolve()
+        except OSError:
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        if not resolved.exists() or not resolved.is_file():
+            return
+        seen.add(key)
+        candidates.append(resolved)
+
+    for output_root in output_roots or []:
+        try:
+            root_obj = Path(output_root).resolve()
+        except OSError:
+            continue
+        _add_candidate(root_obj / "model" / filename)
+
+    for root in search_roots:
+        try:
+            root_obj = Path(root).resolve()
+        except OSError:
+            continue
+        if not root_obj.exists():
+            continue
+        if root_obj.is_file():
+            if root_obj.name == filename:
+                _add_candidate(root_obj)
+            continue
+        _add_candidate(root_obj / filename)
+        _add_candidate(root_obj / "model" / filename)
+        try:
+            for match in root_obj.glob(f"**/model/{filename}"):
+                _add_candidate(match)
+        except OSError:
+            pass
+        try:
+            for match in root_obj.glob(f"**/{filename}"):
+                _add_candidate(match)
+        except OSError:
+            pass
+
+    if not candidates:
+        return None
+
+    def _mtime_key(path_obj: Path) -> float:
+        try:
+            return float(path_obj.stat().st_mtime)
+        except OSError:
+            return 0.0
+
+    candidates.sort(key=_mtime_key, reverse=True)
+    return candidates[0]
 
 
 def _infer_categorical_features(

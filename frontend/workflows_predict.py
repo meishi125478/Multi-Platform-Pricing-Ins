@@ -4,11 +4,69 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import pandas as pd
 
 from ins_pricing.production.inference import load_predictor_from_config
+
+from .workflows_common import (
+    _build_search_roots,
+    _discover_model_file,
+    _resolve_model_output_dir,
+    _resolve_output_dir,
+)
+
+
+def _resolve_model_file_for_prediction(
+    *,
+    model_name: str,
+    model_key: str,
+    model_path: Optional[str],
+    label: str,
+    search_roots: Sequence[Path],
+    default_output_root: Optional[Path] = None,
+) -> Path:
+    raw_path = str(model_path or "").strip()
+
+    if raw_path:
+        candidate = Path(raw_path).resolve()
+        if not candidate.exists():
+            raise FileNotFoundError(f"{label} not found: {candidate}")
+        if candidate.is_file():
+            return candidate
+        discovered = _discover_model_file(
+            model_name=model_name,
+            model_key=model_key,
+            search_roots=[candidate],
+            output_roots=[candidate],
+        )
+        if discovered is None:
+            raise FileNotFoundError(
+                f"{label} is a directory but model artifact was not found under: {candidate}"
+            )
+        print(f"[Info] Found {model_key} model from directory override: {discovered}")
+        return discovered
+
+    discovered = _discover_model_file(
+        model_name=model_name,
+        model_key=model_key,
+        search_roots=search_roots,
+        output_roots=[default_output_root] if default_output_root is not None else None,
+    )
+    if discovered is not None:
+        print(f"[Info] Auto-discovered {model_key} model: {discovered}")
+        return discovered
+
+    expected = (
+        default_output_root / "model"
+        if default_output_root is not None
+        else Path("<search_roots>")
+    )
+    raise FileNotFoundError(
+        f"{label} not found. Expected model artifact under {expected} "
+        "or provide an explicit uploaded model file."
+    )
 
 
 def run_predict_ft_embed(
@@ -20,6 +78,10 @@ def run_predict_ft_embed(
     output_path: str,
     model_name: Optional[str],
     model_keys: str,
+    ft_model_path: Optional[str] = None,
+    xgb_model_path: Optional[str] = None,
+    resn_model_path: Optional[str] = None,
+    model_search_dir: Optional[str] = None,
 ) -> str:
     ft_cfg_path = Path(ft_cfg_path).resolve()
     xgb_cfg_path = Path(xgb_cfg_path).resolve() if xgb_cfg_path else None
@@ -45,10 +107,27 @@ def run_predict_ft_embed(
             raise ValueError("Set model_name when multiple models exist.")
         model_name = f"{model_list[0]}_{model_categories[0]}"
 
-    ft_output_dir = (ft_cfg_path.parent / ft_cfg["output_dir"]).resolve()
-    xgb_output_dir = (xgb_cfg_path.parent / xgb_cfg["output_dir"]).resolve() if xgb_cfg else None
+    ft_output_dir = Path(_resolve_output_dir(ft_cfg, ft_cfg_path)).resolve()
+    xgb_output_dir = (
+        Path(_resolve_output_dir(xgb_cfg, xgb_cfg_path)).resolve()
+        if xgb_cfg and xgb_cfg_path
+        else None
+    )
+    resn_output_dir = (
+        Path(_resolve_output_dir(resn_cfg, resn_cfg_path)).resolve()
+        if resn_cfg and resn_cfg_path
+        else None
+    )
     ft_prefix = ft_cfg.get("ft_feature_prefix", "ft_emb")
     xgb_task_type = str(xgb_cfg.get("task_type", "regression")) if xgb_cfg else None
+    search_roots = _build_search_roots(
+        model_search_dir,
+        ft_cfg_path.parent,
+        xgb_cfg_path.parent if xgb_cfg_path else None,
+        resn_cfg_path.parent if resn_cfg_path else None,
+        input_path.parent,
+        Path.cwd(),
+    )
 
     if ft_cfg.get("geo_feature_nmes"):
         raise ValueError("FT with geo tokens is not supported in this workflow.")
@@ -57,8 +136,15 @@ def run_predict_ft_embed(
     import joblib
 
     print("Loading FT model...")
-    ft_model_path = ft_output_dir / "model" / f"01_{model_name}_FTTransformer.pth"
-    ft_payload = torch.load(ft_model_path, map_location="cpu")
+    ft_model_file = _resolve_model_file_for_prediction(
+        model_name=model_name,
+        model_key="ft",
+        model_path=ft_model_path,
+        label="ft_model_path",
+        search_roots=search_roots,
+        default_output_root=ft_output_dir,
+    )
+    ft_payload = torch.load(ft_model_file, map_location="cpu")
     ft_model = ft_payload["model"] if isinstance(ft_payload, dict) and "model" in ft_payload else ft_payload
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,23 +163,28 @@ def run_predict_ft_embed(
     result = df_with_emb.copy()
 
     if "xgb" in keys:
-        if not xgb_cfg or not xgb_output_dir:
-            raise ValueError("xgb model selected but xgb_cfg_path is missing.")
-        xgb_model_path = xgb_output_dir / "model" / f"01_{model_name}_Xgboost.pkl"
-        xgb_payload = joblib.load(xgb_model_path)
+        xgb_model_file = _resolve_model_file_for_prediction(
+            model_name=model_name,
+            model_key="xgb",
+            model_path=xgb_model_path,
+            label="xgb_model_path",
+            search_roots=search_roots,
+            default_output_root=xgb_output_dir,
+        )
+        xgb_payload = joblib.load(xgb_model_file)
         if isinstance(xgb_payload, dict) and "model" in xgb_payload:
             xgb_model = xgb_payload["model"]
             feature_list = xgb_payload.get("preprocess_artifacts", {}).get("factor_nmes")
         else:
             xgb_model = xgb_payload
             feature_list = None
-        if not feature_list:
+        if not feature_list and xgb_cfg:
             feature_list = xgb_cfg.get("feature_list") or []
         if not feature_list:
             raise ValueError("Feature list missing for XGB model.")
 
         X = df_with_emb[feature_list]
-        if xgb_task_type == "classification" and hasattr(xgb_model, "predict_proba"):
+        if (xgb_task_type or "regression") == "classification" and hasattr(xgb_model, "predict_proba"):
             pred = xgb_model.predict_proba(X)[:, 1]
         else:
             pred = xgb_model.predict(X)
@@ -102,8 +193,23 @@ def run_predict_ft_embed(
     if "resn" in keys:
         if not resn_cfg_path:
             raise ValueError("resn model selected but resn_cfg_path is missing.")
+        resn_model_file = _resolve_model_file_for_prediction(
+            model_name=model_name,
+            model_key="resn",
+            model_path=resn_model_path,
+            label="resn_model_path",
+            search_roots=search_roots,
+            default_output_root=resn_output_dir,
+        )
+        resn_output_override = _resolve_model_output_dir(
+            str(resn_model_file),
+            "resolved_resn_model_path",
+        )
         resn_predictor = load_predictor_from_config(
-            resn_cfg_path, "resn", model_name=model_name
+            resn_cfg_path,
+            "resn",
+            model_name=model_name,
+            output_dir=resn_output_override,
         )
         pred_resn = resn_predictor.predict(df_with_emb)
         result["pred_resn"] = pred_resn

@@ -24,6 +24,10 @@ class ConfigBuilder:
             "split_group_col": None,
             "split_time_col": None,
             "split_time_ascending": True,
+            "train_data_path": None,
+            "test_data_path": None,
+            "split_cache_path": None,
+            "split_cache_force_rebuild": False,
             "cv_strategy": None,
             "cv_group_col": None,
             "cv_time_col": None,
@@ -42,6 +46,7 @@ class ConfigBuilder:
             "stream_split_csv": False,
             "stream_split_chunksize": 200000,
             "plot_curves": False,
+            "dataloader_workers": 0,
             "plot": {
                 "enable": False,
                 "n_bins": 10,
@@ -212,16 +217,28 @@ class ConfigBuilder:
         categorical_features: List[str],
         task_type: str = "regression",
         distribution: Optional[str] = None,
+        binary_resp_nme: Optional[str] = None,
         prop_test: float = 0.25,
         holdout_ratio: float = 0.25,
         val_ratio: float = 0.25,
         split_strategy: str = "random",
+        train_data_path: Optional[str] = None,
+        test_data_path: Optional[str] = None,
+        split_cache_path: Optional[str] = None,
+        split_cache_force_rebuild: bool = False,
         rand_seed: int = 13,
         epochs: int = 50,
         output_dir: str = "./Results",
         use_gpu: bool = True,
         model_keys: Optional[List[str]] = None,
         max_evals: int = 50,
+        build_oht: bool = True,
+        oht_sparse_csr: bool = True,
+        keep_unscaled_oht: bool = False,
+        plot_curves: bool = False,
+        infer_categorical_max_unique: int = 50,
+        infer_categorical_max_ratio: float = 0.05,
+        optuna_study_prefix: str = "pricing",
         xgb_max_depth_max: int = 25,
         xgb_n_estimators_max: int = 500,
         xgb_gpu_id: Optional[int] = None,
@@ -230,8 +247,20 @@ class ConfigBuilder:
         xgb_use_dmatrix: bool = True,
         xgb_chunk_size: Optional[int] = None,
         xgb_search_space: Optional[Dict[str, Any]] = None,
+        cache_predictions: bool = False,
+        prediction_cache_format: str = "parquet",
+        dataloader_workers: int = 0,
+        env: Optional[Dict[str, Any]] = None,
         stream_split_csv: bool = False,
         stream_split_chunksize: int = 200000,
+        use_resn_data_parallel: bool = False,
+        use_ft_data_parallel: bool = False,
+        use_gnn_data_parallel: bool = False,
+        use_resn_ddp: bool = True,
+        use_ft_ddp: bool = True,
+        ddp_min_rows: int = 50000,
+        ft_role: str = "model",
+        ft_feature_prefix: str = "ft_emb",
         ft_cleanup_per_fold: bool = False,
         ft_cleanup_synchronize: bool = False,
         ft_use_lazy_dataset: bool = True,
@@ -268,6 +297,10 @@ class ConfigBuilder:
             holdout_ratio: Holdout ratio for validation
             val_ratio: Validation ratio
             split_strategy: Strategy for splitting data
+            train_data_path: Optional path to pre-split training dataset
+            test_data_path: Optional path to pre-split validation dataset
+            split_cache_path: Optional .npz path to persist/reuse train/test split indices
+            split_cache_force_rebuild: Force regenerating split_cache_path even if it already exists
             rand_seed: Random seed for reproducibility
             epochs: Number of training epochs
             output_dir: Directory for output files
@@ -316,10 +349,15 @@ class ConfigBuilder:
             ft_search_space = {}
         if ft_unsupervised_search_space is None:
             ft_unsupervised_search_space = {}
+        if env is None:
+            env = {}
 
         config = self.default_config.copy()
 
         # Update with user-provided values
+        merged_env: Dict[str, Any] = dict(config.get("env", {}))
+        merged_env.update(env)
+
         config.update({
             "data_dir": data_dir,
             "model_list": model_list,
@@ -328,16 +366,28 @@ class ConfigBuilder:
             "weight": weight,
             "feature_list": feature_list,
             "categorical_features": categorical_features,
+            "binary_resp_nme": binary_resp_nme,
             "task_type": task_type,
             "distribution": distribution,
             "prop_test": prop_test,
             "holdout_ratio": holdout_ratio,
             "val_ratio": val_ratio,
             "split_strategy": split_strategy,
+            "train_data_path": train_data_path,
+            "test_data_path": test_data_path,
+            "split_cache_path": split_cache_path,
+            "split_cache_force_rebuild": bool(split_cache_force_rebuild),
             "rand_seed": rand_seed,
             "epochs": epochs,
             "output_dir": output_dir,
             "use_gpu": use_gpu,
+            "build_oht": build_oht,
+            "oht_sparse_csr": oht_sparse_csr,
+            "keep_unscaled_oht": keep_unscaled_oht,
+            "plot_curves": plot_curves,
+            "infer_categorical_max_unique": int(infer_categorical_max_unique),
+            "infer_categorical_max_ratio": float(infer_categorical_max_ratio),
+            "optuna_study_prefix": str(optuna_study_prefix or "pricing"),
             "xgb_max_depth_max": xgb_max_depth_max,
             "xgb_n_estimators_max": xgb_n_estimators_max,
             "xgb_gpu_id": xgb_gpu_id,
@@ -346,8 +396,20 @@ class ConfigBuilder:
             "xgb_use_dmatrix": xgb_use_dmatrix,
             "xgb_chunk_size": xgb_chunk_size,
             "xgb_search_space": xgb_search_space,
+            "cache_predictions": cache_predictions,
+            "prediction_cache_format": prediction_cache_format,
+            "dataloader_workers": int(dataloader_workers),
+            "env": merged_env,
             "stream_split_csv": stream_split_csv,
             "stream_split_chunksize": stream_split_chunksize,
+            "use_resn_data_parallel": use_resn_data_parallel,
+            "use_ft_data_parallel": use_ft_data_parallel,
+            "use_gnn_data_parallel": use_gnn_data_parallel,
+            "use_resn_ddp": use_resn_ddp,
+            "use_ft_ddp": use_ft_ddp,
+            "ddp_min_rows": int(ddp_min_rows),
+            "ft_role": ft_role,
+            "ft_feature_prefix": ft_feature_prefix,
             "ft_cleanup_per_fold": ft_cleanup_per_fold,
             "ft_cleanup_synchronize": ft_cleanup_synchronize,
             "ft_use_lazy_dataset": ft_use_lazy_dataset,
@@ -375,7 +437,7 @@ class ConfigBuilder:
             "model_keys": model_keys,
             "nproc_per_node": nproc_per_node,
             "max_evals": max_evals,
-            "plot_curves": False,
+            "plot_curves": plot_curves,
             "ft_role": None,
             "use_watchdog": False,
             "idle_seconds": 7200,

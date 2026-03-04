@@ -251,6 +251,101 @@ def _resolve_required_columns(
     return _dedupe_columns(cols)
 
 
+def _resolve_model_scoped_path(
+    value: Any,
+    *,
+    model_name: str,
+    base_dir: Path,
+    resolve_path: Callable[..., Optional[Path]],
+) -> Optional[Path]:
+    if value is None:
+        return None
+    candidate = value
+    if isinstance(value, dict):
+        candidate = value.get(model_name)
+        if candidate is None:
+            candidate = value.get("*")
+    if candidate is None:
+        return None
+    candidate_str = str(candidate).strip()
+    if not candidate_str:
+        return None
+    try:
+        candidate_str = candidate_str.format(model_name=model_name)
+    except Exception:
+        pass
+    return resolve_path(candidate_str, base_dir)
+
+
+def _write_split_cache(
+    path: Path,
+    *,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    row_count: int,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    payload_meta = json.dumps(meta or {}, ensure_ascii=True, sort_keys=True)
+    with tmp_path.open("wb") as f:
+        np.savez_compressed(
+            f,
+            train_idx=np.asarray(train_idx, dtype=np.int64),
+            test_idx=np.asarray(test_idx, dtype=np.int64),
+            row_count=np.asarray([int(row_count)], dtype=np.int64),
+            meta_json=np.asarray([payload_meta]),
+        )
+    tmp_path.replace(path)
+
+
+def _load_split_cache(path: Path) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    with np.load(path, allow_pickle=False) as payload:
+        if "train_idx" not in payload or "test_idx" not in payload:
+            raise ValueError(
+                f"split cache missing required arrays train_idx/test_idx: {path}"
+            )
+        train_idx = np.asarray(payload["train_idx"], dtype=np.int64).reshape(-1)
+        test_idx = np.asarray(payload["test_idx"], dtype=np.int64).reshape(-1)
+        row_count = -1
+        if "row_count" in payload:
+            row_count_arr = np.asarray(payload["row_count"], dtype=np.int64).reshape(-1)
+            if row_count_arr.size > 0:
+                row_count = int(row_count_arr[0])
+        meta: Dict[str, Any] = {}
+        if "meta_json" in payload:
+            try:
+                meta_arr = np.asarray(payload["meta_json"]).reshape(-1)
+                if meta_arr.size > 0:
+                    raw_json = str(meta_arr[0]).strip()
+                    if raw_json:
+                        meta = json.loads(raw_json)
+            except Exception:
+                meta = {}
+    return train_idx, test_idx, row_count, meta
+
+
+def _validate_split_indices(
+    *,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    row_count: int,
+    cache_path: Path,
+) -> None:
+    if row_count <= 0:
+        raise ValueError(f"Invalid row_count={row_count} for split cache: {cache_path}")
+    if train_idx.size == 0 or test_idx.size == 0:
+        raise ValueError(f"split cache has empty train/test indices: {cache_path}")
+    if np.any(train_idx < 0) or np.any(test_idx < 0):
+        raise ValueError(f"split cache contains negative row indices: {cache_path}")
+    if np.any(train_idx >= row_count) or np.any(test_idx >= row_count):
+        raise ValueError(
+            f"split cache row indices exceed dataset bounds row_count={row_count}: {cache_path}"
+        )
+    if np.intersect1d(train_idx, test_idx).size > 0:
+        raise ValueError(f"split cache contains overlapping train/test rows: {cache_path}")
+
+
 def _load_and_split_dataset(
     *,
     deps: BayesOptRunnerDeps,
@@ -266,7 +361,44 @@ def _load_and_split_dataset(
     split_group_col: Optional[str],
     split_time_col: Optional[str],
     split_time_ascending: bool,
+    train_data_path: Optional[Path],
+    test_data_path: Optional[Path],
+    split_cache_path: Optional[Path],
+    split_cache_force_rebuild: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    if (train_data_path is None) != (test_data_path is None):
+        raise ValueError(
+            "train_data_path and test_data_path must be set together when using pre-split data."
+        )
+    if train_data_path is not None and test_data_path is not None:
+        if not train_data_path.exists():
+            raise FileNotFoundError(f"Missing train_data_path: {train_data_path}")
+        if not test_data_path.exists():
+            raise FileNotFoundError(f"Missing test_data_path: {test_data_path}")
+        train_df = deps.load_dataset(
+            train_data_path,
+            data_format="auto",
+            dtype_map=dtype_map,
+            usecols=required_columns,
+            low_memory=False,
+        )
+        test_df = deps.load_dataset(
+            test_data_path,
+            data_format="auto",
+            dtype_map=dtype_map,
+            usecols=required_columns,
+            low_memory=False,
+        )
+        train_df = deps.coerce_dataset_types(train_df)
+        test_df = deps.coerce_dataset_types(test_df)
+        return train_df, test_df, int(len(train_df) + len(test_df))
+
+    strategy_norm = str(split_strategy or "random").strip().lower()
+    should_reset_index = strategy_norm in {"time", "timeseries", "temporal", "group", "grouped"}
+
+    if split_cache_path is not None and use_stream_split:
+        use_stream_split = False
+
     if use_stream_split:
         train_df, test_df, dataset_rows = _stream_random_split_csv(
             data_path,
@@ -287,20 +419,97 @@ def _load_and_split_dataset(
         usecols=required_columns,
         low_memory=False,
     )
-    train_df, test_df = deps.split_train_test(
-        raw,
-        holdout_ratio=holdout_ratio,
-        strategy=split_strategy,
-        group_col=split_group_col,
-        time_col=split_time_col,
-        time_ascending=split_time_ascending,
-        rand_seed=rand_seed,
-        reset_index_mode="time_group",
-        ratio_label="holdout_ratio",
-    )
+    dataset_rows = int(len(raw))
+    train_df: pd.DataFrame
+    test_df: pd.DataFrame
+    cache_loaded = False
+    if (
+        split_cache_path is not None
+        and split_cache_path.exists()
+        and not bool(split_cache_force_rebuild)
+    ):
+        train_idx, test_idx, cached_row_count, cache_meta = _load_split_cache(split_cache_path)
+        if cached_row_count > 0 and cached_row_count != dataset_rows:
+            raise ValueError(
+                f"split cache row_count mismatch for {split_cache_path}: "
+                f"cached={cached_row_count}, current={dataset_rows}. "
+                "Set split_cache_force_rebuild=true to regenerate."
+            )
+        cache_strategy = cache_meta.get("split_strategy")
+        cache_holdout = cache_meta.get("holdout_ratio")
+        cache_seed = cache_meta.get("rand_seed")
+        if cache_strategy is not None and str(cache_strategy).strip().lower() != strategy_norm:
+            raise ValueError(
+                f"split cache strategy mismatch for {split_cache_path}: "
+                f"cached={cache_strategy}, current={strategy_norm}. "
+                "Set split_cache_force_rebuild=true to regenerate."
+            )
+        if cache_holdout is not None:
+            if not np.isclose(float(cache_holdout), float(holdout_ratio)):
+                raise ValueError(
+                    f"split cache holdout_ratio mismatch for {split_cache_path}: "
+                    f"cached={cache_holdout}, current={holdout_ratio}. "
+                    "Set split_cache_force_rebuild=true to regenerate."
+                )
+        if cache_seed is not None and cache_seed != rand_seed:
+            raise ValueError(
+                f"split cache rand_seed mismatch for {split_cache_path}: "
+                f"cached={cache_seed}, current={rand_seed}. "
+                "Set split_cache_force_rebuild=true to regenerate."
+            )
+        _validate_split_indices(
+            train_idx=train_idx,
+            test_idx=test_idx,
+            row_count=dataset_rows,
+            cache_path=split_cache_path,
+        )
+        train_df = raw.iloc[train_idx]
+        test_df = raw.iloc[test_idx]
+        cache_loaded = True
+    else:
+        train_df, test_df = deps.split_train_test(
+            raw,
+            holdout_ratio=holdout_ratio,
+            strategy=split_strategy,
+            group_col=split_group_col,
+            time_col=split_time_col,
+            time_ascending=split_time_ascending,
+            rand_seed=rand_seed,
+            reset_index_mode="none",
+            ratio_label="holdout_ratio",
+        )
+        if split_cache_path is not None:
+            train_idx = np.asarray(train_df.index.to_numpy(), dtype=np.int64).reshape(-1)
+            test_idx = np.asarray(test_df.index.to_numpy(), dtype=np.int64).reshape(-1)
+            _validate_split_indices(
+                train_idx=train_idx,
+                test_idx=test_idx,
+                row_count=dataset_rows,
+                cache_path=split_cache_path,
+            )
+            _write_split_cache(
+                split_cache_path,
+                train_idx=train_idx,
+                test_idx=test_idx,
+                row_count=dataset_rows,
+                meta={
+                    "split_strategy": strategy_norm,
+                    "holdout_ratio": float(holdout_ratio),
+                    "rand_seed": rand_seed,
+                    "data_path": str(data_path),
+                },
+            )
+
+    if should_reset_index:
+        train_df = train_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+
     train_df = deps.coerce_dataset_types(train_df)
     test_df = deps.coerce_dataset_types(test_df)
-    dataset_rows = int(len(raw))
+    if cache_loaded and (train_df.empty or test_df.empty):
+        raise ValueError(
+            f"split cache produced empty train/test frame for dataset: {split_cache_path}"
+        )
     del raw
     return train_df, test_df, dataset_rows
 
@@ -442,6 +651,10 @@ def run_bayesopt_entry_training(
     ft_oof_folds = split_cfg["ft_oof_folds"]
     ft_oof_strategy = split_cfg["ft_oof_strategy"]
     ft_oof_shuffle = split_cfg["ft_oof_shuffle"]
+    train_data_path_cfg = split_cfg["train_data_path"]
+    test_data_path_cfg = split_cfg["test_data_path"]
+    split_cache_path_cfg = split_cfg["split_cache_path"]
+    split_cache_force_rebuild = split_cfg["split_cache_force_rebuild"]
     save_preprocess = runtime_cfg["save_preprocess"]
     preprocess_artifact_path = runtime_cfg["preprocess_artifact_path"]
     rand_seed = runtime_cfg["rand_seed"]
@@ -539,6 +752,40 @@ def run_bayesopt_entry_training(
                 f"[Data] projected column loading enabled: {len(required_columns)} columns",
                 flush=True,
             )
+        train_data_path = _resolve_model_scoped_path(
+            train_data_path_cfg,
+            model_name=model_name,
+            base_dir=config_path.parent,
+            resolve_path=deps.resolve_path,
+        )
+        test_data_path = _resolve_model_scoped_path(
+            test_data_path_cfg,
+            model_name=model_name,
+            base_dir=config_path.parent,
+            resolve_path=deps.resolve_path,
+        )
+        split_cache_path = _resolve_model_scoped_path(
+            split_cache_path_cfg,
+            model_name=model_name,
+            base_dir=config_path.parent,
+            resolve_path=deps.resolve_path,
+        )
+        if train_data_path is not None or test_data_path is not None:
+            print(
+                f"[Data] using pre-split data files: train={train_data_path}, test={test_data_path}",
+                flush=True,
+            )
+        if split_cache_path is not None:
+            cache_mode = "rebuild" if split_cache_force_rebuild else "reuse_or_create"
+            print(
+                f"[Data] split cache path enabled ({cache_mode}): {split_cache_path}",
+                flush=True,
+            )
+            if use_stream_split:
+                print(
+                    "[Data] split_cache_path is set; disabling stream_split_csv for stable split reuse.",
+                    flush=True,
+                )
 
         ddp_requested_by_config = bool(
             args.use_resn_ddp
@@ -601,6 +848,10 @@ def run_bayesopt_entry_training(
                     split_group_col=split_group_col,
                     split_time_col=split_time_col,
                     split_time_ascending=split_time_ascending,
+                    train_data_path=train_data_path,
+                    test_data_path=test_data_path,
+                    split_cache_path=split_cache_path,
+                    split_cache_force_rebuild=bool(split_cache_force_rebuild),
                 )
                 ddp_enabled = bool(
                     dist_active
@@ -655,6 +906,10 @@ def run_bayesopt_entry_training(
                     split_group_col=split_group_col,
                     split_time_col=split_time_col,
                     split_time_ascending=split_time_ascending,
+                    train_data_path=train_data_path,
+                    test_data_path=test_data_path,
+                    split_cache_path=split_cache_path,
+                    split_cache_force_rebuild=bool(split_cache_force_rebuild),
                 )
 
         use_resn_dp = bool((args.use_resn_dp or cfg.get(

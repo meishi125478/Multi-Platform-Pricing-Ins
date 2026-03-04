@@ -317,6 +317,10 @@ def resolve_split_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ft_oof_folds = cfg.get("ft_oof_folds")
     ft_oof_strategy = cfg.get("ft_oof_strategy")
     ft_oof_shuffle = cfg.get("ft_oof_shuffle", True)
+    train_data_path = cfg.get("train_data_path")
+    test_data_path = cfg.get("test_data_path")
+    split_cache_path = cfg.get("split_cache_path")
+    split_cache_force_rebuild = bool(cfg.get("split_cache_force_rebuild", False))
     return {
         "prop_test": prop_test,
         "holdout_ratio": holdout_ratio,
@@ -333,10 +337,22 @@ def resolve_split_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "ft_oof_folds": ft_oof_folds,
         "ft_oof_strategy": ft_oof_strategy,
         "ft_oof_shuffle": ft_oof_shuffle,
+        "train_data_path": train_data_path,
+        "test_data_path": test_data_path,
+        "split_cache_path": split_cache_path,
+        "split_cache_force_rebuild": split_cache_force_rebuild,
     }
 
 
 def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    rand_seed = cfg.get("rand_seed", 13)
+    if rand_seed is None:
+        rand_seed = 13
+    else:
+        try:
+            rand_seed = int(rand_seed)
+        except (TypeError, ValueError):
+            rand_seed = 13
     xgb_gpu_id = cfg.get("xgb_gpu_id")
     if isinstance(xgb_gpu_id, str) and xgb_gpu_id.strip() == "":
         xgb_gpu_id = None
@@ -355,7 +371,7 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "save_preprocess": bool(cfg.get("save_preprocess", False)),
         "preprocess_artifact_path": cfg.get("preprocess_artifact_path"),
-        "rand_seed": cfg.get("rand_seed", 13),
+        "rand_seed": rand_seed,
         "epochs": cfg.get("epochs", 50),
         "plot_path_style": cfg.get("plot_path_style"),
         "reuse_best_params": bool(cfg.get("reuse_best_params", False)),
