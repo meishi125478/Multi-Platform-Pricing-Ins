@@ -81,6 +81,17 @@ class _DummyTorchTrainer(TorchTrainerMixin):
     pass
 
 
+class _ToyDataset(torch.utils.data.Dataset):
+    def __init__(self, n_rows: int):
+        self._x = torch.zeros((n_rows, 4), dtype=torch.float32)
+
+    def __len__(self):
+        return int(self._x.shape[0])
+
+    def __getitem__(self, idx):
+        return self._x[idx]
+
+
 def test_ddp_num_workers_scales_by_world_size(monkeypatch):
     dummy = _DummyTorchTrainer()
     dummy.device = torch.device("cuda:0")
@@ -95,16 +106,6 @@ def test_ddp_num_workers_scales_by_world_size(monkeypatch):
 
 
 def test_ddp_memory_saving_forces_workers_zero(monkeypatch):
-    class _ToyDataset(torch.utils.data.Dataset):
-        def __init__(self, n_rows: int):
-            self._x = torch.zeros((n_rows, 4), dtype=torch.float32)
-
-        def __len__(self):
-            return int(self._x.shape[0])
-
-        def __getitem__(self, idx):
-            return self._x[idx]
-
     dummy = _DummyTorchTrainer()
     dummy.device = torch.device("cuda:0")
     dummy.is_ddp_enabled = True
@@ -132,6 +133,69 @@ def test_ddp_memory_saving_forces_workers_zero(monkeypatch):
     )
 
     assert dataloader.num_workers == 0
+
+
+def test_ddp_cuda_workers_auto_use_spawn_context(monkeypatch):
+    dummy = _DummyTorchTrainer()
+    dummy.device = torch.device("cuda:0")
+    dummy.is_ddp_enabled = True
+    dummy.world_size = 2
+    dummy.learning_rate = 1e-3
+    dummy.batch_num = 100
+    dummy.dataloader_workers = 2
+    dummy.resource_profile = "throughput"
+
+    monkeypatch.setattr(mixin_mod.os, "name", "posix", raising=False)
+    monkeypatch.setattr(mixin_mod.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(mixin_mod.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(mixin_mod.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(mixin_mod.torch.cuda, "is_available", lambda: False)
+
+    dataloader, _ = dummy._build_dataloader(
+        _ToyDataset(64),
+        N=64,
+        base_bs_gpu=(2048, 1024, 512),
+        base_bs_cpu=(256, 128),
+        min_bs=64,
+        target_effective_cuda=2048,
+        target_effective_cpu=1024,
+    )
+    mp_context = getattr(dataloader, "multiprocessing_context", None)
+    assert mp_context is not None
+    if hasattr(mp_context, "get_start_method"):
+        assert mp_context.get_start_method() == "spawn"
+
+
+def test_dataloader_context_override_uses_spawn(monkeypatch):
+    dummy = _DummyTorchTrainer()
+    dummy.device = torch.device("cuda:0")
+    dummy.is_ddp_enabled = True
+    dummy.world_size = 2
+    dummy.learning_rate = 1e-3
+    dummy.batch_num = 100
+    dummy.dataloader_workers = 2
+    dummy.dataloader_multiprocessing_context = "spawn"
+    dummy.resource_profile = "throughput"
+
+    monkeypatch.setattr(mixin_mod.os, "name", "posix", raising=False)
+    monkeypatch.setattr(mixin_mod.os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(mixin_mod.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(mixin_mod.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(mixin_mod.torch.cuda, "is_available", lambda: False)
+
+    dataloader, _ = dummy._build_dataloader(
+        _ToyDataset(64),
+        N=64,
+        base_bs_gpu=(2048, 1024, 512),
+        base_bs_cpu=(256, 128),
+        min_bs=64,
+        target_effective_cuda=2048,
+        target_effective_cpu=1024,
+    )
+    mp_context = getattr(dataloader, "multiprocessing_context", None)
+    assert mp_context is not None
+    if hasattr(mp_context, "get_start_method"):
+        assert mp_context.get_start_method() == "spawn"
 
 
 def test_gnn_trainer_disables_distributed_optuna(monkeypatch):

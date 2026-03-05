@@ -325,7 +325,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         self.use_lazy_dataset: bool = True
         self.predict_batch_size: Optional[int] = None
 
-    def _build_model(self, X_train):
+    def _fit_preprocessor(self, X_train) -> None:
+        """Fit normalization/category mappings on training data (CPU only)."""
         num_numeric = len(self.num_cols)
         cat_cardinalities = []
 
@@ -357,9 +358,16 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
 
         self.cat_cardinalities = cat_cardinalities
 
+    def _build_model_core(self) -> None:
+        """Build FT core model from fitted metadata and move to target device."""
+        if self.cat_cardinalities is None:
+            raise RuntimeError(
+                "cat_cardinalities is None. Call _fit_preprocessor(X_train) before building model."
+            )
+        num_numeric = len(self.num_cols)
         core = FTTransformerCore(
             num_numeric=num_numeric,
-            cat_cardinalities=cat_cardinalities,
+            cat_cardinalities=self.cat_cardinalities,
             d_model=self.d_model,
             n_heads=self.n_heads,
             n_layers=self.n_layers,
@@ -379,6 +387,11 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             fallback_log=_log,
         )
         self.ft = core.to(self.device)
+
+    def _build_model(self, X_train):
+        """Backward-compatible helper: fit preprocessors then build model."""
+        self._fit_preprocessor(X_train)
+        self._build_model_core()
 
     def _encode_cats(self, X):
         # Input DataFrame must include all categorical feature columns.
@@ -521,10 +534,10 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             X_val=None, y_val=None, w_val=None, trial=None,
             geo_train=None, geo_val=None):
 
-        # Build the underlying model on first fit.
+        # Prepare data mappings/statistics before creating DataLoader workers.
         self.num_geo = geo_train.shape[1] if geo_train is not None else 0
         if self.ft is None:
-            self._build_model(X_train)
+            self._fit_preprocessor(X_train)
 
         use_lazy = bool(getattr(self, "use_lazy_dataset", True))
         if use_lazy:
@@ -568,6 +581,9 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             target_effective_cuda=2048,
             target_effective_cpu=1024
         )
+
+        if self.ft is None:
+            self._build_model_core()
 
         if self.is_ddp_enabled and hasattr(dataloader.sampler, 'set_epoch'):
             self.dataloader_sampler = dataloader.sampler
@@ -667,7 +683,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         """Self-supervised pretraining via masked reconstruction (supports raw string categories)."""
         self.num_geo = geo_train.shape[1] if geo_train is not None else 0
         if self.ft is None:
-            self._build_model(X_train)
+            self._fit_preprocessor(X_train)
 
         X_num, X_cat, X_geo, _, _, _ = self._tensorize_split(
             X_train, None, None, geo_tokens=geo_train, allow_none=True)
@@ -686,8 +702,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         gen = torch.Generator()
         gen.manual_seed(13 + int(getattr(self, "rank", 0)))
 
-        base_model = self.ft.module if hasattr(self.ft, "module") else self.ft
-        cardinals = getattr(base_model, "cat_cardinalities", None) or []
+        cardinals = list(self.cat_cardinalities or [])
         unknown_idx = torch.tensor(
             [int(c) - 1 for c in cardinals], dtype=torch.long).view(1, -1)
 
@@ -739,6 +754,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             target_effective_cuda=2048,
             target_effective_cpu=1024
         )
+        if self.ft is None:
+            self._build_model_core()
         if self.is_ddp_enabled and hasattr(dataloader.sampler, 'set_epoch'):
             self.dataloader_sampler = dataloader.sampler
         else:

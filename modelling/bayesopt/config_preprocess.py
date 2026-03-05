@@ -158,6 +158,8 @@ class BayesOptConfig:
         build_oht: Whether to build one-hot encoded features (default True)
         oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
         keep_unscaled_oht: Keep unscaled one-hot copy in memory (default True)
+        dataloader_multiprocessing_context: Optional DataLoader multiprocessing start method
+            ('fork', 'spawn', or 'forkserver')
 
     Example:
         >>> config = BayesOptConfig(
@@ -290,6 +292,7 @@ class BayesOptConfig:
     classification_plot_prediction: str = "score"
     classification_label_threshold: float = 0.5
     dataloader_workers: Optional[int] = None
+    dataloader_multiprocessing_context: Optional[str] = None
 
     # Nested configuration views (synced from flat fields in __post_init__).
     _distributed: DistributedConfig = field(default_factory=DistributedConfig, init=False, repr=False)
@@ -421,6 +424,19 @@ class BayesOptConfig:
                     errors.append("dataloader_workers must be >= 0 when provided.")
             except (TypeError, ValueError):
                 errors.append("dataloader_workers must be an integer when provided.")
+        if self.dataloader_multiprocessing_context is not None:
+            if not isinstance(self.dataloader_multiprocessing_context, str):
+                errors.append(
+                    "dataloader_multiprocessing_context must be a string when provided."
+                )
+            else:
+                mp_ctx = self.dataloader_multiprocessing_context.strip().lower()
+                valid_mp = {"fork", "spawn", "forkserver"}
+                if mp_ctx not in valid_mp:
+                    errors.append(
+                        "dataloader_multiprocessing_context must be one of "
+                        f"{sorted(valid_mp)}, got {self.dataloader_multiprocessing_context!r}."
+                    )
         if not isinstance(self.keep_unscaled_oht, bool):
             errors.append("keep_unscaled_oht must be a boolean.")
         if not isinstance(self.oht_sparse_csr, bool):

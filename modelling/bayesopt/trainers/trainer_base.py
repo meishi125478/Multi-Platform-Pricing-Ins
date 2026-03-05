@@ -170,6 +170,9 @@ class TrainerBase(
         workers = getattr(cfg, "dataloader_workers", None)
         if workers is not None:
             model.dataloader_workers = int(workers)
+        mp_context = getattr(cfg, "dataloader_multiprocessing_context", None)
+        if mp_context is not None:
+            model.dataloader_multiprocessing_context = str(mp_context)
         profile = getattr(cfg, "resource_profile", None)
         if profile:
             model.resource_profile = str(profile)

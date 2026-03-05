@@ -277,6 +277,47 @@ class TorchTrainerMixin:
             worker_cap = min(worker_cap, 2)
         return worker_cap
 
+    def _resolve_dataloader_multiprocessing_context(
+        self,
+        *,
+        workers: int,
+        is_ddp: bool,
+        device_type: str,
+    ) -> Optional[str]:
+        """Resolve DataLoader multiprocessing context."""
+        if int(workers) <= 0:
+            return None
+
+        context = getattr(self, "dataloader_multiprocessing_context", None)
+        if context is None:
+            context = os.environ.get("BAYESOPT_DATALOADER_MP_CONTEXT")
+        if context is not None:
+            context = str(context).strip().lower()
+            if not context:
+                return None
+            valid = {"fork", "spawn", "forkserver"}
+            if context not in valid:
+                _log(
+                    f">>> DataLoader multiprocessing_context={context!r} is invalid; "
+                    f"expected one of {sorted(valid)}. Falling back to default."
+                )
+                return None
+            if os.name == "nt" and context != "spawn":
+                _log(
+                    f">>> DataLoader multiprocessing_context={context!r} is not supported on Windows; "
+                    "using 'spawn'."
+                )
+                return "spawn"
+            return context
+
+        if os.name != "nt" and is_ddp and device_type == "cuda" and workers > 0:
+            _log(
+                ">>> DataLoader safety: DDP + CUDA + workers>0 detected; "
+                "defaulting multiprocessing_context='spawn'."
+            )
+            return "spawn"
+        return None
+
     def _build_dataloader(self,
                           dataset,
                           N: int,
@@ -376,10 +417,15 @@ class TorchTrainerMixin:
         pin_memory = (device_type == 'cuda')
         if is_ddp and profile == "memory_saving" and workers > 0:
             pin_memory = False
+        mp_context = self._resolve_dataloader_multiprocessing_context(
+            workers=workers,
+            is_ddp=is_ddp,
+            device_type=device_type,
+        )
         _log(
             f">>> DataLoader config: Batch Size={batch_size}, Accum Steps={accum_steps}, "
             f"Workers={workers}, Prefetch={prefetch_factor or 'off'}, "
-            f"PinMemory={pin_memory}, Profile={profile}")
+            f"PinMemory={pin_memory}, MpContext={mp_context or 'default'}, Profile={profile}")
         sampler = None
         use_distributed_sampler = bool(
             dist.is_initialized() and getattr(self, "is_ddp_enabled", False)
@@ -390,36 +436,50 @@ class TorchTrainerMixin:
         else:
             shuffle = True
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent,
-            **({"prefetch_factor": prefetch_factor} if prefetch_factor is not None else {}),
-        )
+        dataloader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "sampler": sampler,
+            "num_workers": workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": persistent,
+        }
+        if prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = prefetch_factor
+        if mp_context is not None:
+            dataloader_kwargs["multiprocessing_context"] = mp_context
+
+        dataloader = DataLoader(dataset, **dataloader_kwargs)
         self.dataloader_sampler = sampler
         return dataloader, accum_steps
 
     def _build_val_dataloader(self, dataset, train_dataloader, accum_steps):
         """Build validation DataLoader."""
         profile = self._resolve_resource_profile()
+        device_type = self._device_type()
+        is_ddp = bool(getattr(self, "is_ddp_enabled", False))
         val_bs = accum_steps * train_dataloader.batch_size
         val_workers = self._resolve_num_workers(4, profile=profile)
         prefetch_factor = None
         if val_workers > 0:
             prefetch_factor = 2
-        return DataLoader(
-            dataset,
-            batch_size=val_bs,
-            shuffle=False,
-            num_workers=val_workers,
-            pin_memory=(self._device_type() == 'cuda'),
-            persistent_workers=(val_workers > 0 and profile != "memory_saving"),
-            **({"prefetch_factor": prefetch_factor} if prefetch_factor is not None else {}),
+        mp_context = self._resolve_dataloader_multiprocessing_context(
+            workers=val_workers,
+            is_ddp=is_ddp,
+            device_type=device_type,
         )
+        val_kwargs = {
+            "batch_size": val_bs,
+            "shuffle": False,
+            "num_workers": val_workers,
+            "pin_memory": (device_type == 'cuda'),
+            "persistent_workers": (val_workers > 0 and profile != "memory_saving"),
+        }
+        if prefetch_factor is not None:
+            val_kwargs["prefetch_factor"] = prefetch_factor
+        if mp_context is not None:
+            val_kwargs["multiprocessing_context"] = mp_context
+        return DataLoader(dataset, **val_kwargs)
 
     def _compute_losses(self, y_pred, y_true, apply_softplus: bool = False):
         """Compute per-sample losses based on task type."""

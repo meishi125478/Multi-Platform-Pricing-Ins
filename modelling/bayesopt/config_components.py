@@ -361,6 +361,7 @@ class TrainingConfig:
         reuse_best_params: Whether to reuse best params
         resn_weight_decay: Weight decay for ResNet
         bo_sample_limit: Sample limit for Bayesian optimization
+        dataloader_multiprocessing_context: Optional DataLoader multiprocessing start method
     """
 
     prop_test: float = 0.25
@@ -370,6 +371,7 @@ class TrainingConfig:
     reuse_best_params: bool = False
     resn_weight_decay: float = 1e-4
     bo_sample_limit: Optional[int] = None
+    dataloader_multiprocessing_context: Optional[str] = None
 
     @classmethod
     def from_flat_dict(cls, d: Dict[str, Any]) -> "TrainingConfig":
@@ -382,4 +384,5 @@ class TrainingConfig:
             reuse_best_params=bool(_value_or_default(d, "reuse_best_params", False)),
             resn_weight_decay=float(_value_or_default(d, "resn_weight_decay", 1e-4)),
             bo_sample_limit=d.get("bo_sample_limit"),
+            dataloader_multiprocessing_context=d.get("dataloader_multiprocessing_context"),
         )
