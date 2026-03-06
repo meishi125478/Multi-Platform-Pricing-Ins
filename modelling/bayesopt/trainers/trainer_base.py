@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig, OutputManager
+from ins_pricing.modelling.bayesopt.config_runtime import OutputManager
+from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
 from ins_pricing.modelling.bayesopt.runtime import (
     TrainerCVPredictionMixin,
     TrainerOptunaMixin,

@@ -44,6 +44,22 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
+import pandas as pd
+
+from ins_pricing.exceptions import DataValidationError
+from ins_pricing.utils.validation import (
+    validate_dataframe_not_empty,
+    validate_required_columns,
+)
+
+
+def _to_1d_numeric(values, *, name: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        raise DataValidationError(f"{name} must not be empty.")
+    if not np.isfinite(arr).all():
+        raise DataValidationError(f"{name} must not contain NaN/Inf.")
+    return arr
 
 
 def fit_calibration_factor(
@@ -107,12 +123,15 @@ def fit_calibration_factor(
         - Returns 1.0 (no adjustment) if predictions sum to zero or less
         - target_lr typically in range [0.5, 0.9] for insurance pricing
     """
-    pred = np.asarray(pred, dtype=float).reshape(-1)
-    actual = np.asarray(actual, dtype=float).reshape(-1)
+    pred = _to_1d_numeric(pred, name="pred")
+    actual = _to_1d_numeric(actual, name="actual")
+    if pred.shape[0] != actual.shape[0]:
+        raise DataValidationError("pred and actual must have the same length.")
+
     if weight is not None:
-        weight = np.asarray(weight, dtype=float).reshape(-1)
+        weight = _to_1d_numeric(weight, name="weight")
         if weight.shape[0] != pred.shape[0]:
-            raise ValueError("weight length must match pred length.")
+            raise DataValidationError("weight length must match pred length.")
         pred = pred * weight
         actual = actual * weight
 
@@ -159,43 +178,8 @@ def apply_calibration(pred: np.ndarray, factor: float) -> np.ndarray:
         - Relative ordering and ratios are preserved
         - Can be applied to any numeric predictions (premium, loss, pure premium)
     """
-    pred = np.asarray(pred, dtype=float)
+    pred = _to_1d_numeric(pred, name="pred")
     return pred * float(factor)
-
-
-def calibrate_multiplicative(
-    actual: np.ndarray,
-    predicted: np.ndarray,
-    weights: Optional[np.ndarray] = None,
-) -> float:
-    """Legacy alias: multiplicative calibration factor."""
-    return fit_calibration_factor(
-        pred=np.asarray(predicted, dtype=float),
-        actual=np.asarray(actual, dtype=float),
-        weight=None if weights is None else np.asarray(weights, dtype=float),
-    )
-
-
-def calibrate_additive(
-    actual: np.ndarray,
-    predicted: np.ndarray,
-    weights: Optional[np.ndarray] = None,
-) -> float:
-    """Legacy additive calibration adjustment."""
-    actual_arr = np.asarray(actual, dtype=float).reshape(-1)
-    pred_arr = np.asarray(predicted, dtype=float).reshape(-1)
-    if actual_arr.shape[0] != pred_arr.shape[0]:
-        raise ValueError("actual and predicted must have the same length.")
-    residual = actual_arr - pred_arr
-    if weights is None:
-        return float(np.mean(residual))
-    w = np.asarray(weights, dtype=float).reshape(-1)
-    if w.shape[0] != actual_arr.shape[0]:
-        raise ValueError("weights length must match actual/predicted length.")
-    total = float(np.sum(w))
-    if total <= 0:
-        return float(np.mean(residual))
-    return float(np.sum(w * residual) / total)
 
 
 def calibrate_by_segment(
@@ -207,14 +191,20 @@ def calibrate_by_segment(
     weight_col: Optional[str] = None,
 ):
     """Compute multiplicative calibration factors per segment."""
-    import pandas as pd
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    required_cols = [segment_col, actual_col, pred_col]
+    if weight_col:
+        required_cols.append(weight_col)
+    validate_required_columns(df, required_cols, df_name="df")
 
     rows = []
     for segment, group in df.groupby(segment_col, dropna=False):
-        factor = calibrate_multiplicative(
+        factor = fit_calibration_factor(
+            pred=group[pred_col].to_numpy(),
             actual=group[actual_col].to_numpy(),
-            predicted=group[pred_col].to_numpy(),
-            weights=group[weight_col].to_numpy() if weight_col else None,
+            weight=group[weight_col].to_numpy() if weight_col else None,
         )
         rows.append(
             {

@@ -38,3 +38,17 @@ class TestRateTableGeneration:
         )
 
         assert rate == 150
+
+    def test_compute_base_rate_zero_exposure_returns_nan(self):
+        """Base rate is undefined when total exposure is zero."""
+        from ins_pricing.pricing.rate_table import compute_base_rate
+
+        df = pd.DataFrame(
+            {
+                "loss": [100.0, 50.0],
+                "exposure": [0.0, 0.0],
+            }
+        )
+
+        rate = compute_base_rate(df, loss_col="loss", exposure_col="exposure")
+        assert np.isnan(rate)

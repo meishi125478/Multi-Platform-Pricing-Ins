@@ -6,12 +6,9 @@ from ins_pricing.utils.torch_compat import disable_torch_dynamo_if_requested
 
 disable_torch_dynamo_if_requested()
 
-from ins_pricing.modelling.bayesopt.config_preprocess import (
-    BayesOptConfig,
-    DatasetPreprocessor,
-    OutputManager,
-    VersionManager,
-)
+from ins_pricing.modelling.bayesopt.config_runtime import OutputManager, VersionManager
+from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
+from ins_pricing.modelling.bayesopt.dataset_preprocessor import DatasetPreprocessor
 from ins_pricing.modelling.bayesopt.core import BayesOptModel
 from ins_pricing.modelling.bayesopt.models import (
     FeatureTokenizer,

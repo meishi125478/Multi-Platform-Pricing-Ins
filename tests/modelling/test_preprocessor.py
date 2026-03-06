@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig, DatasetPreprocessor
+from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
+from ins_pricing.modelling.bayesopt.dataset_preprocessor import DatasetPreprocessor
 
 
 def _build_config(binary_resp: bool = False) -> BayesOptConfig:

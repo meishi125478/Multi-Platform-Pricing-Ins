@@ -43,7 +43,11 @@ _SAFE_EXACT_GLOBALS: Dict[str, Set[str]] = {
 _SAFE_PREFIXES: Tuple[str, ...] = (
     "numpy.",
     "pandas.",
-    "sklearn.preprocessing.",
+    "sklearn.",
+    "xgboost.",
+    "joblib.numpy_pickle.",
+    "joblib._memmapping_reducer.",
+    "scipy.sparse.",
 )
 
 

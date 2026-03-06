@@ -5,6 +5,12 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+from ins_pricing.exceptions import DataValidationError
+from ins_pricing.utils.numerics import safe_divide
+from ins_pricing.utils.validation import (
+    validate_dataframe_not_empty,
+    validate_required_columns,
+)
 
 
 def compute_base_rate(
@@ -15,16 +21,23 @@ def compute_base_rate(
     weight_col: Optional[str] = None,
 ) -> float:
     """Compute base rate as loss / exposure."""
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    required_cols = [loss_col, exposure_col]
+    if weight_col:
+        required_cols.append(weight_col)
+    validate_required_columns(df, required_cols, df_name="df")
+
     loss = df[loss_col].to_numpy(dtype=float, copy=False)
     exposure = df[exposure_col].to_numpy(dtype=float, copy=False)
     if weight_col and weight_col in df.columns:
         weight = df[weight_col].to_numpy(dtype=float, copy=False)
         loss = loss * weight
         exposure = exposure * weight
+    total_loss = float(np.sum(loss))
     total_exposure = float(np.sum(exposure))
-    if total_exposure <= 0:
-        return 0.0
-    return float(np.sum(loss) / total_exposure)
+    return safe_divide(total_loss, total_exposure, default=np.nan)
 
 
 def apply_factor_tables(
@@ -34,6 +47,10 @@ def apply_factor_tables(
     default_relativity: float = 1.0,
 ) -> np.ndarray:
     """Apply factor relativities and return a multiplicative factor."""
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+
     multiplier = np.ones(len(df), dtype=float)
     for factor, table in factor_tables.items():
         if factor not in df.columns:
@@ -55,6 +72,11 @@ def rate_premium(
     default_relativity: float = 1.0,
 ) -> np.ndarray:
     """Compute premium using base rate and factor tables."""
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    validate_required_columns(df, [exposure_col], df_name="df")
+
     exposure = df[exposure_col].to_numpy(dtype=float, copy=False)
     factors = apply_factor_tables(
         df, factor_tables, default_relativity=default_relativity

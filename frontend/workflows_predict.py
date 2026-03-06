@@ -13,6 +13,8 @@ from ins_pricing.production.inference import load_predictor_from_config
 from .workflows_common import (
     _build_search_roots,
     _discover_model_file,
+    _load_ft_embedding_model,
+    _load_pickled_model_payload,
     _resolve_model_output_dir,
     _resolve_output_dir,
 )
@@ -133,7 +135,6 @@ def run_predict_ft_embed(
         raise ValueError("FT with geo tokens is not supported in this workflow.")
 
     import torch
-    import joblib
 
     print("Loading FT model...")
     ft_model_file = _resolve_model_file_for_prediction(
@@ -144,8 +145,7 @@ def run_predict_ft_embed(
         search_roots=search_roots,
         default_output_root=ft_output_dir,
     )
-    ft_payload = torch.load(ft_model_file, map_location="cpu")
-    ft_model = ft_payload["model"] if isinstance(ft_payload, dict) and "model" in ft_payload else ft_payload
+    ft_model = _load_ft_embedding_model(ft_model_file)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if hasattr(ft_model, "device"):
@@ -171,7 +171,7 @@ def run_predict_ft_embed(
             search_roots=search_roots,
             default_output_root=xgb_output_dir,
         )
-        xgb_payload = joblib.load(xgb_model_file)
+        xgb_payload = _load_pickled_model_payload(xgb_model_file)
         if isinstance(xgb_payload, dict) and "model" in xgb_payload:
             xgb_model = xgb_payload["model"]
             feature_list = xgb_payload.get("preprocess_artifacts", {}).get("factor_nmes")

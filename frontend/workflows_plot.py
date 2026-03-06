@@ -21,16 +21,21 @@ from ins_pricing.production.inference import load_predictor_from_config
 from .workflows_common import (
     _build_search_roots,
     _dedupe_list,
-    _discover_model_file,
     _drop_duplicate_columns,
     _infer_categorical_features,
     _parse_csv_list,
-    _resolve_model_output_dir,
     _resolve_output_dir,
     _resolve_plot_path,
     _resolve_plot_style,
     _safe_tag,
 )
+from .workflows_prediction_utils import (
+    build_ft_embedding_frames,
+    load_raw_splits,
+    resolve_model_output_override,
+)
+
+PLOT_GRID_FIGSIZE = (11, 5)
 
 
 def _normalize_oneway_feature_override(raw_value: Any) -> List[str]:
@@ -188,74 +193,6 @@ def run_pre_oneway(
     return f"Saved {saved} plots to {out_dir}"
 
 
-def _load_split_frame(path_value: str, label: str) -> pd.DataFrame:
-    path_obj = Path(path_value).resolve()
-    if not path_obj.exists():
-        raise FileNotFoundError(f"{label} not found: {path_obj}")
-    frame = pd.read_csv(path_obj, low_memory=False)
-    frame = _drop_duplicate_columns(frame, label).reset_index(drop=True)
-    frame.fillna(0, inplace=True)
-    return frame
-
-
-def _load_raw_splits(
-    *,
-    split_cfg: dict,
-    data_cfg: dict,
-    data_cfg_path: Path,
-    model_name: str,
-    train_data_path: Optional[str],
-    test_data_path: Optional[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], bool]:
-    explicit_train_path = str(train_data_path or "").strip()
-    explicit_test_path = str(test_data_path or "").strip()
-    use_explicit_split = bool(explicit_train_path or explicit_test_path)
-
-    raw: Optional[pd.DataFrame] = None
-    if use_explicit_split:
-        train_raw = (
-            _load_split_frame(explicit_train_path, "train_raw")
-            if explicit_train_path
-            else pd.DataFrame()
-        )
-        test_raw = (
-            _load_split_frame(explicit_test_path, "test_raw")
-            if explicit_test_path
-            else pd.DataFrame()
-        )
-        if train_raw.empty and test_raw.empty:
-            raise ValueError("At least one of train_data_path/test_data_path must be provided.")
-    else:
-        raw_data_dir = (data_cfg_path.parent / data_cfg["data_dir"]).resolve()
-        raw_path = raw_data_dir / f"{model_name}.csv"
-        raw = pd.read_csv(raw_path, low_memory=False)
-        raw = _drop_duplicate_columns(raw, "raw").reset_index(drop=True)
-        raw.fillna(0, inplace=True)
-
-        holdout_ratio = split_cfg.get("holdout_ratio", split_cfg.get("prop_test", 0.25))
-        split_strategy = split_cfg.get("split_strategy", "random")
-        split_group_col = split_cfg.get("split_group_col")
-        split_time_col = split_cfg.get("split_time_col")
-        split_time_ascending = split_cfg.get("split_time_ascending", True)
-        rand_seed = split_cfg.get("rand_seed", 13)
-
-        train_raw, test_raw = split_train_test(
-            raw,
-            holdout_ratio=holdout_ratio,
-            strategy=split_strategy,
-            group_col=split_group_col,
-            time_col=split_time_col,
-            time_ascending=split_time_ascending,
-            rand_seed=rand_seed,
-            reset_index_mode="none",
-            ratio_label="holdout_ratio",
-        )
-        train_raw = _drop_duplicate_columns(train_raw, "train_raw")
-        test_raw = _drop_duplicate_columns(test_raw, "test_raw")
-
-    return train_raw, test_raw, raw, use_explicit_split
-
-
 def _run_prediction_plot_workflow(
     *,
     cfg: dict,
@@ -304,20 +241,14 @@ def _run_prediction_plot_workflow(
     raw_model_paths = {"xgb": xgb_model_path, "resn": resn_model_path}
     model_output_overrides: Dict[str, Optional[Path]] = {}
     for key in ("xgb", "resn"):
-        override = _resolve_model_output_dir(raw_model_paths.get(key), f"{key}_model_path")
-        if override is None:
-            discovered = _discover_model_file(
-                model_name=model_name,
-                model_key=key,
-                search_roots=search_roots,
-                output_roots=[output_dir_path_map[key]],
-            )
-            if discovered is not None:
-                override = _resolve_model_output_dir(
-                    str(discovered), f"auto_{key}_model_path"
-                )
-                print(f"[Info] Auto-discovered {key} model: {discovered}")
-        model_output_overrides[key] = override
+        model_output_overrides[key] = resolve_model_output_override(
+            model_name=model_name,
+            model_key=key,
+            model_path=raw_model_paths.get(key),
+            search_roots=search_roots,
+            output_root=output_dir_path_map[key],
+            label=f"{key}_model_path",
+        )
 
     def _load_predictor(model_cfg_path: Path, model_key: str):
         output_override = model_output_overrides.get(model_key)
@@ -422,7 +353,7 @@ def _run_prediction_plot_workflow(
             return
         output_root, plot_style = _get_plot_config(pred_key)
         style = PlotStyle()
-        fig, axes = plt.subplots(1, len(datasets), figsize=(11, 5))
+        fig, axes = plt.subplots(1, len(datasets), figsize=PLOT_GRID_FIGSIZE)
         if len(datasets) == 1:
             axes = [axes]
         for ax, (title, data) in zip(axes, datasets):
@@ -466,7 +397,7 @@ def _run_prediction_plot_workflow(
         and datasets
     ):
         style = PlotStyle()
-        fig, axes = plt.subplots(1, len(datasets), figsize=(11, 5))
+        fig, axes = plt.subplots(1, len(datasets), figsize=PLOT_GRID_FIGSIZE)
         if len(datasets) == 1:
             axes = [axes]
         for ax, (title, data) in zip(axes, datasets):
@@ -523,7 +454,7 @@ def run_plot_direct(
     resn_cfg = json.loads(resn_cfg_path.read_text(encoding="utf-8"))
 
     model_name = f"{cfg['model_list'][0]}_{cfg['model_categories'][0]}"
-    train_raw, test_raw, _raw, _ = _load_raw_splits(
+    train_raw, test_raw, _raw, _ = load_raw_splits(
         split_cfg=cfg,
         data_cfg=cfg,
         data_cfg_path=cfg_path,
@@ -600,14 +531,12 @@ def run_plot_embed(
         Path.cwd(),
     )
 
-    ft_output_dir = (ft_cfg_path.parent / ft_cfg["output_dir"]).resolve()
-    ft_prefix = ft_cfg.get("ft_feature_prefix", "ft_emb")
     raw_feature_list = _dedupe_list(ft_cfg.get("feature_list") or [])
     raw_categorical_features = _dedupe_list(ft_cfg.get("categorical_features") or [])
 
     if ft_cfg.get("geo_feature_nmes"):
         raise ValueError("FT inference with geo tokens is not supported in this workflow.")
-    train_raw, test_raw, raw, use_explicit_split = _load_raw_splits(
+    train_raw, test_raw, raw, use_explicit_split = load_raw_splits(
         split_cfg=cfg,
         data_cfg=ft_cfg,
         data_cfg_path=ft_cfg_path,
@@ -616,67 +545,20 @@ def run_plot_embed(
         test_data_path=test_data_path,
     )
 
-    if use_runtime_ft_embedding:
-        import torch
-
-        if ft_model_path and str(ft_model_path).strip():
-            ft_model_path_obj = Path(str(ft_model_path).strip()).resolve()
-        else:
-            default_ft_model_path = (
-                ft_output_dir / "model" / f"01_{model_name}_FTTransformer.pth"
-            )
-            discovered_ft_model = _discover_model_file(
-                model_name=model_name,
-                model_key="ft",
-                search_roots=search_roots,
-                output_roots=[ft_output_dir],
-            )
-            if discovered_ft_model is not None:
-                ft_model_path_obj = discovered_ft_model
-                print(f"[Info] Auto-discovered ft model: {discovered_ft_model}")
-            else:
-                ft_model_path_obj = default_ft_model_path
-        if not ft_model_path_obj.exists():
-            raise FileNotFoundError(f"FT model file not found: {ft_model_path_obj}")
-        ft_payload = torch.load(ft_model_path_obj, map_location="cpu")
-        ft_model = ft_payload["model"] if isinstance(ft_payload, dict) and "model" in ft_payload else ft_payload
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if hasattr(ft_model, "device"):
-            ft_model.device = device
-        if hasattr(ft_model, "to"):
-            ft_model.to(device)
-        if hasattr(ft_model, "ft"):
-            ft_model.ft.to(device)
-
-        emb_train = ft_model.predict(train_raw, return_embedding=True)
-        emb_cols = [f"pred_{ft_prefix}_{i}" for i in range(emb_train.shape[1])]
-        train_df = train_raw.copy()
-        train_df[emb_cols] = emb_train
-
-        emb_test = ft_model.predict(test_raw, return_embedding=True)
-        test_df = test_raw.copy()
-        test_df[emb_cols] = emb_test
-    else:
-        if use_explicit_split:
-            # Assume explicit split files are already compatible with downstream models.
-            train_df = train_raw.copy()
-            test_df = test_raw.copy()
-        else:
-            embed_data_dir = (cfg_path.parent / cfg["data_dir"]).resolve()
-            embed_path = embed_data_dir / f"{model_name}.csv"
-            embed_df = pd.read_csv(embed_path)
-            embed_df = _drop_duplicate_columns(embed_df, "embed").reset_index(drop=True)
-            embed_df.fillna(0, inplace=True)
-            if raw is None:
-                raise ValueError("Raw data unavailable for embedding alignment.")
-            if len(embed_df) != len(raw):
-                raise ValueError(
-                    f"Row count mismatch: raw={len(raw)}, embed={len(embed_df)}. "
-                    "Cannot align predictions to raw features."
-                )
-            train_df = embed_df.loc[train_raw.index].copy()
-            test_df = embed_df.loc[test_raw.index].copy()
+    train_df, test_df = build_ft_embedding_frames(
+        use_runtime_ft_embedding=use_runtime_ft_embedding,
+        train_raw=train_raw,
+        test_raw=test_raw,
+        raw=raw,
+        use_explicit_split=use_explicit_split,
+        model_name=model_name,
+        ft_cfg=ft_cfg,
+        ft_cfg_path=ft_cfg_path,
+        search_roots=search_roots,
+        ft_model_path=ft_model_path,
+        embed_cfg=cfg,
+        embed_cfg_path=cfg_path,
+    )
 
     feature_list = _dedupe_list(cfg.get("feature_list") or [])
     categorical_features = _dedupe_list(cfg.get("categorical_features") or [])

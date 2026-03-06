@@ -39,6 +39,7 @@ from ins_pricing.utils.numerics import (
     EPS,
     set_global_seed,
     compute_batch_size,
+    safe_divide,
     tweedie_loss,
 )
 
@@ -89,6 +90,7 @@ __all__ = [
     "EPS",
     "set_global_seed",
     "compute_batch_size",
+    "safe_divide",
     "tweedie_loss",
     # Features
     "infer_factor_and_cate_list",

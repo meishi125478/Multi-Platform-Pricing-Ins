@@ -16,6 +16,9 @@ from ins_pricing.production.scoring import (
 )
 from ins_pricing.utils.metrics import population_stability_index, psi_categorical
 
+DEFAULT_DRIFT_ALERT_THRESHOLD = 0.25
+HIGH_SEVERITY_PSI_THRESHOLD = 0.30
+
 
 def calculate_psi(expected, actual, *, buckets: int = 10) -> float:
     return float(
@@ -130,8 +133,13 @@ def validate_schema(df: pd.DataFrame, expected_schema: Dict[str, str]) -> bool:
     return True
 
 
-def generate_drift_alert(*, feature: str, psi: float, threshold: float = 0.25) -> dict:
-    if psi >= max(threshold, 0.3):
+def generate_drift_alert(
+    *,
+    feature: str,
+    psi: float,
+    threshold: float = DEFAULT_DRIFT_ALERT_THRESHOLD,
+) -> dict:
+    if psi >= max(threshold, HIGH_SEVERITY_PSI_THRESHOLD):
         severity = "high"
     elif psi >= threshold:
         severity = "medium"
@@ -170,11 +178,15 @@ def generate_performance_alert(
 
 
 def send_email(*args, **kwargs) -> None:  # pragma: no cover - integration hook
-    return None
+    raise NotImplementedError(
+        "send_email is an integration hook and must be implemented by deployment code."
+    )
 
 
 def log_to_monitoring_system(*args, **kwargs) -> None:  # pragma: no cover - integration hook
-    return None
+    raise NotImplementedError(
+        "log_to_monitoring_system is an integration hook and must be implemented by deployment code."
+    )
 
 
 def send_alert(alert: dict, *, recipients: Iterable[str]) -> None:
@@ -245,8 +257,14 @@ def monitor_batch(
         else:
             score = categorical_drift(reference_data[feature], production_data[feature])
         drift_scores[feature] = float(score)
-        if score >= 0.25:
-            alerts.append(generate_drift_alert(feature=feature, psi=score, threshold=0.25))
+        if score >= DEFAULT_DRIFT_ALERT_THRESHOLD:
+            alerts.append(
+                generate_drift_alert(
+                    feature=feature,
+                    psi=score,
+                    threshold=DEFAULT_DRIFT_ALERT_THRESHOLD,
+                )
+            )
 
     quality_checks = {"missing_values": check_missing_values(production_data)}
     return {

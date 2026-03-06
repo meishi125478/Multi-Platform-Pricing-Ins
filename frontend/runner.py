@@ -305,11 +305,6 @@ class TaskRunner:
         if self.task_thread and self.task_thread.is_alive():
             self.task_thread.join(timeout=5)
 
-
-# Backward compatibility aliases
-TrainingRunner = TaskRunner
-
-
 class StreamToLogger:
     """
     Fake file-like stream object that redirects writes to a logger instance.

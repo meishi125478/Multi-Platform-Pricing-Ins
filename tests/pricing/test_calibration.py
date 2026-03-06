@@ -20,30 +20,35 @@ def sample_model_predictions():
 class TestGlobalCalibration:
     """Test global calibration methods."""
 
-    def test_multiplicative_calibration(self, sample_model_predictions):
-        """Test multiplicative calibration factor."""
-        from ins_pricing.pricing.calibration import calibrate_multiplicative
+    def test_fit_calibration_factor(self, sample_model_predictions):
+        """Test multiplicative calibration factor fitting."""
+        from ins_pricing.pricing.calibration import fit_calibration_factor
 
-        calibration_factor = calibrate_multiplicative(
+        calibration_factor = fit_calibration_factor(
+            pred=sample_model_predictions["predicted_loss"],
             actual=sample_model_predictions["actual_loss"],
-            predicted=sample_model_predictions["predicted_loss"],
-            weights=sample_model_predictions["exposure"]
+            weight=sample_model_predictions["exposure"],
         )
 
         assert isinstance(calibration_factor, (int, float, np.number))
         assert calibration_factor > 0
 
-    def test_additive_calibration(self, sample_model_predictions):
-        """Test additive calibration adjustment."""
-        from ins_pricing.pricing.calibration import calibrate_additive
+    def test_apply_calibration(self, sample_model_predictions):
+        """Test applying a fitted calibration factor."""
+        from ins_pricing.pricing.calibration import apply_calibration, fit_calibration_factor
 
-        calibration_adjustment = calibrate_additive(
+        calibration_factor = fit_calibration_factor(
+            pred=sample_model_predictions["predicted_loss"],
             actual=sample_model_predictions["actual_loss"],
-            predicted=sample_model_predictions["predicted_loss"],
-            weights=sample_model_predictions["exposure"]
+            weight=sample_model_predictions["exposure"],
+        )
+        calibrated = apply_calibration(
+            sample_model_predictions["predicted_loss"],
+            calibration_factor,
         )
 
-        assert isinstance(calibration_adjustment, (int, float, np.number))
+        assert isinstance(calibrated, np.ndarray)
+        assert calibrated.shape[0] == sample_model_predictions.shape[0]
 
 
 class TestSegmentCalibration:

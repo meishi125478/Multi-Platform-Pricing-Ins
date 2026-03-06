@@ -11,6 +11,7 @@ from ins_pricing.utils.metrics import mae as _mae
 from ins_pricing.utils.metrics import mape as _mape
 from ins_pricing.utils.metrics import mse as _mse
 from ins_pricing.utils.metrics import r2_score as _r2_score
+from ins_pricing.utils.numerics import safe_divide
 
 
 def _to_1d(values, *, name: str) -> np.ndarray:
@@ -126,10 +127,9 @@ def loss_ratio(claims, premiums, exposure=None) -> float:
     if w is not None:
         y_claims = y_claims * w
         y_premiums = y_premiums * w
+    numer = float(np.sum(y_claims))
     denom = float(np.sum(y_premiums))
-    if denom <= 0:
-        return 0.0
-    return float(np.sum(y_claims) / denom)
+    return safe_divide(numer, denom, default=np.nan)
 
 
 def gini_coefficient(actual, predicted) -> float:

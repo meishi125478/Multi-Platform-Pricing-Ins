@@ -175,6 +175,18 @@ class TestInsuranceMetrics:
         assert isinstance(lr, (int, float, np.number))
         assert lr >= 0
 
+    def test_loss_ratio_zero_premium_returns_nan(self):
+        """Zero premium denominator should be surfaced as NaN (undefined)."""
+        from ins_pricing.production.scoring import loss_ratio
+
+        lr = loss_ratio(
+            claims=[100.0, 50.0],
+            premiums=[0.0, 0.0],
+            exposure=[1.0, 1.0],
+        )
+
+        assert np.isnan(lr)
+
     def test_gini_coefficient(self, sample_predictions):
         """Test Gini coefficient calculation."""
         from ins_pricing.production.scoring import gini_coefficient

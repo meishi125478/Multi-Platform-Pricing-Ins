@@ -42,7 +42,7 @@ from ins_pricing.cli.utils.bayesopt_runner_ui import (
     plot_curves_for_model,
     plot_loss_curve_for_trainer,
 )
-from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
+from ins_pricing.cli.utils.import_resolver import resolve_imports
 from ins_pricing.cli.utils.evaluation_context import TrainingContext
 from ins_pricing.modelling.bayesopt.runtime import (
     BayesOptRunnerDeps,
@@ -51,7 +51,6 @@ from ins_pricing.modelling.bayesopt.runtime import (
 )
 
 # Resolve all imports from a single location
-setup_sys_path()
 _imports = resolve_imports()
 
 ropt = _imports.bayesopt

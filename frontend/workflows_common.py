@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Union
+from typing import Any, Iterable, List, Optional, Sequence, Union
 
 import pandas as pd
 
@@ -180,6 +180,32 @@ def _discover_model_file(
 
     candidates.sort(key=_mtime_key, reverse=True)
     return candidates[0]
+
+
+def _load_ft_embedding_model(model_path: Path) -> Any:
+    """Load FT checkpoint for embedding inference using secure defaults."""
+    from ins_pricing.modelling.bayesopt.checkpoints import (
+        rebuild_ft_model_from_payload,
+    )
+    from ins_pricing.utils.model_loading import load_torch_payload
+
+    payload = load_torch_payload(
+        model_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    model, _best_params, kind = rebuild_ft_model_from_payload(payload=payload)
+    if kind == "raw":
+        raise ValueError(
+            f"Unsupported FT checkpoint format for secure loading: {model_path}"
+        )
+    return model
+
+
+def _load_pickled_model_payload(model_path: Path) -> Any:
+    from ins_pricing.utils.model_loading import load_pickle_artifact
+
+    return load_pickle_artifact(model_path)
 
 
 def _infer_categorical_features(

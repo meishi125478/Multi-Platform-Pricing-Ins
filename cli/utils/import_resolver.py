@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
-from ins_pricing.cli.utils.bootstrap import ensure_repo_root
-
 
 @dataclass
 class ResolvedImports:
@@ -336,13 +334,3 @@ def resolve_imports() -> ResolvedImports:
 
     return imports
 
-
-# Convenience function for backward compatibility
-def setup_sys_path() -> None:
-    """Ensure the repository root is in sys.path for imports."""
-    try:
-        if importlib.util.find_spec("ins_pricing") is not None:
-            return
-    except Exception:
-        pass
-    ensure_repo_root()

@@ -26,7 +26,6 @@ from ins_pricing.utils import (
 from ins_pricing.modelling.bayesopt.utils.distributed_utils import (
     DistributedUtils,
     TrainingUtils,
-    free_cuda,
 )
 
 # PyTorch training mixin
@@ -55,7 +54,6 @@ __all__ = [
     # Distributed
     'DistributedUtils',
     'TrainingUtils',
-    'free_cuda',
     # PyTorch
     'TorchTrainerMixin',
     'create_autocast_context',

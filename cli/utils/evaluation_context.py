@@ -221,68 +221,6 @@ class EvaluationContext:
     # Full config dict (for artifact collection)
     cfg: Dict[str, Any] = field(default_factory=dict)
 
-    @classmethod
-    def from_params(
-        cls,
-        model_name: str,
-        model_key: str,
-        cfg: Dict[str, Any],
-        data_path: Path,
-        data_fingerprint: Dict[str, Any],
-        run_id: str,
-        config_sha: str,
-        pred_col: str,
-        calibration_cfg: Dict[str, Any],
-        threshold_cfg: Dict[str, Any],
-        bootstrap_cfg: Dict[str, Any],
-        report_output_dir: Optional[str],
-        report_group_cols: Optional[List[str]],
-        report_time_col: Optional[str],
-        report_time_freq: str,
-        report_time_ascending: bool,
-        register_model: bool,
-        registry_path: Optional[str],
-        registry_tags: Dict[str, Any],
-        registry_status: str,
-        psi_report_df: Optional[pd.DataFrame] = None,
-    ) -> "EvaluationContext":
-        """Create from individual parameters (for backward compatibility)."""
-        task_type = str(cfg.get("task_type", "regression"))
-        version = f"{model_key}_{run_id}"
-
-        return cls(
-            identity=ModelIdentity(
-                model_name=model_name,
-                model_key=model_key,
-                version=version,
-                task_type=task_type,
-            ),
-            data_path=data_path,
-            data_fingerprint=DataFingerprint.from_dict(data_fingerprint),
-            config_sha=config_sha,
-            run_id=run_id,
-            pred_col=pred_col,
-            calibration=CalibrationConfig.from_dict(calibration_cfg),
-            threshold=ThresholdConfig.from_dict(threshold_cfg),
-            bootstrap=BootstrapConfig.from_dict(bootstrap_cfg),
-            report=ReportConfig(
-                output_dir=report_output_dir,
-                group_cols=report_group_cols,
-                time_col=report_time_col,
-                time_freq=report_time_freq,
-                time_ascending=report_time_ascending,
-            ),
-            registry=RegistryConfig(
-                register=register_model,
-                path=registry_path,
-                tags=registry_tags,
-                status=registry_status,
-            ),
-            psi_report_df=psi_report_df,
-            cfg=cfg,
-        )
-
-
 @dataclass
 class TrainingContext:
     """Context for distributed training orchestration."""

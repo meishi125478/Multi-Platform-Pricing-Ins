@@ -12,7 +12,7 @@ from ins_pricing.modelling.plotting.curves import (
     plot_pr_curves,
     plot_roc_curves,
 )
-from ins_pricing.modelling.plotting.compat import PlotUtils, plot_dlift_list, plot_lift_list
+from ins_pricing.modelling.plotting.plot_lists import plot_dlift_list, plot_lift_list
 from ins_pricing.modelling.plotting.diagnostics import plot_loss_curve, plot_oneway
 from ins_pricing.modelling.plotting.geo import (
     plot_geo_contour,
@@ -43,7 +43,6 @@ __all__ = [
     "plot_roc_curves",
     "plot_shap_importance",
     "shap_importance",
-    "PlotUtils",
     "plot_lift_list",
     "plot_dlift_list",
 ]

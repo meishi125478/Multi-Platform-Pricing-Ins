@@ -140,6 +140,26 @@ class TestDataCleaning:
 
         assert fixed['age'].dtype == np.int64
 
+    def test_prepare_raw_features_rejects_non_numeric_values(self):
+        """Numeric feature conversion should fail fast on invalid text values."""
+        from ins_pricing.production.preprocess import prepare_raw_features
+
+        raw = pd.DataFrame(
+            {
+                "age": ["25", "bad_input"],
+                "gender": ["M", "F"],
+            }
+        )
+        artifacts = {
+            "factor_nmes": ["age", "gender"],
+            "num_features": ["age"],
+            "cate_list": ["gender"],
+            "cat_categories": {"gender": ["M", "F"]},
+        }
+
+        with pytest.raises(DataValidationError):
+            prepare_raw_features(raw, artifacts)
+
 
 class TestFeatureSelection:
     """Test feature selection operations."""

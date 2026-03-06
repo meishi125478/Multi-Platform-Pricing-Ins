@@ -36,10 +36,14 @@ def _supports_weights_only() -> bool:
 def torch_load(
     path: Any,
     *args: Any,
-    weights_only: Optional[bool] = None,
+    weights_only: Optional[bool] = True,
     **kwargs: Any,
 ) -> Any:
-    """Load a torch artifact while handling 1.x/2.x API differences."""
+    """Load a torch artifact while handling 1.x/2.x API differences.
+
+    Uses secure weights-only mode by default when supported by the installed
+    torch runtime.
+    """
     if not TORCH_AVAILABLE:
         raise RuntimeError("torch is required to load model files.")
     if weights_only is not None and _supports_weights_only():
@@ -73,7 +77,7 @@ def disable_torch_dynamo_if_requested() -> None:
 
     try:
         import torch.optim.optimizer as optim_mod
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         return
 
     for name in ("state_dict", "load_state_dict", "zero_grad", "add_param_group"):

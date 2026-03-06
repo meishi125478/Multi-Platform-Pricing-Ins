@@ -2,36 +2,26 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
-import importlib.util
-import sys
+if __package__ in {None, ""}:
+    from _entry_bootstrap import ensure_repo_root  # type: ignore
+else:
+    from ._entry_bootstrap import ensure_repo_root
 
+ensure_repo_root(__file__, __package__)
 
-def _ensure_repo_root() -> None:
-    if __package__ not in {None, ""}:
-        return
-    if importlib.util.find_spec("ins_pricing") is not None:
-        return
-    bootstrap_path = Path(__file__).resolve().parents[1] / "utils" / "bootstrap.py"
-    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
-    if spec is None or spec.loader is None:
-        return
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.ensure_repo_root()
-
-
-_ensure_repo_root()
-
-from ins_pricing.cli.utils.notebook_utils import run_from_config, run_from_config_cli  # type: ignore
+if __package__ in {None, ""}:
+    from _config_runner import run_config, run_config_main  # type: ignore
+else:
+    from ._config_runner import run_config, run_config_main
 
 
 def run(config_json: str | Path) -> None:
     """Run explain by config.json (runner.mode=explain)."""
-    run_from_config(config_json)
+    run_config(config_json)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    run_from_config_cli(
+    run_config_main(
         "Explain_Run: run explain by config.json (runner.mode=explain).",
         argv,
     )

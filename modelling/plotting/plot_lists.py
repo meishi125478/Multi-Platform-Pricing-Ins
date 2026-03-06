@@ -88,7 +88,6 @@ def plot_lift_list(
     filename_prefix: str = "lift",
     style: Optional[PlotStyle] = None,
 ) -> List[plt.Figure]:
-    """Compatibility helper: plot multiple lift curves in one call."""
     if isinstance(data_or_preds, pd.DataFrame):
         df = data_or_preds
         pairs = _resolve_pred_pairs_from_df(df, pred_cols, pred_labels)
@@ -146,7 +145,6 @@ def plot_dlift_list(
     filename_prefix: str = "double_lift",
     style: Optional[PlotStyle] = None,
 ) -> List[plt.Figure]:
-    """Compatibility helper: plot double-lift curves for multiple model pairs."""
     if isinstance(data_or_preds, pd.DataFrame):
         df = data_or_preds
         pairs_list = _resolve_pred_pairs_from_df(df, pred_cols, pred_labels)
@@ -167,7 +165,7 @@ def plot_dlift_list(
     pair_labels: List[Tuple[str, str]] = []
     if pairs is None:
         for idx, first in enumerate(labels):
-            for second in labels[idx + 1 :]:
+            for second in labels[idx + 1:]:
                 pair_labels.append((first, second))
     else:
         for left, right in pairs:
@@ -212,17 +210,7 @@ def plot_dlift_list(
     return figs
 
 
-class PlotUtils:
-    """Compatibility wrapper for legacy plotting helpers."""
-
-    plot_lift_curve = staticmethod(plot_lift_curve)
-    plot_double_lift_curve = staticmethod(plot_double_lift_curve)
-    plot_lift_list = staticmethod(plot_lift_list)
-    plot_dlift_list = staticmethod(plot_dlift_list)
-
-
 __all__ = [
-    "PlotUtils",
     "plot_lift_list",
     "plot_dlift_list",
 ]

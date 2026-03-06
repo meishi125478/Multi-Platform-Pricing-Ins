@@ -100,12 +100,28 @@ def parse_model_pairs(raw_pairs: List) -> List[Tuple[str, str]]:
 # =============================================================================
 
 
-def resolve_path(value: Optional[str], base_dir: Path) -> Optional[Path]:
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_path(
+    value: Optional[str],
+    base_dir: Path,
+    *,
+    allow_absolute: bool = True,
+    allowed_roots: Optional[Sequence[Path]] = None,
+) -> Optional[Path]:
     """Resolve a path relative to a base directory.
 
     Args:
         value: Path string (absolute or relative)
         base_dir: Base directory for relative paths
+        allow_absolute: Whether absolute paths are accepted
+        allowed_roots: Optional whitelist roots for the resolved output path
 
     Returns:
         Resolved absolute Path, or None if value is None/empty
@@ -116,8 +132,16 @@ def resolve_path(value: Optional[str], base_dir: Path) -> Optional[Path]:
         return None
     p = Path(value)
     if p.is_absolute():
-        return p
-    return (base_dir / p).resolve()
+        if not allow_absolute:
+            raise ValueError(f"Absolute path is not allowed: {p}")
+        resolved = p.resolve()
+    else:
+        resolved = (base_dir / p).resolve()
+    if allowed_roots:
+        roots = [Path(root).resolve() for root in allowed_roots]
+        if not any(_is_relative_to(resolved, root) for root in roots):
+            raise ValueError(f"Resolved path is outside allowed roots: {resolved}")
+    return resolved
 
 
 def resolve_dir_path(

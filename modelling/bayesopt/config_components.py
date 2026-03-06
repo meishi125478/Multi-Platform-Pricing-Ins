@@ -22,6 +22,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+DEFAULT_GNN_APPROX_KNN_THRESHOLD = 50_000
+DEFAULT_GNN_MAX_GPU_KNN_NODES = 200_000
+DEFAULT_GNN_KNN_GPU_MEM_RATIO = 0.9
+DEFAULT_GNN_KNN_GPU_MEM_OVERHEAD = 2.0
+
 
 def _value_or_default(d: Dict[str, Any], key: str, default: Any) -> Any:
     value = d.get(key, default)
@@ -75,11 +80,11 @@ class GNNConfig:
     """
 
     use_approx_knn: bool = True
-    approx_knn_threshold: int = 50000
+    approx_knn_threshold: int = DEFAULT_GNN_APPROX_KNN_THRESHOLD
     graph_cache: Optional[str] = None
-    max_gpu_knn_nodes: int = 200000
-    knn_gpu_mem_ratio: float = 0.9
-    knn_gpu_mem_overhead: float = 2.0
+    max_gpu_knn_nodes: int = DEFAULT_GNN_MAX_GPU_KNN_NODES
+    knn_gpu_mem_ratio: float = DEFAULT_GNN_KNN_GPU_MEM_RATIO
+    knn_gpu_mem_overhead: float = DEFAULT_GNN_KNN_GPU_MEM_OVERHEAD
     max_fit_rows: Optional[int] = None
     max_predict_rows: Optional[int] = None
     predict_chunk_rows: Optional[int] = None
@@ -89,11 +94,35 @@ class GNNConfig:
         """Create from a flat dictionary with prefixed keys."""
         return cls(
             use_approx_knn=bool(_value_or_default(d, "gnn_use_approx_knn", True)),
-            approx_knn_threshold=int(_value_or_default(d, "gnn_approx_knn_threshold", 50000)),
+            approx_knn_threshold=int(
+                _value_or_default(
+                    d,
+                    "gnn_approx_knn_threshold",
+                    DEFAULT_GNN_APPROX_KNN_THRESHOLD,
+                )
+            ),
             graph_cache=d.get("gnn_graph_cache"),
-            max_gpu_knn_nodes=int(_value_or_default(d, "gnn_max_gpu_knn_nodes", 200000)),
-            knn_gpu_mem_ratio=float(_value_or_default(d, "gnn_knn_gpu_mem_ratio", 0.9)),
-            knn_gpu_mem_overhead=float(_value_or_default(d, "gnn_knn_gpu_mem_overhead", 2.0)),
+            max_gpu_knn_nodes=int(
+                _value_or_default(
+                    d,
+                    "gnn_max_gpu_knn_nodes",
+                    DEFAULT_GNN_MAX_GPU_KNN_NODES,
+                )
+            ),
+            knn_gpu_mem_ratio=float(
+                _value_or_default(
+                    d,
+                    "gnn_knn_gpu_mem_ratio",
+                    DEFAULT_GNN_KNN_GPU_MEM_RATIO,
+                )
+            ),
+            knn_gpu_mem_overhead=float(
+                _value_or_default(
+                    d,
+                    "gnn_knn_gpu_mem_overhead",
+                    DEFAULT_GNN_KNN_GPU_MEM_OVERHEAD,
+                )
+            ),
             max_fit_rows=d.get("gnn_max_fit_rows"),
             max_predict_rows=d.get("gnn_max_predict_rows"),
             predict_chunk_rows=d.get("gnn_predict_chunk_rows"),

@@ -18,6 +18,23 @@ EPS = 1e-8
 """Small epsilon value for numerical stability."""
 
 
+def safe_divide(
+    numerator: float,
+    denominator: float,
+    *,
+    default: float = np.nan,
+) -> float:
+    """Safely divide two numeric scalars.
+
+    Returns `default` when denominator is zero or either input is non-finite.
+    """
+    num = float(numerator)
+    den = float(denominator)
+    if not np.isfinite(num) or not np.isfinite(den) or den == 0.0:
+        return float(default)
+    return float(num / den)
+
+
 def set_global_seed(seed: int) -> None:
     """Set random seed for reproducibility across numpy/python/torch."""
     random.seed(seed)

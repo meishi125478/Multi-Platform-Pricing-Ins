@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional, Protocol, runtime_checkable
 
-from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig, OutputManager
+from ins_pricing.modelling.bayesopt.config_runtime import OutputManager
+from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
 
 
 @runtime_checkable

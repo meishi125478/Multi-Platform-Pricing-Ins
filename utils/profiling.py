@@ -365,17 +365,3 @@ def profile_training_epoch(
         if logger:
             logger.info(f"Epoch {epoch}: Performing periodic memory cleanup")
         cleanup_memory(logger)
-
-
-# Convenience function for backward compatibility
-def ensure_memory_cleanup(threshold_gb: float = 32.0) -> None:
-    """Check memory and cleanup if needed (simple function interface).
-
-    Args:
-        threshold_gb: Memory threshold in GB
-
-    Example:
-        >>> ensure_memory_cleanup(threshold_gb=16.0)
-    """
-    if check_memory_threshold(threshold_gb):
-        cleanup_memory()

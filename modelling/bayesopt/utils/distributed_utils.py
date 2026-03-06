@@ -3,12 +3,12 @@
 This module contains:
 - DistributedUtils for DDP setup and process coordination
 - TrainingUtils for CUDA memory management
-- free_cuda() for legacy compatibility
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from datetime import timedelta
 from typing import Optional
 
@@ -17,6 +17,7 @@ import torch.distributed as dist
 from ins_pricing.utils import GPUMemoryManager, get_logger, log_print
 
 _logger = get_logger("ins_pricing.modelling.bayesopt.utils.distributed_utils")
+_STATE_LOCK = threading.RLock()
 
 
 def _log(*args, **kwargs) -> None:
@@ -56,7 +57,8 @@ def _get_ddp_timeout() -> timedelta:
 def _cache_ddp_state(local_rank: int, rank: int, world_size: int) -> tuple:
     """Cache and return DDP state tuple."""
     state = (True, local_rank, rank, world_size)
-    DistributedUtils._cached_state = state
+    with _STATE_LOCK:
+        DistributedUtils._cached_state = state
     return state
 
 
@@ -80,13 +82,14 @@ class DistributedUtils:
         """
         # Return cached state if already initialized
         if dist.is_initialized():
-            if DistributedUtils._cached_state is None:
-                DistributedUtils._cached_state = _cache_ddp_state(
-                    int(os.environ.get("LOCAL_RANK", 0)),
-                    dist.get_rank(),
-                    dist.get_world_size(),
-                )
-            return DistributedUtils._cached_state
+            with _STATE_LOCK:
+                if DistributedUtils._cached_state is None:
+                    DistributedUtils._cached_state = _cache_ddp_state(
+                        int(os.environ.get("LOCAL_RANK", 0)),
+                        dist.get_rank(),
+                        dist.get_world_size(),
+                    )
+                return DistributedUtils._cached_state
 
         # Check for required environment variables
         if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
@@ -130,7 +133,8 @@ class DistributedUtils:
         """Destroy the DDP process group and clear cached state."""
         if dist.is_initialized():
             dist.destroy_process_group()
-        DistributedUtils._cached_state = None
+        with _STATE_LOCK:
+            DistributedUtils._cached_state = None
 
     @staticmethod
     def is_main_process():
@@ -171,11 +175,3 @@ class TrainingUtils:
         else:
             _log(">>> CUDA not available; cleanup skipped.")
 
-
-# Backward compatibility function wrapper
-def free_cuda(*, synchronize: bool = True, empty_cache: bool = True):
-    """Legacy function wrapper for CUDA memory cleanup.
-
-    This function calls TrainingUtils.free_cuda() for backward compatibility.
-    """
-    TrainingUtils.free_cuda(synchronize=synchronize, empty_cache=empty_cache)

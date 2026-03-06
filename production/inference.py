@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, TYPE_CHECKING
 
-import joblib
 import numpy as np
 import pandas as pd
 try:  # statsmodels is optional when GLM inference is not used
@@ -34,7 +33,10 @@ from ins_pricing.utils.losses import (
     resolve_effective_loss_name,
     resolve_tweedie_power,
 )
-from ins_pricing.utils.torch_compat import torch_load
+from ins_pricing.utils.model_loading import (
+    load_pickle_artifact,
+    load_torch_payload,
+)
 from ins_pricing.utils import get_logger, load_dataset
 
 _logger = get_logger("ins_pricing.production.inference")
@@ -184,9 +186,13 @@ def _load_preprocess_from_model_file(
     if not model_path.exists():
         return None
     if model_key in {"xgb", "glm"}:
-        payload = joblib.load(model_path)
+        payload = load_pickle_artifact(model_path)
     else:
-        payload = torch_load(model_path, map_location="cpu")
+        payload = load_torch_payload(
+            model_path,
+            map_location="cpu",
+            weights_only=True,
+        )
     if isinstance(payload, dict):
         return payload.get("preprocess_artifacts")
     return None
@@ -327,14 +333,17 @@ def load_saved_model(
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     if model_key in {"xgb", "glm"}:
-        payload = joblib.load(model_path)
+        payload = load_pickle_artifact(model_path)
         if isinstance(payload, dict) and "model" in payload:
             return payload.get("model")
         return payload
 
     if model_key == "ft":
-        payload = torch_load(
-            model_path, map_location="cpu", weights_only=False)
+        payload = load_torch_payload(
+            model_path,
+            map_location="cpu",
+            weights_only=True,
+        )
         return _load_ft_model_from_payload(
             payload=payload,
             cfg=cfg,
@@ -346,7 +355,11 @@ def load_saved_model(
     if model_key == "resn":
         if input_dim is None:
             raise ValueError("input_dim is required for ResNet loading")
-        payload = torch_load(model_path, map_location="cpu")
+        payload = load_torch_payload(
+            model_path,
+            map_location="cpu",
+            weights_only=True,
+        )
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
         params_fallback = load_best_params(output_dir, model_name, model_key)
         model, _resolved_params = rebuild_resn_model_from_payload(
@@ -369,7 +382,11 @@ def load_saved_model(
     if model_key == "gnn":
         if input_dim is None:
             raise ValueError("input_dim is required for GNN loading")
-        payload = torch_load(model_path, map_location="cpu")
+        payload = load_torch_payload(
+            model_path,
+            map_location="cpu",
+            weights_only=True,
+        )
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
         try:
             model, _params, _warning = rebuild_gnn_model_from_payload(

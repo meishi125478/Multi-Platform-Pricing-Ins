@@ -8,6 +8,11 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from ins_pricing.exceptions import DataValidationError
+from ins_pricing.utils.validation import (
+    validate_dataframe_not_empty,
+    validate_required_columns,
+)
 
 
 _BIN_CACHE_MAXSIZE = 128
@@ -74,6 +79,11 @@ def bin_numeric(
         When use_cache=True, identical distributions will reuse cached bin edges,
         improving performance when the same column is binned multiple times.
     """
+    if not isinstance(series, pd.Series):
+        raise DataValidationError("series must be a pandas Series.")
+    if len(series) == 0:
+        raise DataValidationError("series must not be empty.")
+
     method_norm = str(method).strip().lower()
     if method_norm == "equal_width":
         method_norm = "uniform"
@@ -177,6 +187,14 @@ def build_factor_table(
     - Numeric methods: ``quantile`` and ``equal_width``/``uniform``.
     - Categorical method: ``categorical``.
     """
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    required_cols = [factor_col, loss_col, exposure_col]
+    if weight_col:
+        required_cols.append(weight_col)
+    validate_required_columns(df, required_cols, df_name="df")
+
     if weight_col and weight_col in df.columns:
         weights = df[weight_col].to_numpy(dtype=float, copy=False)
     else:

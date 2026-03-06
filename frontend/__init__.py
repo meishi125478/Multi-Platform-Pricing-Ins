@@ -8,12 +8,11 @@ from __future__ import annotations
 
 from importlib import import_module
 
-__all__ = ["ConfigBuilder", "TaskRunner", "TrainingRunner", "FTWorkflowHelper"]
+__all__ = ["ConfigBuilder", "TaskRunner", "FTWorkflowHelper"]
 
 _LAZY_ATTRS = {
     "ConfigBuilder": ("ins_pricing.frontend.config_builder", "ConfigBuilder"),
     "TaskRunner": ("ins_pricing.frontend.runner", "TaskRunner"),
-    "TrainingRunner": ("ins_pricing.frontend.runner", "TrainingRunner"),
     "FTWorkflowHelper": ("ins_pricing.frontend.ft_workflow", "FTWorkflowHelper"),
 }
 

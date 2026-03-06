@@ -1,7 +1,7 @@
 import pytest
 
 from ins_pricing.exceptions import ConfigurationError
-from ins_pricing.modelling.bayesopt.config_preprocess import BayesOptConfig
+from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
 from ins_pricing.utils.losses import (
     normalize_distribution_name,
     resolve_effective_loss_name,

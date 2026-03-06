@@ -43,10 +43,28 @@ from sklearn.preprocessing import OneHotEncoder
 from ins_pricing.exceptions import DataValidationError, PreprocessingError
 from ins_pricing.utils.safe_pickle import restricted_pickle_load
 from ins_pricing.utils.validation import validate_column_types
+from ins_pricing.utils import get_logger
+
+_logger = get_logger("ins_pricing.production.preprocess")
 
 
-def _coerce_numeric(series: pd.Series, *, fill_value: float = 0.0) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(fill_value)
+def _coerce_numeric(
+    series: pd.Series,
+    *,
+    fill_value: float = 0.0,
+    strict: bool = False,
+    column_name: Optional[str] = None,
+) -> pd.Series:
+    converted = pd.to_numeric(series, errors="coerce")
+    if strict:
+        failed = series.notna() & converted.isna()
+        if failed.any():
+            sample_values = series.loc[failed].astype(str).head(5).tolist()
+            col = column_name or str(series.name or "<unknown>")
+            raise DataValidationError(
+                f"Column '{col}' contains non-numeric values that cannot be converted: {sample_values}"
+            )
+    return converted.fillna(fill_value)
 
 
 def _coerce_categorical(
@@ -122,7 +140,11 @@ def _one_hot_encode(
         cat_names = [str(name) for name in encoder.get_feature_names_out(cols)]
         cat_oht = pd.DataFrame(cat_array, index=df.index, columns=cat_names)
         return pd.concat([out_num, cat_oht], axis=1)
-    except Exception:
+    except (TypeError, ValueError, RuntimeError) as exc:
+        _logger.warning(
+            "Falling back to pandas.get_dummies after OneHotEncoder failure: %s",
+            exc,
+        )
         cat_oht = pd.get_dummies(
             out_cat,
             columns=cols,
@@ -203,7 +225,7 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
 
     This function performs initial data preparation:
     1. Ensures all required features exist (adds missing columns with NA)
-    2. Converts numeric features to numeric type (coercing errors to 0)
+    2. Converts numeric features to numeric type (invalid values raise validation errors)
     3. Converts categorical features to proper categorical type
     4. Applies category constraints from training data
 
@@ -218,7 +240,7 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
         - Numeric features as float64
         - Categorical features as object or Categorical
         - Missing columns filled with NA
-        - Invalid numeric values filled with 0
+        - Missing numeric values filled with 0
 
     Example:
         >>> raw_df = pd.DataFrame({
@@ -238,14 +260,24 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
         gender     category
         region     object
         >>> print(prepared['age'].tolist())
-        [25.0, 30.0, 0.0]  # 'invalid' coerced to 0
+        [25.0, 30.0, 0.0]  # only missing values are filled with 0
 
     Note:
         - Missing numeric values are filled with 0 (not NaN)
+        - Non-numeric values in numeric columns raise DataValidationError
         - Unknown categories are kept as-is (handled later in one-hot encoding)
         - Extra columns in input df are dropped
     """
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    if len(df) == 0:
+        raise DataValidationError("df must not be empty.")
+    if not isinstance(artifacts, dict):
+        raise DataValidationError("artifacts must be a dictionary.")
+
     factor_nmes = list(artifacts.get("factor_nmes") or [])
+    if not factor_nmes:
+        raise DataValidationError("artifacts.factor_nmes is empty or missing.")
     cate_list = list(artifacts.get("cate_list") or [])
     num_features = set(artifacts.get("num_features") or [])
     cat_categories = artifacts.get("cat_categories") or {}
@@ -257,7 +289,12 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
 
     for col in factor_nmes:
         if col in num_features:
-            work[col] = _coerce_numeric(work[col], fill_value=0.0)
+            work[col] = _coerce_numeric(
+                work[col],
+                fill_value=0.0,
+                strict=True,
+                column_name=col,
+            )
         else:
             cats = cat_categories.get(col)
             category_list = cats if isinstance(cats, list) and cats else None

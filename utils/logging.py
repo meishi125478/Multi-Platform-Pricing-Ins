@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from functools import lru_cache
 from typing import Optional, Union
 
 _DEFAULT_HANDLER_FLAG = "_ins_pricing_default_handler"
+_SYNC_LOCK = threading.Lock()
 
 
 @lru_cache(maxsize=1)
@@ -38,31 +40,33 @@ def _sync_package_logger(logger: logging.Logger) -> None:
     - If root logger is not configured, attach package default handler as
       fallback so logs remain visible.
     """
-    level = os.environ.get("INS_PRICING_LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, level, logging.INFO))
-    root_has_handlers = bool(logging.getLogger().handlers)
+    with _SYNC_LOCK:
+        level = os.environ.get("INS_PRICING_LOG_LEVEL", "INFO").upper()
+        logger.setLevel(getattr(logging, level, logging.INFO))
+        root_has_handlers = bool(logging.getLogger().handlers)
 
-    if root_has_handlers:
-        for handler in list(logger.handlers):
-            if getattr(handler, _DEFAULT_HANDLER_FLAG, False):
-                logger.removeHandler(handler)
-                try:
-                    handler.close()
-                except Exception:
-                    pass
-        logger.propagate = True
-        return
+        if root_has_handlers:
+            for handler in list(logger.handlers):
+                if getattr(handler, _DEFAULT_HANDLER_FLAG, False):
+                    logger.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
+            logger.propagate = True
+            return
 
-    has_default_handler = any(
-        getattr(handler, _DEFAULT_HANDLER_FLAG, False) for handler in logger.handlers
-    )
-    if not has_default_handler:
-        handler = logging.StreamHandler()
-        setattr(handler, _DEFAULT_HANDLER_FLAG, True)
-        formatter = logging.Formatter("[%(levelname)s][%(name)s] %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    logger.propagate = False
+        has_default_handler = any(
+            getattr(handler, _DEFAULT_HANDLER_FLAG, False)
+            for handler in logger.handlers
+        )
+        if not has_default_handler:
+            handler = logging.StreamHandler()
+            setattr(handler, _DEFAULT_HANDLER_FLAG, True)
+            formatter = logging.Formatter("[%(levelname)s][%(name)s] %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        logger.propagate = False
 
 
 def get_logger(name: str = "ins_pricing") -> logging.Logger:

@@ -4,6 +4,11 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
+from ins_pricing.exceptions import DataValidationError
+from ins_pricing.utils.validation import (
+    validate_dataframe_not_empty,
+    validate_required_columns,
+)
 
 
 def compute_exposure(
@@ -23,6 +28,11 @@ def compute_exposure(
     - If ``time_unit`` is provided, returns a DataFrame copy with ``exposure`` column.
     - Otherwise returns a Series (legacy lightweight utility behavior).
     """
+
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    validate_required_columns(df, [start_col, end_col], df_name="df")
 
     resolved_unit = (time_unit or unit or "year").strip().lower()
     aliases = {
@@ -71,6 +81,18 @@ def aggregate_policy_level(
     weight_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """Aggregate event-level rows to policy-level records."""
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    required_cols = list(policy_keys) + [exposure_col]
+    if claim_count_col:
+        required_cols.append(claim_count_col)
+    if claim_amount_col:
+        required_cols.append(claim_amount_col)
+    if weight_col:
+        required_cols.append(weight_col)
+    validate_required_columns(df, required_cols, df_name="df")
+
     agg = {exposure_col: "sum"}
     if claim_count_col:
         agg[claim_count_col] = "sum"
@@ -91,6 +113,15 @@ def build_frequency_severity(
     zero_severity: float = 0.0,
 ) -> pd.DataFrame:
     """Compute frequency, severity and pure premium from counts and losses."""
+    if not isinstance(df, pd.DataFrame):
+        raise DataValidationError("df must be a pandas DataFrame.")
+    validate_dataframe_not_empty(df, df_name="df")
+    validate_required_columns(
+        df,
+        [exposure_col, claim_count_col, claim_amount_col],
+        df_name="df",
+    )
+
     exposure = df[exposure_col].to_numpy(dtype=float, copy=False)
     counts = df[claim_count_col].to_numpy(dtype=float, copy=False)
     amounts = df[claim_amount_col].to_numpy(dtype=float, copy=False)

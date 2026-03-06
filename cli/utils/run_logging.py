@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import sys
@@ -11,6 +12,9 @@ from typing import Optional, TextIO
 _LOGGING_CONFIGURED = False
 _LOG_PATH: Optional[Path] = None
 _LOG_FILE: Optional[TextIO] = None
+_ORIGINAL_STDOUT: Optional[TextIO] = None
+_ORIGINAL_STDERR: Optional[TextIO] = None
+_ATEXIT_REGISTERED = False
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 _DEFAULT_HANDLER_FLAG = "_ins_pricing_default_handler"
@@ -96,6 +100,7 @@ def configure_run_logging(
     announce: bool = True,
 ) -> Optional[Path]:
     global _LOGGING_CONFIGURED, _LOG_PATH, _LOG_FILE
+    global _ORIGINAL_STDOUT, _ORIGINAL_STDERR, _ATEXIT_REGISTERED
 
     if _LOGGING_CONFIGURED:
         return _LOG_PATH
@@ -111,6 +116,11 @@ def configure_run_logging(
         log_file = log_path.open("a", encoding="utf-8")
     except Exception:
         return None
+
+    if _ORIGINAL_STDOUT is None:
+        _ORIGINAL_STDOUT = sys.stdout
+    if _ORIGINAL_STDERR is None:
+        _ORIGINAL_STDERR = sys.stderr
 
     sys.stdout = _TeeStream(sys.stdout, log_file)  # type: ignore[assignment]
     sys.stderr = _TeeStream(sys.stderr, log_file)  # type: ignore[assignment]
@@ -143,4 +153,30 @@ def configure_run_logging(
     if announce:
         print(f"[ins_pricing] log saved to {log_path}", flush=True)
 
+    if not _ATEXIT_REGISTERED:
+        atexit.register(close_run_logging)
+        _ATEXIT_REGISTERED = True
+
     return log_path
+
+
+def close_run_logging() -> None:
+    """Close active run log file and restore stdio streams."""
+    global _LOGGING_CONFIGURED, _LOG_FILE
+    global _ORIGINAL_STDOUT, _ORIGINAL_STDERR
+
+    if isinstance(sys.stdout, _TeeStream):
+        sys.stdout = _ORIGINAL_STDOUT or sys.__stdout__  # type: ignore[assignment]
+    if isinstance(sys.stderr, _TeeStream):
+        sys.stderr = _ORIGINAL_STDERR or sys.__stderr__  # type: ignore[assignment]
+
+    if _LOG_FILE is not None:
+        try:
+            _LOG_FILE.flush()
+            _LOG_FILE.close()
+        except Exception:
+            pass
+        finally:
+            _LOG_FILE = None
+
+    _LOGGING_CONFIGURED = False

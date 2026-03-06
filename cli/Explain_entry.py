@@ -3,24 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-import importlib.util
-import sys
 
-def _ensure_repo_root() -> None:
-    if __package__ not in {None, ""}:
-        return
-    if importlib.util.find_spec("ins_pricing") is not None:
-        return
-    bootstrap_path = Path(__file__).resolve().parents[1] / "utils" / "bootstrap.py"
-    spec = importlib.util.spec_from_file_location("ins_pricing.cli.utils.bootstrap", bootstrap_path)
-    if spec is None or spec.loader is None:
-        return
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.ensure_repo_root()
+if __package__ in {None, ""}:
+    from _entry_bootstrap import ensure_repo_root  # type: ignore
+else:
+    from ._entry_bootstrap import ensure_repo_root
 
-
-_ensure_repo_root()
+ensure_repo_root(__file__, __package__)
 
 import argparse
 import json
@@ -29,9 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
-
-setup_sys_path()
+from ins_pricing.cli.utils.import_resolver import resolve_imports
 _imports = resolve_imports()
 
 ropt = _imports.bayesopt

@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 _LAZY_ATTRS = {
-    "psi_report": ("ins_pricing.production.drift", "psi_report"),
+    "psi_report": ("ins_pricing.utils.metrics", "psi_report"),
     "classification_metrics": ("ins_pricing.production.monitoring", "classification_metrics"),
     "group_metrics": ("ins_pricing.production.monitoring", "group_metrics"),
     "loss_ratio": ("ins_pricing.production.monitoring", "loss_ratio"),

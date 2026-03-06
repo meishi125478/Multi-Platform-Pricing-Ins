@@ -49,9 +49,9 @@ from ins_pricing.modelling.bayesopt.artifacts import (
     best_params_csv_path,
     load_best_params_csv,
 )
-from ins_pricing.cli.utils.import_resolver import resolve_imports, setup_sys_path
+from ins_pricing.cli.utils.import_resolver import resolve_imports
+from ins_pricing.modelling.bayesopt.utils.distributed_utils import TrainingUtils
 
-setup_sys_path()
 _imports = resolve_imports()
 
 ropt = _imports.bayesopt
@@ -759,7 +759,7 @@ class IncrementalUpdateRunner:
             trainer.save()
             executed_keys.append(key)
             if key in PYTORCH_TRAINERS:
-                ropt.free_cuda()
+                TrainingUtils.free_cuda()
 
             snapshot = {
                 "mode": "incremental_train",
