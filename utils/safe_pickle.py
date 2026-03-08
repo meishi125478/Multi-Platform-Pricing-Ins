@@ -38,6 +38,8 @@ _SAFE_EXACT_GLOBALS: Dict[str, Set[str]] = {
     "pandas.core.internals.managers": {"BlockManager", "SingleBlockManager"},
     "sklearn.preprocessing._data": {"StandardScaler"},
     "sklearn.preprocessing._encoders": {"OneHotEncoder"},
+    # Legacy XGBoost payloads may include the sklearn-style wrapper object.
+    "ins_pricing.modelling.bayesopt.trainers.trainer_xgb": {"_XGBDMatrixWrapper"},
 }
 
 _SAFE_PREFIXES: Tuple[str, ...] = (

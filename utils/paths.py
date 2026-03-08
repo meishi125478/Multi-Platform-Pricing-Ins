@@ -326,7 +326,8 @@ def coerce_dataset_types(raw: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with coerced types
     """
-    data = raw
+    # Avoid chained-assignment warnings when callers pass a sliced frame.
+    data = raw.copy() if getattr(raw, "_is_copy", None) is not None else raw
     for col in data.columns:
         s = data[col]
         if pd.api.types.is_bool_dtype(s):

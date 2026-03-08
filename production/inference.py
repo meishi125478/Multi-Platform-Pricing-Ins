@@ -14,6 +14,7 @@ except Exception as exc:  # pragma: no cover - optional dependency
     sm = None  # type: ignore[assignment]
     _SM_IMPORT_ERROR = exc
 
+from ins_pricing.exceptions import ModelLoadError
 from ins_pricing.modelling.bayesopt.artifacts import (
     load_best_params as load_best_params_artifacts,
 )
@@ -40,6 +41,7 @@ from ins_pricing.utils.model_loading import (
 from ins_pricing.utils import get_logger, load_dataset
 
 _logger = get_logger("ins_pricing.production.inference")
+_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 if TYPE_CHECKING:
@@ -167,6 +169,54 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    return bool(value)
+
+
+def _allow_unsafe_model_load(
+    cfg: Optional[Dict[str, Any]],
+    *,
+    override: Optional[bool] = None,
+) -> bool:
+    if override is not None:
+        return bool(override)
+    if not isinstance(cfg, dict):
+        return False
+    return _coerce_bool(cfg.get("allow_unsafe_model_load"), default=False)
+
+
+def _load_pickle_with_optional_unsafe_retry(
+    model_path: Path,
+    *,
+    model_key: str,
+    allow_unsafe_retry: bool,
+) -> Any:
+    try:
+        return load_pickle_artifact(model_path)
+    except ModelLoadError as exc:
+        message = str(exc)
+        can_retry = (
+            allow_unsafe_retry
+            and model_key in {"xgb", "glm"}
+            and "Blocked unsafe pickle artifact" in message
+            and "INS_PRICING_ALLOW_UNSAFE_MODEL_LOAD" in message
+        )
+        if not can_retry:
+            raise
+        _logger.warning(
+            "Retrying %s model load with unsafe pickle enabled for trusted artifact: %s",
+            model_key,
+            model_path,
+        )
+        return load_pickle_artifact(model_path, allow_unsafe=True)
+
+
 
 
 def _model_file_path(output_dir: Path, model_name: str, model_key: str) -> Path:
@@ -181,12 +231,18 @@ def _load_preprocess_from_model_file(
     output_dir: Path,
     model_name: str,
     model_key: str,
+    *,
+    allow_unsafe_retry: bool = False,
 ) -> Optional[Dict[str, Any]]:
     model_path = _model_file_path(output_dir, model_name, model_key)
     if not model_path.exists():
         return None
     if model_key in {"xgb", "glm"}:
-        payload = load_pickle_artifact(model_path)
+        payload = _load_pickle_with_optional_unsafe_retry(
+            model_path,
+            model_key=model_key,
+            allow_unsafe_retry=allow_unsafe_retry,
+        )
     else:
         payload = load_torch_payload(
             model_path,
@@ -327,13 +383,22 @@ def load_saved_model(
     input_dim: Optional[int],
     cfg: Dict[str, Any],
     device: Optional[Any] = None,
+    allow_unsafe_model_load: Optional[bool] = None,
 ) -> Any:
     model_path = _model_file_path(Path(output_dir), model_name, model_key)
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
+    allow_unsafe_retry = _allow_unsafe_model_load(
+        cfg,
+        override=allow_unsafe_model_load,
+    )
 
     if model_key in {"xgb", "glm"}:
-        payload = load_pickle_artifact(model_path)
+        payload = _load_pickle_with_optional_unsafe_retry(
+            model_path,
+            model_key=model_key,
+            allow_unsafe_retry=allow_unsafe_retry,
+        )
         if isinstance(payload, dict) and "model" in payload:
             return payload.get("model")
         return payload
@@ -562,11 +627,19 @@ def load_predictor_from_config(
     model_name: Optional[str] = None,
     output_dir: Optional[str | Path] = None,
     preprocess_artifact_path: Optional[str | Path] = None,
+    allow_unsafe_model_load: Optional[bool] = None,
     device: Optional[Any] = None,
     registry: Optional[PredictorRegistry] = None,
 ) -> Predictor:
     config_path = Path(config_path).resolve()
     cfg = _load_json(config_path)
+    allow_unsafe_retry = _allow_unsafe_model_load(
+        cfg,
+        override=allow_unsafe_model_load,
+    )
+    if allow_unsafe_model_load is not None:
+        cfg = dict(cfg)
+        cfg["allow_unsafe_model_load"] = allow_unsafe_retry
     base_dir = config_path.parent
 
     if model_name is None:
@@ -606,7 +679,10 @@ def load_predictor_from_config(
         artifacts = load_preprocess_artifacts(resolved_artifact)
     if artifacts is None:
         artifacts = _load_preprocess_from_model_file(
-            resolved_output, model_name, model_key
+            resolved_output,
+            model_name,
+            model_key,
+            allow_unsafe_retry=allow_unsafe_retry,
         )
 
     device = _normalize_device(device)

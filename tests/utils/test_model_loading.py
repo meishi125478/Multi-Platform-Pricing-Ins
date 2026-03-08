@@ -25,3 +25,27 @@ def test_load_pickle_artifact_blocks_untrusted_global_by_default(tmp_path):
 
     with pytest.raises(ModelLoadError):
         load_pickle_artifact(path, allow_unsafe=False)
+
+
+def test_load_pickle_artifact_allows_xgb_wrapper_payload(tmp_path):
+    pytest.importorskip("xgboost")
+    pytest.importorskip("optuna")
+    pytest.importorskip("torch")
+    pytest.importorskip("sklearn")
+
+    from ins_pricing.modelling.bayesopt.trainers.trainer_xgb import _XGBDMatrixWrapper
+
+    path = tmp_path / "xgb_wrapper.pkl"
+    payload = {
+        "model": _XGBDMatrixWrapper(
+            params={"n_estimators": 1},
+            task_type="regression",
+            use_gpu=False,
+        )
+    }
+    with path.open("wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    loaded = load_pickle_artifact(path, allow_unsafe=False)
+    assert isinstance(loaded, dict)
+    assert isinstance(loaded.get("model"), _XGBDMatrixWrapper)

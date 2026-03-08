@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -45,6 +47,27 @@ def test_coerce_dataset_types_is_in_place_and_downcasts_numeric():
     assert out["num_f"].dtype == np.float32
     assert out["num_f"].isna().sum() == 0
     assert out["cat"].tolist() == ["a", "<NA>", "c"]
+
+
+def test_coerce_dataset_types_avoids_settingwithcopy_warning_for_sliced_frame():
+    base = pd.DataFrame(
+        {
+            "num": [1, 2, 3, 4],
+            "cat": ["a", None, "c", "d"],
+        }
+    )
+    sliced = base[base["num"] > 2]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = coerce_dataset_types(sliced)
+
+    swc_warnings = [
+        w for w in caught if "settingwithcopywarning" in type(w.message).__name__.lower()
+    ]
+    assert not swc_warnings
+    assert out["num"].dtype == np.float32
+    assert out["cat"].tolist() == ["c", "d"]
 
 
 def test_load_dataset_with_chunksize_returns_iterator(tmp_path):
