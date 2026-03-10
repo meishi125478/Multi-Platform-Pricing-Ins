@@ -124,7 +124,7 @@ class DatasetPreprocessor:
             self.var_nmes = list(cfg.factor_nmes)
             return self
 
-        keep_unscaled_oht = bool(getattr(cfg, "keep_unscaled_oht", True))
+        keep_unscaled_oht = bool(getattr(cfg, "keep_unscaled_oht", False))
         keep_unscaled_env = os.environ.get("BAYESOPT_KEEP_UNSCALED_OHT")
         if keep_unscaled_env is not None:
             keep_unscaled_oht = str(keep_unscaled_env).strip().lower() in {
@@ -337,6 +337,8 @@ class DatasetPreprocessor:
         dummy_columns: List[str] = []
         if self.train_oht_data is not None:
             dummy_columns = list(self.train_oht_data.columns)
+        elif self.train_oht_scl_data is not None:
+            dummy_columns = list(self.train_oht_scl_data.columns)
         return PreprocessArtifacts(
             factor_nmes=list(self.config.factor_nmes),
             cate_list=list(self.config.cate_list or []),

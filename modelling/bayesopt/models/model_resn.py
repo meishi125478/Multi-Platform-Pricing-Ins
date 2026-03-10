@@ -161,12 +161,87 @@ class _LazyTabularDataset(Dataset):
             raise ValueError(
                 f"w length {len(w)} does not match X length {self._len}."
             )
+        self._dense_X = self._try_dense_matrix(X)
+        self._dense_y = self._to_dense_vector(y)
+        self._dense_w = self._to_dense_vector(w) if w is not None else None
+
+        self._cache_block_size = 256
+        self._cache_start = -1
+        self._cache_end = -1
+        self._cache_X = None
+
+    @staticmethod
+    def _is_sparse_dataframe(arr) -> bool:
+        if not isinstance(arr, pd.DataFrame):
+            return False
+        try:
+            return any(isinstance(dtype, pd.SparseDtype) for dtype in arr.dtypes)
+        except Exception:
+            return False
+
+    @classmethod
+    def _try_dense_matrix(cls, arr):
+        """Fast path for dense matrix-like inputs."""
+        if cls._is_sparse_dataframe(arr):
+            return None
+        try:
+            if hasattr(arr, "to_numpy"):
+                out = arr.to_numpy(dtype=np.float32, copy=False)
+            else:
+                out = np.asarray(arr, dtype=np.float32)
+        except Exception:
+            return None
+        out = np.asarray(out, dtype=np.float32)
+        if out.ndim == 1:
+            out = out.reshape(-1, 1)
+        if out.ndim != 2:
+            return None
+        return out
+
+    @staticmethod
+    def _to_dense_vector(arr):
+        if arr is None:
+            return None
+        if isinstance(arr, pd.DataFrame):
+            if arr.shape[1] != 1:
+                raise ValueError("Expected a single-column DataFrame for vector input.")
+            values = arr.iloc[:, 0].to_numpy(dtype=np.float32, copy=False)
+        elif hasattr(arr, "to_numpy"):
+            values = arr.to_numpy(dtype=np.float32, copy=False)
+        else:
+            values = np.asarray(arr, dtype=np.float32)
+        return np.asarray(values, dtype=np.float32).reshape(-1)
 
     @staticmethod
     def _row_slice(arr, idx: int):
         if hasattr(arr, "iloc"):
             return arr.iloc[idx]
         return arr[idx]
+
+    def _get_feature_row(self, idx: int) -> np.ndarray:
+        if self._dense_X is not None:
+            row = self._dense_X[int(idx)]
+            return np.asarray(row, dtype=np.float32).reshape(-1)
+
+        if self._cache_X is None or not (self._cache_start <= idx < self._cache_end):
+            start = (int(idx) // self._cache_block_size) * self._cache_block_size
+            end = min(self._len, start + self._cache_block_size)
+            if hasattr(self.X, "iloc"):
+                block = self.X.iloc[start:end]
+            else:
+                block = self.X[start:end]
+            if hasattr(block, "to_numpy"):
+                cache = block.to_numpy(dtype=np.float32, copy=False)
+            else:
+                cache = np.asarray(block, dtype=np.float32)
+            cache = np.asarray(cache, dtype=np.float32)
+            if cache.ndim == 1:
+                cache = cache.reshape(-1, 1)
+            self._cache_X = cache
+            self._cache_start = start
+            self._cache_end = end
+        row = self._cache_X[int(idx) - self._cache_start]
+        return np.asarray(row, dtype=np.float32).reshape(-1)
 
     @staticmethod
     def _row_to_feature_array(row) -> np.ndarray:
@@ -190,13 +265,19 @@ class _LazyTabularDataset(Dataset):
         return self._len
 
     def __getitem__(self, idx: int):
-        row_x = self._row_slice(self.X, int(idx))
-        row_y = self._row_slice(self.y, int(idx))
-        row_w = self._row_slice(self.w, int(idx)) if self.w is not None else 1.0
-
-        x_np = self._row_to_feature_array(row_x)
-        y_val = self._scalar_to_float(row_y)
-        w_val = self._scalar_to_float(row_w)
+        x_np = self._get_feature_row(int(idx))
+        if self._dense_y is not None:
+            y_val = float(self._dense_y[int(idx)])
+        else:
+            row_y = self._row_slice(self.y, int(idx))
+            y_val = self._scalar_to_float(row_y)
+        if self._dense_w is not None:
+            w_val = float(self._dense_w[int(idx)])
+        elif self.w is not None:
+            row_w = self._row_slice(self.w, int(idx))
+            w_val = self._scalar_to_float(row_w)
+        else:
+            w_val = 1.0
 
         x_tensor = torch.as_tensor(x_np, dtype=torch.float32)
         y_tensor = torch.tensor([y_val], dtype=torch.float32)

@@ -49,6 +49,7 @@ from ins_pricing.modelling.bayesopt.runtime import (
     BayesOptRunnerHooks,
     run_bayesopt_entry_training,
 )
+from ins_pricing.modelling.bayesopt.utils.distributed_utils import DistributedUtils
 
 # Resolve all imports from a single location
 _imports = resolve_imports()
@@ -226,7 +227,10 @@ def main() -> None:
     if configure_run_logging:
         configure_run_logging(prefix="bayesopt_entry")
     args = _parse_args()
-    train_from_config(args)
+    try:
+        train_from_config(args)
+    finally:
+        DistributedUtils.cleanup_ddp()
 
 
 if __name__ == "__main__":

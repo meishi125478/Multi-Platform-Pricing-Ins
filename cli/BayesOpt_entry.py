@@ -8,7 +8,6 @@ from __future__ import annotations
 from pathlib import Path
 import importlib.util
 import json
-import os
 import sys
 
 def _ensure_repo_root() -> None:
@@ -48,10 +47,8 @@ def _apply_env_from_config(argv: list[str]) -> None:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8", errors="replace"))
         env = cfg.get("env", {})
         if isinstance(env, dict):
-            for key, value in env.items():
-                if key is None:
-                    continue
-                os.environ.setdefault(str(key), str(value))
+            from ins_pricing.cli.utils.cli_config import set_env
+            set_env(env)
     except Exception:
         return
 

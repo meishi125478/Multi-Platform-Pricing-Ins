@@ -1,21 +1,35 @@
-"""Trainer implementations split by model type."""
+"""Trainer implementations split by model type.
+
+Keep this package initializer lazy to avoid import cycles between runtime
+mixins and trainer modules.
+"""
 from __future__ import annotations
 
-from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
-from ins_pricing.modelling.bayesopt.trainers.trainer_context import TrainerContext
-from ins_pricing.modelling.bayesopt.trainers.trainer_ft import FTTrainer
-from ins_pricing.modelling.bayesopt.trainers.trainer_glm import GLMTrainer
-from ins_pricing.modelling.bayesopt.trainers.trainer_gnn import GNNTrainer
-from ins_pricing.modelling.bayesopt.trainers.trainer_resn import ResNetTrainer
-from ins_pricing.modelling.bayesopt.trainers.trainer_xgb import XGBTrainer, _xgb_cuda_available
+from importlib import import_module
 
-__all__ = [
-    "TrainerBase",
-    "TrainerContext",
-    "FTTrainer",
-    "GLMTrainer",
-    "GNNTrainer",
-    "ResNetTrainer",
-    "XGBTrainer",
-    "_xgb_cuda_available",
-]
+_EXPORTS = {
+    "TrainerBase": "ins_pricing.modelling.bayesopt.trainers.trainer_base",
+    "TrainerContext": "ins_pricing.modelling.bayesopt.trainers.trainer_context",
+    "FTTrainer": "ins_pricing.modelling.bayesopt.trainers.trainer_ft",
+    "GLMTrainer": "ins_pricing.modelling.bayesopt.trainers.trainer_glm",
+    "GNNTrainer": "ins_pricing.modelling.bayesopt.trainers.trainer_gnn",
+    "ResNetTrainer": "ins_pricing.modelling.bayesopt.trainers.trainer_resn",
+    "XGBTrainer": "ins_pricing.modelling.bayesopt.trainers.trainer_xgb",
+    "_xgb_cuda_available": "ins_pricing.modelling.bayesopt.trainers.trainer_xgb",
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str):
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(target)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | set(globals().keys()))

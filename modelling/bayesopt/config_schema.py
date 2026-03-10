@@ -71,7 +71,7 @@ class BayesOptConfig:
         cv_strategy: CV strategy ('random', 'group', 'time', 'stratified')
         build_oht: Whether to build one-hot encoded features (default True)
         oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
-        keep_unscaled_oht: Keep unscaled one-hot copy in memory (default True)
+        keep_unscaled_oht: Keep unscaled one-hot copy in memory (default False)
         dataloader_multiprocessing_context: Optional DataLoader multiprocessing start method
             ('fork', 'spawn', or 'forkserver')
 
@@ -197,7 +197,7 @@ class BayesOptConfig:
     bo_sample_limit: Optional[int] = None
     build_oht: bool = True
     oht_sparse_csr: bool = True
-    keep_unscaled_oht: bool = True
+    keep_unscaled_oht: bool = False
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"

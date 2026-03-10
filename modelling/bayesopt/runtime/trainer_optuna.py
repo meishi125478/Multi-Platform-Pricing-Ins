@@ -26,6 +26,18 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerOptunaMixin:
+    @staticmethod
+    def _get_trials(
+        study: optuna.study.Study,
+        *,
+        states: tuple[optuna.trial.TrialState, ...],
+    ) -> list[optuna.trial.FrozenTrial]:
+        """Read trials with minimal copying when supported by Optuna."""
+        try:
+            return study.get_trials(states=states, deepcopy=False)
+        except TypeError:
+            return study.get_trials(states=states)
+
     def _wait_with_deadline_fallback(
         self,
         wait_fn: Callable[[], Any],
@@ -275,13 +287,14 @@ class TrainerOptunaMixin:
             optuna.trial.TrialState.PRUNED,
             optuna.trial.TrialState.FAIL,
         )
-        completed = len(study.get_trials(states=completed_states))
+        completed = len(self._get_trials(study, states=completed_states))
         progress_counter["count"] = completed
         remaining = max(0, total_trials - completed)
         if remaining < 1:
-            has_complete = bool(
-                study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
-            )
+            has_complete = bool(self._get_trials(
+                study,
+                states=(optuna.trial.TrialState.COMPLETE,),
+            ))
             if not has_complete:
                 _log(
                     f"[Optuna][{self.label}] Study has no completed trial yet; "
@@ -296,16 +309,19 @@ class TrainerOptunaMixin:
                 callbacks=[checkpoint_callback],
             )
 
-        complete_count = len(
-            study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
-        )
+        complete_count = len(self._get_trials(
+            study,
+            states=(optuna.trial.TrialState.COMPLETE,),
+        ))
         if complete_count < 1:
-            pruned_count = len(
-                study.get_trials(states=(optuna.trial.TrialState.PRUNED,))
-            )
-            fail_count = len(
-                study.get_trials(states=(optuna.trial.TrialState.FAIL,))
-            )
+            pruned_count = len(self._get_trials(
+                study,
+                states=(optuna.trial.TrialState.PRUNED,),
+            ))
+            fail_count = len(self._get_trials(
+                study,
+                states=(optuna.trial.TrialState.FAIL,),
+            ))
             study_name = getattr(study, "study_name", None) or "<unnamed>"
             raise RuntimeError(
                 f"[Optuna][{self.label}] No completed trials in study '{study_name}' "

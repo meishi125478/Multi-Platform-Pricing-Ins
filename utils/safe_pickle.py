@@ -5,6 +5,7 @@ from typing import BinaryIO, Dict, Optional, Set, Tuple
 
 
 _SAFE_BUILTINS: Set[str] = {
+    "bytearray",
     "bool",
     "bytes",
     "complex",

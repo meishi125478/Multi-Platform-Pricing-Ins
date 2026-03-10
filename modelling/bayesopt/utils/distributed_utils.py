@@ -131,8 +131,11 @@ class DistributedUtils:
     @staticmethod
     def cleanup_ddp():
         """Destroy the DDP process group and clear cached state."""
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            if getattr(dist, "is_available", lambda: False)() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception as exc:
+            _log(f">>> DDP cleanup warning: {exc}")
         with _STATE_LOCK:
             DistributedUtils._cached_state = None
 

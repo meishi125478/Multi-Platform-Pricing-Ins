@@ -318,6 +318,60 @@ class TorchTrainerMixin:
             return "spawn"
         return None
 
+    def _dataset_holds_torch_module(
+        self,
+        dataset,
+        *,
+        max_depth: int = 5,
+        max_nodes: int = 2048,
+    ) -> bool:
+        """Detect accidental nn.Module/DDP capture inside dataset object graph."""
+        if dataset is None:
+            return False
+
+        def _should_skip_expand(obj) -> bool:
+            if obj is None:
+                return True
+            if isinstance(obj, (str, bytes, int, float, bool, np.ndarray, torch.Tensor)):
+                return True
+            module_name = getattr(type(obj), "__module__", "")
+            if module_name.startswith("pandas."):
+                return True
+            return False
+
+        stack = [(dataset, 0)]
+        seen = set()
+        visited = 0
+        while stack:
+            obj, depth = stack.pop()
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            visited += 1
+            if visited > max_nodes:
+                break
+
+            if isinstance(obj, nn.Module):
+                return True
+            if depth >= max_depth or _should_skip_expand(obj):
+                continue
+
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    stack.append((value, depth + 1))
+                continue
+            if isinstance(obj, (list, tuple, set)):
+                for value in obj:
+                    stack.append((value, depth + 1))
+                continue
+
+            state = getattr(obj, "__dict__", None)
+            if isinstance(state, dict):
+                for value in state.values():
+                    stack.append((value, depth + 1))
+        return False
+
     def _build_dataloader(self,
                           dataset,
                           N: int,
@@ -404,6 +458,18 @@ class TorchTrainerMixin:
                 "forcing workers=0. Set BAYESOPT_DDP_ALLOW_WORKERS_IN_MEMORY_SAVING=1 to override."
             )
             workers = 0
+        if (
+            is_ddp
+            and device_type == "cuda"
+            and workers > 0
+            and self._dataset_holds_torch_module(dataset)
+        ):
+            _log(
+                ">>> DataLoader safety: dataset holds nn.Module/DDP references under "
+                "DDP + workers>0; forcing workers=0 to avoid spawn worker "
+                "process-group initialization failures."
+            )
+            workers = 0
 
         prefetch_factor = None
         if workers > 0:
@@ -460,6 +526,17 @@ class TorchTrainerMixin:
         is_ddp = bool(getattr(self, "is_ddp_enabled", False))
         val_bs = accum_steps * train_dataloader.batch_size
         val_workers = self._resolve_num_workers(4, profile=profile)
+        if (
+            is_ddp
+            and device_type == "cuda"
+            and val_workers > 0
+            and self._dataset_holds_torch_module(dataset)
+        ):
+            _log(
+                ">>> Validation DataLoader safety: dataset holds nn.Module/DDP references under "
+                "DDP + workers>0; forcing val_workers=0."
+            )
+            val_workers = 0
         prefetch_factor = None
         if val_workers > 0:
             prefetch_factor = 2

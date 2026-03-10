@@ -78,11 +78,11 @@ class TaskRunner:
             _log(f"Warning: Could not detect task mode, defaulting to 'entry': {e}")
             return 'entry'
 
-    def _build_cmd_from_config(self, config_path: str) -> Tuple[List[str], str]:
+    def _build_cmd_from_config(self, config_path: str) -> Tuple[List[str], str, Dict[str, str]]:
         """Build the command to execute based on config.runner.mode."""
-        from ins_pricing.cli.utils.notebook_utils import build_cmd_from_config
+        from ins_pricing.cli.utils.notebook_utils import build_run_spec_from_config
 
-        return build_cmd_from_config(config_path)
+        return build_run_spec_from_config(config_path)
 
     def run_task(self, config_path: str) -> Generator[str, None, None]:
         """
@@ -127,7 +127,7 @@ class TaskRunner:
                     sys.stderr = self.log_capture
 
                     # Log start
-                    cmd, task_mode = self._build_cmd_from_config(config_path)
+                    cmd, task_mode, cmd_env = self._build_cmd_from_config(config_path)
                     _log(f"Starting task [{task_mode}] with config: {config_path}")
                     _log("=" * 80)
 
@@ -145,6 +145,7 @@ class TaskRunner:
                         text=True,
                         bufsize=1,
                         cwd=str(Path(config_path).resolve().parent),
+                        env=cmd_env,
                         creationflags=creationflags,
                         start_new_session=start_new_session,
                     )

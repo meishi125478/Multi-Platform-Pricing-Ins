@@ -29,7 +29,30 @@ def load_config_json(path: Path, required_keys: Sequence[str]) -> Dict[str, Any]
     return cfg
 
 
-def set_env(env_overrides: Dict[str, Any]) -> None:
+def _normalize_env_overrides(env_overrides: Dict[str, Any]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for key, value in (env_overrides or {}).items():
+        if key is None:
+            continue
+        normalized[str(key)] = str(value)
+    return normalized
+
+
+def build_subprocess_env(
+    env_overrides: Dict[str, Any],
+    *,
+    base_env: Optional[Dict[str, str]] = None,
+    overwrite: bool = True,
+) -> Dict[str, str]:
+    """Build an isolated subprocess environment with config overrides."""
+    merged = dict(base_env or os.environ)
+    for key, value in _normalize_env_overrides(env_overrides).items():
+        if overwrite or key not in merged:
+            merged[key] = value
+    return merged
+
+
+def set_env(env_overrides: Dict[str, Any], *, overwrite: bool = True) -> Dict[str, str]:
     """Apply environment variables from config.json.
 
     Notes (DDP/Optuna hang debugging):
@@ -40,11 +63,39 @@ def set_env(env_overrides: Dict[str, Any]) -> None:
       - `BAYESOPT_DDP_BARRIER_TIMEOUT=300`
       - `BAYESOPT_CUDA_SYNC=1` (optional; can slow down)
       - `BAYESOPT_CUDA_IPC_COLLECT=1` (optional; can slow down)
-    - This function uses `os.environ.setdefault`, so a value already set in the
-      shell will take precedence over config.json.
+    - By default config values overwrite existing process env for deterministic
+      behavior across notebooks/frontend reruns.
     """
-    for key, value in (env_overrides or {}).items():
-        os.environ.setdefault(str(key), str(value))
+    applied = _normalize_env_overrides(env_overrides)
+    for key, value in applied.items():
+        if overwrite or key not in os.environ:
+            os.environ[key] = value
+    return applied
+
+
+def validate_bayesopt_config_schema(cfg: Dict[str, Any]) -> None:
+    """Run BayesOptConfig schema validation before heavy runtime setup."""
+    try:
+        from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
+    except Exception:
+        # Defer when modelling stack is unavailable at import time.
+        return
+
+    payload: Dict[str, Any] = dict(cfg)
+    payload.setdefault("model_nme", "__config_validation__")
+    payload.setdefault("resp_nme", payload.get("target"))
+    payload.setdefault("weight_nme", payload.get("weight"))
+    payload.setdefault("factor_nmes", payload.get("feature_list"))
+    payload.setdefault("cate_list", payload.get("categorical_features"))
+    if payload.get("factor_nmes") is None:
+        payload["factor_nmes"] = []
+    if payload.get("cate_list") is None:
+        payload["cate_list"] = []
+
+    try:
+        BayesOptConfig.from_flat_dict(payload)
+    except Exception as exc:
+        raise ValueError(f"Invalid BayesOpt config schema: {exc}") from exc
 
 
 def _looks_like_url(value: str) -> bool:
@@ -219,10 +270,13 @@ def resolve_and_load_config(
     required_keys: Sequence[str],
     *,
     apply_env: bool = True,
+    validate_schema: bool = True,
 ) -> Tuple[Path, Dict[str, Any]]:
     config_path = resolve_config_path(raw, script_dir)
     cfg = load_config_json(config_path, required_keys=required_keys)
     cfg = normalize_config_paths(cfg, config_path)
+    if validate_schema:
+        validate_bayesopt_config_schema(cfg)
     if apply_env:
         set_env(cfg.get("env", {}))
     return config_path, cfg

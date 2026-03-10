@@ -151,6 +151,113 @@ def _compute_reconstruction_loss(
     return num_loss + cat_loss
 
 
+def _codes_to_int64_with_unknown(codes: pd.Series, unknown_idx: int) -> np.ndarray:
+    """Convert mapped category codes to int64 and route NA/unseen to unknown_idx."""
+    numeric = pd.to_numeric(codes, errors="coerce")
+    arr = np.asarray(numeric.to_numpy(copy=False), dtype=np.float64)
+    missing = np.isnan(arr)
+    if missing.any():
+        arr = arr.copy()
+        arr[missing] = float(unknown_idx)
+    return arr.astype("int64", copy=False)
+
+
+class _FTPreprocessorSnapshot:
+    """Pickle-safe FT preprocessing snapshot for DataLoader workers."""
+
+    def __init__(
+        self,
+        *,
+        num_cols: list[str],
+        cat_cols: list[str],
+        num_mean: Optional[np.ndarray],
+        num_std: Optional[np.ndarray],
+        cat_categories: Dict[str, Any],
+        cat_maps: Dict[str, Dict[Any, int]],
+        cat_str_maps: Dict[str, Dict[str, int]],
+        num_geo: int,
+    ) -> None:
+        self.num_cols = list(num_cols)
+        self.cat_cols = list(cat_cols)
+        self.num_mean = None if num_mean is None else np.asarray(num_mean, dtype=np.float32)
+        self.num_std = None if num_std is None else np.asarray(num_std, dtype=np.float32)
+        self.cat_categories = dict(cat_categories)
+        self.cat_maps = {k: dict(v) for k, v in (cat_maps or {}).items()}
+        self.cat_str_maps = {k: dict(v) for k, v in (cat_str_maps or {}).items()}
+        self.num_geo = int(num_geo)
+        self.unknown_indices = {
+            col: int(len(self.cat_categories.get(col, [])))
+            for col in self.cat_cols
+        }
+
+    @classmethod
+    def from_owner(cls, owner: "FTTransformerSklearn") -> "_FTPreprocessorSnapshot":
+        return cls(
+            num_cols=list(owner.num_cols),
+            cat_cols=list(owner.cat_cols),
+            num_mean=None if owner._num_mean is None else np.asarray(owner._num_mean, dtype=np.float32),
+            num_std=None if owner._num_std is None else np.asarray(owner._num_std, dtype=np.float32),
+            cat_categories=dict(owner.cat_categories),
+            cat_maps=dict(owner.cat_maps),
+            cat_str_maps=dict(owner.cat_str_maps),
+            num_geo=int(owner.num_geo),
+        )
+
+    def encode_nums(self, X_num: Optional[pd.DataFrame]) -> np.ndarray:
+        if not self.num_cols:
+            n_rows = 0 if X_num is None else len(X_num)
+            return np.zeros((n_rows, 0), dtype=np.float32)
+        if X_num is None:
+            raise ValueError("X_num is required when numeric columns exist.")
+        num_np = X_num.to_numpy(dtype=np.float32, copy=False)
+        if not num_np.flags["OWNDATA"]:
+            num_np = num_np.copy()
+        num_np = np.nan_to_num(num_np, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+        if self.num_mean is not None and self.num_std is not None and num_np.size:
+            num_np = (num_np - self.num_mean) / self.num_std
+        return np.asarray(num_np, dtype=np.float32)
+
+    def encode_cats(self, X_cat: Optional[pd.DataFrame]) -> np.ndarray:
+        if not self.cat_cols:
+            n_rows = 0 if X_cat is None else len(X_cat)
+            return np.zeros((n_rows, 0), dtype=np.int64)
+        if X_cat is None:
+            raise ValueError("X_cat is required when categorical columns exist.")
+
+        n_rows = len(X_cat)
+        out = np.empty((n_rows, len(self.cat_cols)), dtype=np.int64)
+        for idx, col in enumerate(self.cat_cols):
+            categories = self.cat_categories[col]
+            mapping = self.cat_maps.get(col)
+            if mapping is None:
+                mapping = {cat: i for i, cat in enumerate(categories)}
+                self.cat_maps[col] = mapping
+            unknown_idx = self.unknown_indices[col]
+            series = X_cat[col]
+            codes = series.map(mapping)
+            unmapped = series.notna() & codes.isna()
+            if unmapped.any():
+                try:
+                    series_cast = series.astype(categories.dtype)
+                except Exception:
+                    series_cast = None
+                if series_cast is not None:
+                    codes = series_cast.map(mapping)
+                    unmapped = series_cast.notna() & codes.isna()
+            if unmapped.any():
+                str_map = self.cat_str_maps.get(col)
+                if str_map is None:
+                    str_map = {str(cat): i for i, cat in enumerate(categories)}
+                    self.cat_str_maps[col] = str_map
+                as_str = series.astype(str)
+                str_codes = as_str.map(str_map)
+                replace_mask = codes.isna()
+                if replace_mask.any():
+                    codes = codes.where(~replace_mask, str_codes)
+            out[:, idx] = _codes_to_int64_with_unknown(codes, unknown_idx)
+        return out
+
+
 class _LazyFTSupervisedDataset(Dataset):
     """Lazy supervised dataset that tensorizes rows on demand."""
 
@@ -167,10 +274,10 @@ class _LazyFTSupervisedDataset(Dataset):
         n_rows = len(X)
         owner._validate_vector(y, "y", n_rows)
         owner._validate_vector(w, "w", n_rows)
-        self.owner = owner
+        self.pre = _FTPreprocessorSnapshot.from_owner(owner)
         self.n_rows = int(n_rows)
-        self.X_num = X[owner.num_cols] if owner.num_cols else None
-        self.X_cat = X[owner.cat_cols] if owner.cat_cols else None
+        self.X_num = X[self.pre.num_cols] if self.pre.num_cols else None
+        self.X_cat = X[self.pre.cat_cols] if self.pre.cat_cols else None
         y_np = y.to_numpy(dtype=np.float32, copy=False) if hasattr(
             y, "to_numpy") else np.asarray(y, dtype=np.float32)
         self.y_values = np.asarray(y_np, dtype=np.float32).reshape(-1)
@@ -189,7 +296,7 @@ class _LazyFTSupervisedDataset(Dataset):
             if geo_np.shape[0] != n_rows:
                 raise ValueError("geo_tokens length does not match X rows.")
             self.geo_values = np.asarray(geo_np, dtype=np.float32)
-        elif owner.num_geo > 0:
+        elif self.pre.num_geo > 0:
             raise RuntimeError("geo_tokens must not be empty; prepare geo tokens first.")
         else:
             self.geo_values = None
@@ -203,14 +310,14 @@ class _LazyFTSupervisedDataset(Dataset):
         else:
             num_np = self.X_num.iloc[idx].to_numpy(dtype=np.float32, copy=False)
             num_np = np.nan_to_num(num_np, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-            if self.owner._num_mean is not None and self.owner._num_std is not None and num_np.size:
-                num_np = (num_np - self.owner._num_mean) / self.owner._num_std
+            if self.pre.num_mean is not None and self.pre.num_std is not None and num_np.size:
+                num_np = (num_np - self.pre.num_mean) / self.pre.num_std
             X_num = torch.as_tensor(np.asarray(num_np, dtype=np.float32))
 
         if self.X_cat is None:
             X_cat = torch.zeros((0,), dtype=torch.long)
         else:
-            cat_np = self.owner._encode_cats(self.X_cat.iloc[idx:idx + 1]).reshape(-1)
+            cat_np = self.pre.encode_cats(self.X_cat.iloc[idx:idx + 1]).reshape(-1)
             X_cat = torch.as_tensor(cat_np, dtype=torch.long)
 
         if self.geo_values is None:
@@ -224,6 +331,96 @@ class _LazyFTSupervisedDataset(Dataset):
         else:
             w_item = torch.as_tensor(self.w_values[idx:idx + 1], dtype=torch.float32)
         return X_num, X_cat, X_geo, y_item, w_item
+
+
+class _LazyFTMaskedDataset(Dataset):
+    """Lazy masked dataset for FT unsupervised pretraining."""
+
+    def __init__(
+        self,
+        pre: _FTPreprocessorSnapshot,
+        X: pd.DataFrame,
+        *,
+        geo_tokens=None,
+        mask_prob_num: float = 0.15,
+        mask_prob_cat: float = 0.15,
+        seed: int = 13,
+    ) -> None:
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("X must be a pandas DataFrame.")
+        self.pre = pre
+        self.n_rows = int(len(X))
+        self.X_num = X[self.pre.num_cols] if self.pre.num_cols else None
+        self.X_cat = X[self.pre.cat_cols] if self.pre.cat_cols else None
+        self.mask_prob_num = float(mask_prob_num)
+        self.mask_prob_cat = float(mask_prob_cat)
+        self.seed = int(seed)
+
+        if geo_tokens is not None:
+            geo_np = geo_tokens.to_numpy(dtype=np.float32, copy=False) if hasattr(
+                geo_tokens, "to_numpy") else np.asarray(geo_tokens, dtype=np.float32)
+            if geo_np.ndim == 1:
+                geo_np = geo_np.reshape(-1, 1)
+            if geo_np.shape[0] != self.n_rows:
+                raise ValueError("geo_tokens length does not match X rows.")
+            self.geo_values = np.asarray(geo_np, dtype=np.float32)
+        elif self.pre.num_geo > 0:
+            raise RuntimeError("geo_tokens must not be empty; prepare geo tokens first.")
+        else:
+            self.geo_values = None
+
+        self.num_dim = len(self.pre.num_cols)
+        self.cat_dim = len(self.pre.cat_cols)
+        self.num_fill = np.zeros((self.num_dim,), dtype=np.float32)
+        self.unknown_idx = np.asarray(
+            [self.pre.unknown_indices[col] for col in self.pre.cat_cols],
+            dtype=np.int64,
+        )
+
+    def __len__(self) -> int:
+        return self.n_rows
+
+    def _rng_for_row(self, row_idx: int) -> np.random.Generator:
+        return np.random.default_rng(self.seed + int(row_idx))
+
+    def __getitem__(self, idx: int):
+        row_idx = int(idx)
+        rng = self._rng_for_row(row_idx)
+
+        if self.num_dim > 0:
+            num_true_np = self.pre.encode_nums(self.X_num.iloc[row_idx:row_idx + 1]).reshape(-1)
+            num_mask_np = rng.random(self.num_dim) < self.mask_prob_num
+            num_masked_np = num_true_np.copy()
+            if num_mask_np.any():
+                num_masked_np[num_mask_np] = self.num_fill[num_mask_np]
+            X_num = torch.as_tensor(num_masked_np, dtype=torch.float32)
+            num_true = torch.as_tensor(num_true_np, dtype=torch.float32)
+            num_mask = torch.as_tensor(num_mask_np, dtype=torch.bool)
+        else:
+            X_num = torch.zeros((0,), dtype=torch.float32)
+            num_true = None
+            num_mask = None
+
+        if self.cat_dim > 0:
+            cat_true_np = self.pre.encode_cats(self.X_cat.iloc[row_idx:row_idx + 1]).reshape(-1)
+            cat_mask_np = rng.random(self.cat_dim) < self.mask_prob_cat
+            cat_masked_np = cat_true_np.copy()
+            if cat_mask_np.any():
+                cat_masked_np[cat_mask_np] = self.unknown_idx[cat_mask_np]
+            X_cat = torch.as_tensor(cat_masked_np, dtype=torch.long)
+            cat_true = torch.as_tensor(cat_true_np, dtype=torch.long)
+            cat_mask = torch.as_tensor(cat_mask_np, dtype=torch.bool)
+        else:
+            X_cat = torch.zeros((0,), dtype=torch.long)
+            cat_true = None
+            cat_mask = None
+
+        if self.geo_values is None:
+            X_geo = torch.zeros((0,), dtype=torch.float32)
+        else:
+            X_geo = torch.as_tensor(self.geo_values[row_idx], dtype=torch.float32)
+
+        return X_num, X_cat, X_geo, num_true, num_mask, cat_true, cat_mask
 
 
 # Scikit-Learn style wrapper for FTTransformer.
@@ -426,12 +623,12 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                 if str_map is None:
                     str_map = {str(cat): i for i, cat in enumerate(categories)}
                     self.cat_str_maps[col] = str_map
-                codes = series.astype(str).map(str_map)
-            if pd.api.types.is_categorical_dtype(codes):
-                codes = codes.astype("float")
-            codes = codes.fillna(unknown_idx).astype(
-                "int64", copy=False).to_numpy()
-            X_cat_np[:, idx] = codes
+                as_str = series.astype(str)
+                str_codes = as_str.map(str_map)
+                replace_mask = codes.isna()
+                if replace_mask.any():
+                    codes = codes.where(~replace_mask, str_codes)
+            X_cat_np[:, idx] = _codes_to_int64_with_unknown(codes, unknown_idx)
         return X_cat_np
 
     def _build_train_tensors(self, X_train, y_train, w_train, geo_train=None):
@@ -685,66 +882,107 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         if self.ft is None:
             self._fit_preprocessor(X_train)
 
-        X_num, X_cat, X_geo, _, _, _ = self._tensorize_split(
-            X_train, None, None, geo_tokens=geo_train, allow_none=True)
-        has_val = X_val is not None
-        if has_val:
-            X_num_val, X_cat_val, X_geo_val, _, _, _ = self._tensorize_split(
-                X_val, None, None, geo_tokens=geo_val, allow_none=True)
-        else:
-            X_num_val = X_cat_val = X_geo_val = None
-
-        N = int(X_num.shape[0])
-        num_dim = int(X_num.shape[1])
-        cat_dim = int(X_cat.shape[1])
+        use_lazy = bool(getattr(self, "use_lazy_dataset", True))
         device_type = self._device_type()
+        has_val = X_val is not None
 
-        gen = torch.Generator()
-        gen.manual_seed(13 + int(getattr(self, "rank", 0)))
+        val_dataset = None
+        if use_lazy:
+            pre = _FTPreprocessorSnapshot.from_owner(self)
+            dataset = _LazyFTMaskedDataset(
+                pre,
+                X_train,
+                geo_tokens=geo_train,
+                mask_prob_num=mask_prob_num,
+                mask_prob_cat=mask_prob_cat,
+                seed=13 + int(getattr(self, "rank", 0)),
+            )
+            if has_val:
+                val_dataset = _LazyFTMaskedDataset(
+                    pre,
+                    X_val,
+                    geo_tokens=geo_val,
+                    mask_prob_num=mask_prob_num,
+                    mask_prob_cat=mask_prob_cat,
+                    seed=10_000,
+                )
+            if not getattr(self, "_lazy_unsupervised_logged", False):
+                _log(
+                    ">>> FTTransformer using lazy masked dataset for unsupervised pretraining.",
+                    flush=True,
+                )
+                self._lazy_unsupervised_logged = True
+            N = len(dataset)
+        else:
+            X_num, X_cat, X_geo, _, _, _ = self._tensorize_split(
+                X_train, None, None, geo_tokens=geo_train, allow_none=True)
+            if has_val:
+                X_num_val, X_cat_val, X_geo_val, _, _, _ = self._tensorize_split(
+                    X_val, None, None, geo_tokens=geo_val, allow_none=True)
+            else:
+                X_num_val = X_cat_val = X_geo_val = None
 
-        cardinals = list(self.cat_cardinalities or [])
-        unknown_idx = torch.tensor(
-            [int(c) - 1 for c in cardinals], dtype=torch.long).view(1, -1)
+            N = int(X_num.shape[0])
+            num_dim = int(X_num.shape[1])
+            cat_dim = int(X_cat.shape[1])
+            gen = torch.Generator()
+            gen.manual_seed(13 + int(getattr(self, "rank", 0)))
+            unknown_idx = torch.tensor(
+                [int(c) - 1 for c in list(self.cat_cardinalities or [])],
+                dtype=torch.long,
+            ).view(1, -1)
+            means = torch.zeros((1, num_dim), dtype=torch.float32)
 
-        means = None
-        if num_dim > 0:
-            # Keep masked fill values on the same scale as model inputs (may be normalized in _tensorize_split).
-            means = X_num.to(dtype=torch.float32).mean(dim=0, keepdim=True)
-
-        def _mask_inputs(X_num_in: torch.Tensor,
-                         X_cat_in: torch.Tensor,
-                         generator: torch.Generator):
-            n_rows = int(X_num_in.shape[0])
-            num_mask_local = None
-            cat_mask_local = None
-            X_num_masked_local = X_num_in
-            X_cat_masked_local = X_cat_in
-            if num_dim > 0:
-                num_mask_local = (torch.rand(
-                    (n_rows, num_dim), generator=generator) < float(mask_prob_num))
+            def _mask_inputs(X_num_in: torch.Tensor,
+                             X_cat_in: torch.Tensor,
+                             generator: torch.Generator):
+                n_rows = int(X_num_in.shape[0])
+                num_mask_local = (
+                    torch.rand((n_rows, num_dim), generator=generator) < float(mask_prob_num)
+                )
+                cat_mask_local = (
+                    torch.rand((n_rows, cat_dim), generator=generator) < float(mask_prob_cat)
+                )
                 X_num_masked_local = X_num_in.clone()
+                X_cat_masked_local = X_cat_in.clone()
                 if num_mask_local.any():
                     X_num_masked_local[num_mask_local] = means.expand_as(
-                        X_num_masked_local)[num_mask_local]
-            if cat_dim > 0:
-                cat_mask_local = (torch.rand(
-                    (n_rows, cat_dim), generator=generator) < float(mask_prob_cat))
-                X_cat_masked_local = X_cat_in.clone()
+                        X_num_masked_local
+                    )[num_mask_local]
                 if cat_mask_local.any():
                     X_cat_masked_local[cat_mask_local] = unknown_idx.expand_as(
-                        X_cat_masked_local)[cat_mask_local]
-            return X_num_masked_local, X_cat_masked_local, num_mask_local, cat_mask_local
+                        X_cat_masked_local
+                    )[cat_mask_local]
+                return X_num_masked_local, X_cat_masked_local, num_mask_local, cat_mask_local
 
-        X_num_true = X_num if num_dim > 0 else None
-        X_cat_true = X_cat if cat_dim > 0 else None
-        X_num_masked, X_cat_masked, num_mask, cat_mask = _mask_inputs(
-            X_num, X_cat, gen)
+            X_num_masked, X_cat_masked, num_mask, cat_mask = _mask_inputs(X_num, X_cat, gen)
+            dataset = MaskedTabularDataset(
+                X_num_masked,
+                X_cat_masked,
+                X_geo,
+                X_num,
+                num_mask,
+                X_cat,
+                cat_mask,
+            )
+            if has_val and X_num_val is not None and X_cat_val is not None and X_geo_val is not None:
+                gen_val = torch.Generator()
+                gen_val.manual_seed(10_000)
+                X_num_val_masked, X_cat_val_masked, num_mask_val, cat_mask_val = _mask_inputs(
+                    X_num_val,
+                    X_cat_val,
+                    gen_val,
+                )
+                val_dataset = MaskedTabularDataset(
+                    X_num_val_masked,
+                    X_cat_val_masked,
+                    X_geo_val,
+                    X_num_val,
+                    num_mask_val,
+                    X_cat_val,
+                    cat_mask_val,
+                )
 
-        dataset = MaskedTabularDataset(
-            X_num_masked, X_cat_masked, X_geo,
-            X_num_true, num_mask,
-            X_cat_true, cat_mask
-        )
         dataloader, accum_steps = self._build_dataloader(
             dataset,
             N=N,
@@ -767,6 +1005,13 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             weight_decay=float(getattr(self, "weight_decay", 0.0)),
         )
         scaler = create_grad_scaler(device_type)
+        val_dataloader = None
+        if has_val and val_dataset is not None:
+            val_dataloader = self._build_val_dataloader(
+                val_dataset,
+                dataloader,
+                accum_steps,
+            )
 
         train_history: List[float] = []
         val_history: List[float] = []
@@ -886,7 +1131,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
 
             train_history.append(epoch_loss_sum / max(epoch_count, 1.0))
 
-            if has_val and X_num_val is not None and X_cat_val is not None and X_geo_val is not None:
+            if val_dataloader is not None:
                 should_compute_val = (not dist.is_initialized()
                                       or DistributedUtils.is_main_process())
                 loss_tensor_device = self.device if device_type == 'cuda' else torch.device(
@@ -896,30 +1141,18 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                 if should_compute_val:
                     self.ft.eval()
                     with torch.no_grad(), create_autocast_context(device_type):
-                        val_bs = min(
-                            int(dataloader.batch_size * max(1, accum_steps)), int(X_num_val.shape[0]))
                         total_val = 0.0
                         total_n = 0.0
-                        for start in range(0, int(X_num_val.shape[0]), max(1, val_bs)):
-                            end = min(
-                                int(X_num_val.shape[0]), start + max(1, val_bs))
-                            X_num_v_true_cpu = X_num_val[start:end]
-                            X_cat_v_true_cpu = X_cat_val[start:end]
-                            X_geo_v = X_geo_val[start:end].to(
-                                self.device, non_blocking=True)
-                            gen_val = torch.Generator()
-                            gen_val.manual_seed(10_000 + epoch + start)
-                            X_num_v_cpu, X_cat_v_cpu, val_num_mask, val_cat_mask = _mask_inputs(
-                                X_num_v_true_cpu, X_cat_v_true_cpu, gen_val)
-                            X_num_v_true = X_num_v_true_cpu.to(
-                                self.device, non_blocking=True)
-                            X_cat_v_true = X_cat_v_true_cpu.to(
-                                self.device, non_blocking=True)
-                            X_num_v = X_num_v_cpu.to(
-                                self.device, non_blocking=True)
-                            X_cat_v = X_cat_v_cpu.to(
+                        for batch in val_dataloader:
+                            X_num_v, X_cat_v, X_geo_v, X_num_v_true, val_num_mask, X_cat_v_true, val_cat_mask = batch
+                            X_num_v = X_num_v.to(self.device, non_blocking=True)
+                            X_cat_v = X_cat_v.to(self.device, non_blocking=True)
+                            X_geo_v = X_geo_v.to(self.device, non_blocking=True)
+                            X_num_v_true = None if X_num_v_true is None else X_num_v_true.to(
                                 self.device, non_blocking=True)
                             val_num_mask = None if val_num_mask is None else val_num_mask.to(
+                                self.device, non_blocking=True)
+                            X_cat_v_true = None if X_cat_v_true is None else X_cat_v_true.to(
                                 self.device, non_blocking=True)
                             val_cat_mask = None if val_cat_mask is None else val_cat_mask.to(
                                 self.device, non_blocking=True)
@@ -927,8 +1160,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                                 X_num_v, X_cat_v, X_geo_v, return_reconstruction=True)
                             loss_v = _compute_reconstruction_loss(
                                 num_pred_v, cat_logits_v,
-                                X_num_v_true if X_num_v_true.numel() else None, val_num_mask,
-                                X_cat_v_true if X_cat_v_true.numel() else None, val_cat_mask,
+                                X_num_v_true, val_num_mask,
+                                X_cat_v_true, val_cat_mask,
                                 num_loss_weight, cat_loss_weight,
                                 device=X_num_v.device
                             )
@@ -936,9 +1169,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                                 total_val = float("inf")
                                 total_n = 1.0
                                 break
-                            total_val += float(loss_v.detach().item()
-                                               ) * float(end - start)
-                            total_n += float(end - start)
+                            total_val += float(loss_v.detach().item()) * float(X_num_v.shape[0])
+                            total_n += float(X_num_v.shape[0])
                     val_loss_tensor[0] = total_val / max(total_n, 1.0)
 
                 if use_collectives:

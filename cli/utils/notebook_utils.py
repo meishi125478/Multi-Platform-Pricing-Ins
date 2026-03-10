@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, cast
+from typing import Dict, Iterable, List, Optional, Sequence, cast
 
-from ins_pricing.cli.utils.cli_config import add_config_json_arg, set_env  # type: ignore
+from ins_pricing.cli.utils.cli_config import add_config_json_arg, build_subprocess_env  # type: ignore
 
 
 def _find_ins_pricing_dir(cwd: Optional[Path] = None) -> Path:
@@ -139,9 +140,14 @@ def wrap_with_watchdog(
     return _stringify_cmd(wd_cmd)
 
 
-def run(cmd: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def run(
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
     """Run an external command from a notebook (blocking)."""
-    return subprocess.run(list(cmd), check=check)
+    return subprocess.run(list(cmd), check=check, env=env)
 
 
 def _build_config_parser(description: str) -> argparse.ArgumentParser:
@@ -153,18 +159,20 @@ def _build_config_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
-def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
+def build_run_spec_from_config(
+    config_json: str | Path,
+) -> tuple[List[str], str, Dict[str, str]]:
     """Build a command list from config.json runner settings.
 
     Returns:
-        (cmd, mode) where mode is one of: entry, incremental, explain.
+        (cmd, mode, env) where mode is one of: entry, incremental, explain.
     """
     pkg_dir = _find_ins_pricing_dir()
     config_path = Path(config_json)
     if not config_path.is_absolute():
         config_path = (pkg_dir / config_path).resolve() if (pkg_dir / config_path).exists() else config_path.resolve()
     raw = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
-    set_env(raw.get("env", {}))
+    env = build_subprocess_env(raw.get("env", {}), base_env=dict(os.environ), overwrite=True)
     runner = cast(dict, raw.get("runner") or {})
 
     mode = str(runner.get("mode") or "entry").strip().lower()
@@ -189,7 +197,7 @@ def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
                 max_restarts=max_restarts,
                 restart_delay_seconds=restart_delay_seconds,
             )
-        return cmd, "incremental"
+        return cmd, "incremental", env
 
     if mode == "explain":
         exp_args = runner.get("explain_args") or []
@@ -203,7 +211,7 @@ def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
                 max_restarts=max_restarts,
                 restart_delay_seconds=restart_delay_seconds,
             )
-        return cmd, "explain"
+        return cmd, "explain", env
 
     if mode != "entry":
         raise ValueError(
@@ -244,7 +252,13 @@ def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
             max_restarts=max_restarts,
             restart_delay_seconds=restart_delay_seconds,
         )
-    return cmd, "entry"
+    return cmd, "entry", env
+
+
+def build_cmd_from_config(config_json: str | Path) -> tuple[List[str], str]:
+    """Backward-compatible wrapper returning only (cmd, mode)."""
+    cmd, mode, _env = build_run_spec_from_config(config_json)
+    return cmd, mode
 
 
 def run_from_config_cli(
@@ -306,5 +320,5 @@ def run_from_config(config_json: str | Path) -> subprocess.CompletedProcess:
     - runner.use_watchdog / runner.idle_seconds / runner.max_restarts / runner.restart_delay_seconds
     - runner.incremental_args: List[str] (incremental only; extra args for cli/BayesOpt_incremental.py)
     """
-    cmd, _mode = build_cmd_from_config(config_json)
-    return run(cmd, check=True)
+    cmd, _mode, env = build_run_spec_from_config(config_json)
+    return run(cmd, check=True, env=env)

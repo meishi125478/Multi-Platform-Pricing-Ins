@@ -4,9 +4,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ins_pricing.modelling.bayesopt.config_runtime import OutputManager
 from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
-from ins_pricing.modelling.bayesopt.runtime import (
+from ins_pricing.modelling.bayesopt.runtime.trainer_cv_prediction import (
     TrainerCVPredictionMixin,
+)
+from ins_pricing.modelling.bayesopt.runtime.trainer_optuna import (
     TrainerOptunaMixin,
+)
+from ins_pricing.modelling.bayesopt.runtime.trainer_persistence import (
     TrainerPersistenceMixin,
 )
 from ins_pricing.modelling.bayesopt.trainers.trainer_context import TrainerContext
@@ -210,6 +214,8 @@ class TrainerBase(
         dummy_columns: List[str] = []
         if getattr(self.ctx, "train_oht_data", None) is not None:
             dummy_columns = list(self.ctx.train_oht_data.columns)
+        elif getattr(self.ctx, "train_oht_scl_data", None) is not None:
+            dummy_columns = list(self.ctx.train_oht_scl_data.columns)
         ohe_feature_names = list(getattr(self.ctx, "ohe_feature_names", []) or [])
         if not ohe_feature_names:
             num_set = set(getattr(self.ctx, "num_features", []) or [])
