@@ -887,6 +887,8 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
         has_val = X_val is not None
 
         val_dataset = None
+        val_dataloader = None
+        X_num_val = X_cat_val = X_geo_val = None
         if use_lazy:
             pre = _FTPreprocessorSnapshot.from_owner(self)
             dataset = _LazyFTMaskedDataset(
@@ -1005,8 +1007,7 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
             weight_decay=float(getattr(self, "weight_decay", 0.0)),
         )
         scaler = create_grad_scaler(device_type)
-        val_dataloader = None
-        if has_val and val_dataset is not None:
+        if use_lazy and has_val and val_dataset is not None:
             val_dataloader = self._build_val_dataloader(
                 val_dataset,
                 dataloader,
@@ -1130,6 +1131,112 @@ class FTTransformerSklearn(TorchTrainerMixin, nn.Module):
                 epoch_count += float(X_num_b.shape[0])
 
             train_history.append(epoch_loss_sum / max(epoch_count, 1.0))
+
+            if (
+                (not use_lazy)
+                and has_val
+                and X_num_val is not None
+                and X_cat_val is not None
+                and X_geo_val is not None
+            ):
+                should_compute_val = (not dist.is_initialized()
+                                      or DistributedUtils.is_main_process())
+                loss_tensor_device = self.device if device_type == 'cuda' else torch.device(
+                    "cpu")
+                val_loss_tensor = torch.zeros(1, device=loss_tensor_device)
+
+                if should_compute_val:
+                    self.ft.eval()
+                    with torch.no_grad(), create_autocast_context(device_type):
+                        val_bs = min(
+                            int(dataloader.batch_size * max(1, accum_steps)), int(X_num_val.shape[0]))
+                        total_val = 0.0
+                        total_n = 0.0
+                        for start in range(0, int(X_num_val.shape[0]), max(1, val_bs)):
+                            end = min(
+                                int(X_num_val.shape[0]), start + max(1, val_bs))
+                            X_num_v_true_cpu = X_num_val[start:end]
+                            X_cat_v_true_cpu = X_cat_val[start:end]
+                            X_geo_v = X_geo_val[start:end].to(
+                                self.device, non_blocking=True)
+                            gen_val = torch.Generator()
+                            gen_val.manual_seed(10_000 + epoch + start)
+                            X_num_v_cpu, X_cat_v_cpu, val_num_mask, val_cat_mask = _mask_inputs(
+                                X_num_v_true_cpu, X_cat_v_true_cpu, gen_val)
+                            X_num_v_true = X_num_v_true_cpu.to(
+                                self.device, non_blocking=True)
+                            X_cat_v_true = X_cat_v_true_cpu.to(
+                                self.device, non_blocking=True)
+                            X_num_v = X_num_v_cpu.to(
+                                self.device, non_blocking=True)
+                            X_cat_v = X_cat_v_cpu.to(
+                                self.device, non_blocking=True)
+                            val_num_mask = None if val_num_mask is None else val_num_mask.to(
+                                self.device, non_blocking=True)
+                            val_cat_mask = None if val_cat_mask is None else val_cat_mask.to(
+                                self.device, non_blocking=True)
+                            num_pred_v, cat_logits_v = self.ft(
+                                X_num_v, X_cat_v, X_geo_v, return_reconstruction=True)
+                            loss_v = _compute_reconstruction_loss(
+                                num_pred_v, cat_logits_v,
+                                X_num_v_true if X_num_v_true.numel() else None, val_num_mask,
+                                X_cat_v_true if X_cat_v_true.numel() else None, val_cat_mask,
+                                num_loss_weight, cat_loss_weight,
+                                device=X_num_v.device
+                            )
+                            if not torch.isfinite(loss_v):
+                                total_val = float("inf")
+                                total_n = 1.0
+                                break
+                            total_val += float(loss_v.detach().item()
+                                               ) * float(end - start)
+                            total_n += float(end - start)
+                    val_loss_tensor[0] = total_val / max(total_n, 1.0)
+
+                if use_collectives:
+                    dist.broadcast(val_loss_tensor, src=0)
+                val_loss_value = float(val_loss_tensor.item())
+                prune_now = False
+                prune_msg = None
+                if not np.isfinite(val_loss_value):
+                    prune_now = True
+                    prune_msg = (
+                        f"[FTTransformerSklearn.fit_unsupervised] non-finite val loss "
+                        f"(epoch={epoch}, val_loss={val_loss_value})"
+                    )
+                val_history.append(val_loss_value)
+
+                if val_loss_value < best_loss:
+                    best_loss = val_loss_value
+                    base_module = self.ft.module if hasattr(self.ft, "module") else self.ft
+                    best_state = {
+                        k: v.detach().clone().cpu() if isinstance(v, torch.Tensor) else copy.deepcopy(v)
+                        for k, v in base_module.state_dict().items()
+                    }
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if best_state is not None and patience_counter >= int(self.patience):
+                        break
+
+                if trial is not None and (not dist.is_initialized() or DistributedUtils.is_main_process()):
+                    trial.report(val_loss_value, epoch)
+                    if trial.should_prune():
+                        prune_now = True
+
+                if use_collectives:
+                    flag = torch.tensor(
+                        [1 if prune_now else 0],
+                        device=loss_tensor_device,
+                        dtype=torch.int32,
+                    )
+                    dist.broadcast(flag, src=0)
+                    prune_now = bool(flag.item())
+
+                if prune_now:
+                    if prune_msg:
+                        raise optuna.TrialPruned(prune_msg)
+                    raise optuna.TrialPruned()
 
             if val_dataloader is not None:
                 should_compute_val = (not dist.is_initialized()
