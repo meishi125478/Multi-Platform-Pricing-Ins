@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ins_pricing.modelling.bayesopt.config_runtime import OutputManager
 from ins_pricing.modelling.bayesopt.config_schema import BayesOptConfig
@@ -14,6 +14,13 @@ from ins_pricing.modelling.bayesopt.runtime.trainer_persistence import (
     TrainerPersistenceMixin,
 )
 from ins_pricing.modelling.bayesopt.trainers.trainer_context import TrainerContext
+from ins_pricing.utils import get_logger, log_print
+
+_logger = get_logger("ins_pricing.modelling.bayesopt.trainer.base")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
 
 
 class TrainerBase(
@@ -31,6 +38,107 @@ class TrainerBase(
         self.study_name: Optional[str] = None
         self.enable_distributed_optuna: bool = False
         self._distributed_forced_params: Optional[Dict[str, Any]] = None
+        self._invalid_param_warnings_emitted: Set[Tuple[str, Tuple[str, ...]]] = set()
+
+    def _resolve_invalid_param_policy(self) -> str:
+        raw = str(getattr(self.config, "invalid_param_policy", "warn") or "warn")
+        policy = raw.strip().lower()
+        if policy not in {"warn", "error", "ignore"}:
+            return "warn"
+        return policy
+
+    def _handle_invalid_params(self, *, params: Dict[str, Any], context: str) -> None:
+        if not params:
+            return
+        keys = tuple(sorted(str(k) for k in params.keys()))
+        policy = self._resolve_invalid_param_policy()
+        message = (
+            f"[{self.label}] Unsupported params for {context}: "
+            f"{', '.join(keys)}."
+        )
+        if policy == "error":
+            raise ValueError(message)
+        if policy == "warn":
+            signature = (context, keys)
+            if signature in self._invalid_param_warnings_emitted:
+                return
+            self._invalid_param_warnings_emitted.add(signature)
+            _log(f"{message} Ignoring these params.", flush=True)
+
+    def _filter_params_by_allowlist(
+        self,
+        params: Optional[Dict[str, Any]],
+        *,
+        allowed_keys: Optional[Set[str]],
+        context: str,
+    ) -> Dict[str, Any]:
+        if not params:
+            return {}
+        if allowed_keys is None:
+            return dict(params)
+        filtered: Dict[str, Any] = {}
+        invalid: Dict[str, Any] = {}
+        for key, value in params.items():
+            if key in allowed_keys:
+                filtered[key] = value
+            else:
+                invalid[key] = value
+        self._handle_invalid_params(params=invalid, context=context)
+        return filtered
+
+    def _filter_params_by_model_support(
+        self,
+        model: Any,
+        params: Optional[Dict[str, Any]],
+        *,
+        context: str,
+        extra_allowed_keys: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        if not params:
+            return {}
+
+        allowed_keys: Set[str] = set(extra_allowed_keys or set())
+        get_params = getattr(model, "get_params", None)
+        if callable(get_params):
+            try:
+                model_params = get_params(deep=True)
+            except TypeError:
+                model_params = get_params()
+            except Exception:
+                model_params = None
+            if isinstance(model_params, dict):
+                allowed_keys.update(str(k) for k in model_params.keys())
+
+        filtered: Dict[str, Any] = {}
+        invalid: Dict[str, Any] = {}
+        for key, value in params.items():
+            if key in allowed_keys or hasattr(model, key):
+                filtered[key] = value
+            else:
+                invalid[key] = value
+        self._handle_invalid_params(params=invalid, context=context)
+        return filtered
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        return dict(params or {})
+
+    def _sanitize_with_allowlist(
+        self,
+        params: Optional[Dict[str, Any]],
+        *,
+        allowed_keys: set[str],
+        context: str,
+    ) -> Dict[str, Any]:
+        return self._filter_params_by_allowlist(
+            dict(params or {}),
+            allowed_keys=set(allowed_keys),
+            context=context,
+        )
 
     def _get_search_space_config(self, field_name: str) -> Dict[str, Any]:
         """Read search-space config from BayesOptConfig."""

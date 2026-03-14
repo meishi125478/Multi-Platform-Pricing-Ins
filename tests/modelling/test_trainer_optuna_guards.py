@@ -35,6 +35,19 @@ class _DummyTrainer(TrainerOptunaMixin):
         return None
 
 
+class _DummySanitizedTrainer(_DummyTrainer):
+    def _sanitize_best_params(
+        self,
+        params: dict,
+        *,
+        context: str = "best_params",
+    ) -> dict:
+        _ = context
+        out = dict(params or {})
+        out.pop("drop_me", None)
+        return out
+
+
 def test_run_study_and_extract_raises_for_all_pruned_trials(tmp_path: Path) -> None:
     trainer = _DummyTrainer(tmp_path)
     study = trainer._create_study()
@@ -153,3 +166,64 @@ def test_objective_wrapper_prunes_dataloader_worker_runtime_error(tmp_path: Path
     with pytest.raises(optuna.TrialPruned):
         objective_wrapper(trial)
     assert progress_counter["count"] == 1
+
+
+def test_run_study_and_extract_applies_best_param_sanitizer(tmp_path: Path) -> None:
+    trainer = _DummySanitizedTrainer(tmp_path)
+    study = trainer._create_study()
+    progress_counter = {"count": 0}
+
+    def _objective(trial: optuna.trial.Trial) -> float:
+        trial.suggest_float("keep_me", 1e-5, 1e-3, log=True)
+        trial.suggest_int("drop_me", 1, 5)
+        return 0.1
+
+    objective_wrapper = trainer._make_objective_wrapper(
+        _objective,
+        total_trials=1,
+        progress_counter=progress_counter,
+        barrier_on_end=False,
+    )
+    checkpoint_callback = trainer._make_checkpoint_callback()
+    trainer._run_study_and_extract(
+        study=study,
+        objective_wrapper=objective_wrapper,
+        checkpoint_callback=checkpoint_callback,
+        total_trials=1,
+        progress_counter=progress_counter,
+    )
+
+    assert isinstance(trainer.best_params, dict)
+    assert "keep_me" in trainer.best_params
+    assert "drop_me" not in trainer.best_params
+
+
+def _make_minimal_xgb_trainer(invalid_param_policy: str = "warn") -> XGBTrainer:
+    trainer = object.__new__(XGBTrainer)
+    trainer.label = "Xgboost"
+    trainer.model_name_prefix = "Xgboost"
+    trainer._invalid_param_warnings_emitted = set()
+    trainer.ctx = types.SimpleNamespace(
+        task_type="regression",
+        config=types.SimpleNamespace(
+            invalid_param_policy=invalid_param_policy,
+            xgb_search_space={"learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2}},
+        ),
+    )
+    return trainer
+
+
+def test_xgb_sanitize_tuned_params_filters_unsupported_keys_under_warn_policy() -> None:
+    trainer = _make_minimal_xgb_trainer(invalid_param_policy="warn")
+    sanitized = trainer._sanitize_tuned_params(
+        {"learning_rate": 1e-3, "geo_token_hidden_dim": 32}
+    )
+    assert sanitized == {"learning_rate": 1e-3}
+
+
+def test_xgb_sanitize_tuned_params_raises_under_error_policy() -> None:
+    trainer = _make_minimal_xgb_trainer(invalid_param_policy="error")
+    with pytest.raises(ValueError, match="Unsupported params"):
+        trainer._sanitize_tuned_params(
+            {"learning_rate": 1e-3, "geo_token_hidden_dim": 32}
+        )

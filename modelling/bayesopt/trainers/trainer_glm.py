@@ -19,9 +19,35 @@ def _log(*args, **kwargs) -> None:
     log_print(_logger, *args, **kwargs)
 
 class GLMTrainer(TrainerBase):
+    _GLM_PARAM_KEYS = {"alpha", "l1_ratio", "tweedie_power"}
+
     def __init__(self, context: "BayesOptModel") -> None:
         super().__init__(context, 'GLM', 'GLM')
         self.model = None
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        return self._sanitize_with_allowlist(
+            params,
+            allowed_keys=set(self._GLM_PARAM_KEYS),
+            context=f"{context} (GLM params)",
+        )
+
+    def _resolve_tuned_params(self) -> Dict[str, Any]:
+        params = self._sanitize_with_allowlist(
+            self.best_params,
+            allowed_keys=set(self._GLM_PARAM_KEYS),
+            context="GLM tuned params",
+        )
+        if "alpha" not in params or "l1_ratio" not in params:
+            raise RuntimeError(
+                "GLM best_params must contain both 'alpha' and 'l1_ratio' after filtering."
+            )
+        return params
 
     def _select_family(self, tweedie_power: Optional[float] = None):
         if self.ctx.task_type == 'classification':
@@ -119,7 +145,8 @@ class GLMTrainer(TrainerBase):
     def train(self) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best GLM parameters.")
-        tweedie_power = self.best_params.get('tweedie_power')
+        params = self._resolve_tuned_params()
+        tweedie_power = params.get('tweedie_power')
         family = self._select_family(tweedie_power)
 
         X_train = self._prepare_design(self.ctx.train_oht_scl_data)
@@ -129,10 +156,11 @@ class GLMTrainer(TrainerBase):
         glm = sm.GLM(y_train, X_train, family=family,
                      freq_weights=w_train)
         self.model = glm.fit_regularized(
-            alpha=self.best_params['alpha'],
-            L1_wt=self.best_params['l1_ratio'],
+            alpha=params['alpha'],
+            L1_wt=params['l1_ratio'],
             maxiter=300
         )
+        self.best_params = params
 
         self.ctx.glm_best = self.model
         self.ctx.model_label += [self.label]
@@ -147,6 +175,7 @@ class GLMTrainer(TrainerBase):
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best GLM parameters.")
+        params = self._resolve_tuned_params()
         k = max(2, int(k))
         data = self.ctx.train_oht_scl_data
         if data is None:
@@ -161,7 +190,7 @@ class GLMTrainer(TrainerBase):
         n_samples = len(X_all)
         X_all_design = self._prepare_design(data)
         X_test_design = self._prepare_design(X_test)
-        tweedie_power = self.best_params.get('tweedie_power')
+        tweedie_power = params.get('tweedie_power')
         family = self._select_family(tweedie_power)
 
         split_iter, _ = self._resolve_ensemble_splits(X_all, k=k)
@@ -182,8 +211,8 @@ class GLMTrainer(TrainerBase):
 
             glm = sm.GLM(y_train, X_train, family=family, freq_weights=w_train)
             result = glm.fit_regularized(
-                alpha=self.best_params['alpha'],
-                L1_wt=self.best_params['l1_ratio'],
+                alpha=params['alpha'],
+                L1_wt=params['l1_ratio'],
                 maxiter=300
             )
             pred_train = result.predict(X_all_design)

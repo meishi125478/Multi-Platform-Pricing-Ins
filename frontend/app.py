@@ -15,27 +15,22 @@ def create_ui():
     import gradio as gr
 
     app = PricingApp()
-    xgb_search_space_template = json.dumps(
-        app.config_builder._default_xgb_search_space(),
-        indent=2,
-        ensure_ascii=False,
+    def _dump_json_template(payload):
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    xgb_search_space_template = _dump_json_template(
+        app.config_builder._default_xgb_search_space()
     )
-    resn_search_space_template = json.dumps(
-        app.config_builder._default_resn_search_space(),
-        indent=2,
-        ensure_ascii=False,
+    resn_search_space_template = _dump_json_template(
+        app.config_builder._default_resn_search_space()
     )
-    ft_search_space_template = json.dumps(
-        app.config_builder._default_ft_search_space(),
-        indent=2,
-        ensure_ascii=False,
+    ft_search_space_template = _dump_json_template(
+        app.config_builder._default_ft_search_space()
     )
-    ft_unsupervised_search_space_template = json.dumps(
-        app.config_builder._default_ft_unsupervised_search_space(),
-        indent=2,
-        ensure_ascii=False,
+    ft_unsupervised_search_space_template = _dump_json_template(
+        app.config_builder._default_ft_unsupervised_search_space()
     )
-    workflow_template = json.dumps(
+    workflow_template = _dump_json_template(
         {
             "workflow": {
                 "mode": "plot_direct",
@@ -43,11 +38,9 @@ def create_ui():
                 "xgb_cfg_path": "config_xgb_direct.json",
                 "resn_cfg_path": "config_resn_direct.json",
             }
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
-    xgb_step2_overrides_template = json.dumps(
+    xgb_step2_overrides_template = _dump_json_template(
         {
             "output_dir": "./ResultsXGBFromFTUnsupervised",
             "optuna_storage": "./ResultsXGBFromFTUnsupervised/optuna/bayesopt.sqlite3",
@@ -62,11 +55,9 @@ def create_ui():
             },
             "plot_curves": False,
             "plot": {"enable": False},
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
-    resn_step2_overrides_template = json.dumps(
+    resn_step2_overrides_template = _dump_json_template(
         {
             "use_resn_ddp": True,
             "output_dir": "./ResultsResNFromFTUnsupervised",
@@ -81,22 +72,17 @@ def create_ui():
             },
             "plot_curves": False,
             "plot": {"enable": False},
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
     dir_status_init, dir_choices_init, dir_value_init = app.list_directory_candidates(
         str(app.working_dir)
     )
-    pre_factor_status_init, pre_factor_choices_init, pre_factor_value_init = (
-        app.suggest_oneway_factors("config_plot.json")
-    )
-    direct_factor_status_init, direct_factor_choices_init, direct_factor_value_init = (
-        app.suggest_oneway_factors("config_plot.json")
-    )
-    embed_factor_status_init, embed_factor_choices_init, embed_factor_value_init = (
-        app.suggest_oneway_factors("config_plot.json")
-    )
+    def _initial_oneway_factor_state():
+        return app.suggest_oneway_factors("config_plot.json")
+
+    pre_factor_status_init, pre_factor_choices_init, pre_factor_value_init = _initial_oneway_factor_state()
+    direct_factor_status_init, direct_factor_choices_init, direct_factor_value_init = _initial_oneway_factor_state()
+    embed_factor_status_init, embed_factor_choices_init, embed_factor_value_init = _initial_oneway_factor_state()
 
     def _set_working_dir_ui(path_text: str):
         status, resolved = app.set_working_dir(path_text)
@@ -1087,18 +1073,25 @@ def create_ui():
             outputs=[step2_status, xgb_config_display, resn_config_display]
         )
 
-        pre_load_factors_btn.click(
-            fn=_load_oneway_factors_ui,
-            inputs=[pre_cfg_path],
-            outputs=[pre_factor_status, pre_oneway_factors],
-            show_api=False,
-        )
+        def _bind_oneway_factor_loader(load_btn, cfg_input, status_output, factors_output):
+            load_btn.click(
+                fn=_load_oneway_factors_ui,
+                inputs=[cfg_input],
+                outputs=[status_output, factors_output],
+                show_api=False,
+            )
+            cfg_input.change(
+                fn=_load_oneway_factors_ui,
+                inputs=[cfg_input],
+                outputs=[status_output, factors_output],
+                show_api=False,
+            )
 
-        pre_cfg_path.change(
-            fn=_load_oneway_factors_ui,
-            inputs=[pre_cfg_path],
-            outputs=[pre_factor_status, pre_oneway_factors],
-            show_api=False,
+        _bind_oneway_factor_loader(
+            pre_load_factors_btn,
+            pre_cfg_path,
+            pre_factor_status,
+            pre_oneway_factors,
         )
 
         pre_run_btn.click(
@@ -1113,18 +1106,11 @@ def create_ui():
             show_api=False,
         )
 
-        direct_load_factors_btn.click(
-            fn=_load_oneway_factors_ui,
-            inputs=[direct_cfg_path],
-            outputs=[direct_factor_status, direct_oneway_factors],
-            show_api=False,
-        )
-
-        direct_cfg_path.change(
-            fn=_load_oneway_factors_ui,
-            inputs=[direct_cfg_path],
-            outputs=[direct_factor_status, direct_oneway_factors],
-            show_api=False,
+        _bind_oneway_factor_loader(
+            direct_load_factors_btn,
+            direct_cfg_path,
+            direct_factor_status,
+            direct_oneway_factors,
         )
 
         direct_run_btn.click(
@@ -1143,18 +1129,11 @@ def create_ui():
             show_api=False,
         )
 
-        embed_load_factors_btn.click(
-            fn=_load_oneway_factors_ui,
-            inputs=[embed_cfg_path],
-            outputs=[embed_factor_status, embed_oneway_factors],
-            show_api=False,
-        )
-
-        embed_cfg_path.change(
-            fn=_load_oneway_factors_ui,
-            inputs=[embed_cfg_path],
-            outputs=[embed_factor_status, embed_oneway_factors],
-            show_api=False,
+        _bind_oneway_factor_loader(
+            embed_load_factors_btn,
+            embed_cfg_path,
+            embed_factor_status,
+            embed_oneway_factors,
         )
 
         embed_run_btn.click(

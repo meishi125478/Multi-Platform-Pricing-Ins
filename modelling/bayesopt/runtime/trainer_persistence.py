@@ -44,7 +44,13 @@ class TrainerPersistenceMixin:
             _log(f"[load] Warning: Unknown model format in {path}")
             return
         if best_params is not None:
-            self.best_params = best_params
+            sanitize_fn = getattr(self, "_sanitize_best_params", None)
+            if callable(sanitize_fn):
+                self.best_params = dict(
+                    sanitize_fn(dict(best_params), context="checkpoint_load") or {}
+                )
+            else:
+                self.best_params = best_params
         if model is not None:
             self._move_to_device(model)
         self.model = model

@@ -33,6 +33,7 @@ class FTTrainer(TrainerBase):
             getattr(dist_cfg, "use_ft_ddp", False) and context.use_gpu
         )
         self._cv_geo_warned = False
+        self._param_probe_model: Optional[FTTransformerSklearn] = None
 
     def _dist_cfg(self):
         return getattr(self.ctx.config, "distributed", self.ctx.config)
@@ -72,6 +73,26 @@ class FTTrainer(TrainerBase):
             requested,
         )
 
+    def _create_ft_model(self, **overrides: Any) -> FTTransformerSklearn:
+        kwargs: Dict[str, Any] = {
+            "model_nme": self.ctx.model_nme,
+            "num_cols": self.ctx.num_features,
+            "cat_cols": self.ctx.cate_list,
+            "task_type": self.ctx.task_type,
+            "use_data_parallel": self._use_ft_data_parallel(),
+            "use_ddp": self._use_ft_ddp(),
+            "use_gpu": bool(getattr(self.ctx, "use_gpu", False)),
+            "num_numeric_tokens": self._resolve_numeric_tokens(),
+            "loss_name": getattr(self.ctx, "loss_name", "tweedie"),
+            "distribution": getattr(self.ctx, "distribution", None),
+        }
+        kwargs.update(overrides)
+        return FTTransformerSklearn(**kwargs)
+
+    def _create_runtime_ft_model(self, **overrides: Any) -> FTTransformerSklearn:
+        model = self._create_ft_model(**overrides)
+        return self._apply_dataloader_overrides(model)
+
     def _resolve_adaptive_heads(self,
                                 d_model: int,
                                 requested_heads: Optional[int] = None) -> Tuple[int, bool]:
@@ -92,25 +113,113 @@ class FTTrainer(TrainerBase):
                 return candidate, True
         return 1, True
 
-    def _build_geo_tokens_for_split(self,
-                                    X_train: pd.DataFrame,
-                                    X_val: pd.DataFrame,
-                                    geo_params: Optional[Dict[str, Any]] = None):
-        if not self._geo_feature_names():
+    def _apply_adaptive_heads(
+        self,
+        params: Dict[str, Any],
+        *,
+        default_d_model: int,
+        log_adjustment: bool = True,
+    ) -> Dict[str, Any]:
+        resolved = dict(params)
+        d_model_value = resolved.get("d_model", default_d_model)
+        adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
+            d_model=d_model_value,
+            requested_heads=resolved.get("n_heads"),
+        )
+        if log_adjustment and heads_adjusted:
+            _log(
+                f"[FTTrainer] Auto-adjusted n_heads from "
+                f"{resolved.get('n_heads')} to {adaptive_heads} "
+                f"(d_model={d_model_value})."
+            )
+        resolved["n_heads"] = adaptive_heads
+        return resolved
+
+    def _apply_model_params(
+        self,
+        model: FTTransformerSklearn,
+        resolved_params: Dict[str, Any],
+        *,
+        context: str = "FTTransformer model params",
+    ) -> Dict[str, Any]:
+        model_params = self._filter_params_by_model_support(
+            model,
+            resolved_params,
+            context=context,
+        )
+        if model_params:
+            model.set_params(model_params)
+        return model_params
+
+    def _slice_geo_tokens(self, index: pd.Index) -> Optional[pd.DataFrame]:
+        geo_all = self.ctx.train_geo_tokens
+        if geo_all is None:
             return None
-        orig_train = self.ctx.train_data
-        orig_test = self.ctx.test_data
         try:
-            self.ctx.train_data = orig_train.loc[X_train.index].copy()
-            self.ctx.test_data = orig_train.loc[X_val.index].copy()
-            return self.ctx._build_geo_tokens(geo_params)
-        finally:
-            self.ctx.train_data = orig_train
-            self.ctx.test_data = orig_test
+            return geo_all.loc[index]
+        except Exception:
+            return None
+
+    def _build_geo_io_kwargs(
+        self,
+        *,
+        geo_train: Optional[pd.DataFrame],
+        geo_test: Optional[pd.DataFrame],
+        return_embedding: bool = False,
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        fit_kwargs: Dict[str, Any] = {}
+        predict_kwargs_train: Optional[Dict[str, Any]] = None
+        predict_kwargs_test: Optional[Dict[str, Any]] = None
+        if geo_train is not None and geo_test is not None:
+            fit_kwargs["geo_train"] = geo_train
+            predict_kwargs_train = {"geo_tokens": geo_train}
+            predict_kwargs_test = {"geo_tokens": geo_test}
+        if return_embedding:
+            predict_kwargs_train = dict(predict_kwargs_train or {})
+            predict_kwargs_test = dict(predict_kwargs_test or {})
+            predict_kwargs_train["return_embedding"] = True
+            predict_kwargs_test["return_embedding"] = True
+        return fit_kwargs, predict_kwargs_train, predict_kwargs_test
+
+    def _resolve_geo_tokens_for_fold(
+        self,
+        X_train: pd.DataFrame,
+        X_val: pd.DataFrame,
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        if not self._geo_feature_names():
+            return None, None
+        geo_train = self._slice_geo_tokens(X_train.index)
+        geo_val = self._slice_geo_tokens(X_val.index)
+        if (geo_train is None or geo_val is None) and not self._cv_geo_warned:
+            _log(
+                "[FTTrainer] Geo tokens unavailable for CV split; continue without geo tokens.",
+                flush=True,
+            )
+            self._cv_geo_warned = True
+        return geo_train, geo_val
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        probe = self._param_probe_model
+        if probe is None:
+            probe = self._create_ft_model(
+                use_data_parallel=False,
+                use_ddp=False,
+                use_gpu=False,
+            )
+            self._param_probe_model = probe
+        return self._filter_params_by_model_support(
+            probe,
+            params,
+            context=f"{context} (FT model params)",
+        )
 
     def cross_val_unsupervised(self, trial: Optional[optuna.trial.Trial]) -> float:
         """Optuna objective A: minimize validation loss for masked reconstruction."""
-        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         search_space = self._get_search_space_config("ft_unsupervised_search_space")
         param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {}
         param_space = self._augment_param_space_with_search_space(
@@ -152,17 +261,7 @@ class FTTrainer(TrainerBase):
         train_idx, val_idx = split
         X_train = X_all.iloc[train_idx]
         X_val = X_all.iloc[val_idx]
-        geo_train = geo_val = None
-        if self._geo_feature_names():
-            built = self._build_geo_tokens_for_split(X_train, X_val, params)
-            if built is not None:
-                geo_train, geo_val, _, _ = built
-            elif not self._cv_geo_warned:
-                _log(
-                    "[FTTrainer] Geo tokens unavailable for CV split; continue without geo tokens.",
-                    flush=True,
-                )
-                self._cv_geo_warned = True
+        geo_train, geo_val = self._resolve_geo_tokens_for_fold(X_train, X_val)
 
         d_model = int(params.get("d_model", 64))
         n_layers = int(params.get("n_layers", 4))
@@ -190,23 +289,17 @@ class FTTrainer(TrainerBase):
         for k in ("mask_prob_num", "mask_prob_cat", "num_loss_weight", "cat_loss_weight"):
             model_params.pop(k, None)
 
-        model = FTTransformerSklearn(
-            model_nme=self.ctx.model_nme,
-            num_cols=self.ctx.num_features,
-            cat_cols=self.ctx.cate_list,
-            task_type=self.ctx.task_type,
+        model = self._create_runtime_ft_model(
             epochs=self.ctx.epochs,
             patience=5,
             weight_decay=float(params.get("weight_decay", 0.0)),
-            use_data_parallel=self._use_ft_data_parallel(),
-            use_ddp=self._use_ft_ddp(),
-            use_gpu=self.ctx.use_gpu,
             num_numeric_tokens=num_numeric_tokens,
-            loss_name=loss_name,
-            distribution=getattr(self.ctx, "distribution", None),
         )
-        model = self._apply_dataloader_overrides(model)
-        model.set_params(model_params)
+        self._apply_model_params(
+            model,
+            model_params,
+            context="FT unsupervised model params",
+        )
         try:
             return float(model.fit_unsupervised(
                 X_train,
@@ -257,8 +350,6 @@ class FTTrainer(TrainerBase):
                     f"[FTTrainer] Trial pruned early: d_model={d_model}, n_layers={n_layers} -> approx_units={approx_units}")
                 raise optuna.TrialPruned(
                     "config exceeds safe memory budget; prune before training")
-            geo_params_local = {k: v for k, v in params.items()
-                                if k.startswith("geo_token_")}
 
             tw_power = params.get("tw_power")
             if self.ctx.task_type == 'regression':
@@ -276,28 +367,18 @@ class FTTrainer(TrainerBase):
                 requested_heads=params.get("n_heads")
             )
 
-            model = FTTransformerSklearn(
-                model_nme=self.ctx.model_nme,
-                num_cols=self.ctx.num_features,
-                cat_cols=self.ctx.cate_list,
+            model = self._create_runtime_ft_model(
                 d_model=d_model,
                 n_heads=adaptive_heads,
                 n_layers=n_layers,
                 dropout=float(params.get("dropout", 0.1)),
-                task_type=self.ctx.task_type,
                 epochs=self.ctx.epochs,
                 tweedie_power=tw_power,
                 learning_rate=float(params.get("learning_rate", 1e-3)),
                 patience=5,
                 weight_decay=float(params.get("weight_decay", 0.0)),
-                use_data_parallel=self._use_ft_data_parallel(),
-                use_ddp=self._use_ft_ddp(),
-                use_gpu=self.ctx.use_gpu,
                 num_numeric_tokens=num_numeric_tokens,
-                loss_name=loss_name,
-                distribution=getattr(self.ctx, "distribution", None),
             )
-            model = self._apply_dataloader_overrides(model)
             handled_keys = {
                 "d_model",
                 "n_heads",
@@ -309,27 +390,21 @@ class FTTrainer(TrainerBase):
             }
             extra_params = {
                 key: value for key, value in params.items()
-                if key not in handled_keys and not key.startswith("geo_token_")
+                if key not in handled_keys
             }
+            extra_params = self._filter_params_by_model_support(
+                model,
+                extra_params,
+                context="FT CV model params",
+            )
             if extra_params:
                 model.set_params(extra_params)
-            model.set_params({"_geo_params": geo_params_local} if geo_enabled else {})
             return model
 
         def fit_predict(model, X_train, y_train, w_train, X_val, y_val, w_val, trial_obj):
-            geo_train = geo_val = None
+            geo_train, geo_val = (None, None)
             if geo_enabled:
-                geo_params = getattr(model, "_geo_params", {})
-                built = self._build_geo_tokens_for_split(
-                    X_train, X_val, geo_params)
-                if built is not None:
-                    geo_train, geo_val, _, _ = built
-                elif not self._cv_geo_warned:
-                    _log(
-                        "[FTTrainer] Geo tokens unavailable for CV split; continue without geo tokens.",
-                        flush=True,
-                    )
-                    self._cv_geo_warned = True
+                geo_train, geo_val = self._resolve_geo_tokens_for_fold(X_train, X_val)
             model.fit(
                 X_train, y_train, w_train,
                 X_val, y_val, w_val,
@@ -370,18 +445,13 @@ class FTTrainer(TrainerBase):
         if not self.best_params:
             raise RuntimeError(
                 "Run tune() first to obtain best FT-Transformer parameters.")
-        loss_name = getattr(self.ctx, "loss_name", "tweedie")
-        resolved_params = dict(self.best_params)
-        d_model_value = resolved_params.get("d_model", 64)
-        adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
-            d_model=d_model_value,
-            requested_heads=resolved_params.get("n_heads")
+        resolved_params = self._apply_adaptive_heads(
+            dict(self.best_params),
+            default_d_model=64,
+            log_adjustment=True,
         )
-        if heads_adjusted:
-            _log(f"[FTTrainer] Auto-adjusted n_heads from "
-                  f"{resolved_params.get('n_heads')} to {adaptive_heads} "
-                  f"(d_model={d_model_value}).")
-        resolved_params["n_heads"] = adaptive_heads
+        geo_train_full = self.ctx.train_geo_tokens
+        geo_test_full = self.ctx.test_geo_tokens
 
         use_refit = bool(getattr(self.ctx.config, "final_refit", True))
         refit_epochs = None
@@ -391,22 +461,14 @@ class FTTrainer(TrainerBase):
         split = self._resolve_train_val_indices(X_all)
         if use_refit and split is not None:
             train_idx, val_idx = split
-            tmp_model = FTTransformerSklearn(
-                model_nme=self.ctx.model_nme,
-                num_cols=self.ctx.num_features,
-                cat_cols=self.ctx.cate_list,
-                task_type=self.ctx.task_type,
-                use_data_parallel=self._use_ft_data_parallel(),
-                use_ddp=self._use_ft_ddp(),
-                use_gpu=self.ctx.use_gpu,
-                num_numeric_tokens=self._resolve_numeric_tokens(),
+            tmp_model = self._create_runtime_ft_model(
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
-                loss_name=loss_name,
-                distribution=getattr(self.ctx, "distribution", None),
             )
-            tmp_model = self._apply_dataloader_overrides(tmp_model)
-            tmp_model.set_params(resolved_params)
-            geo_train_full = self.ctx.train_geo_tokens
+            self._apply_model_params(
+                tmp_model,
+                resolved_params,
+                context="FT final refit params",
+            )
             geo_train = None if geo_train_full is None else geo_train_full.iloc[train_idx]
             geo_val = None if geo_train_full is None else geo_train_full.iloc[val_idx]
             tmp_model.fit(
@@ -426,36 +488,30 @@ class FTTrainer(TrainerBase):
             )
             self._maybe_cleanup_gpu(tmp_model)
 
-        self.model = FTTransformerSklearn(
-            model_nme=self.ctx.model_nme,
-            num_cols=self.ctx.num_features,
-            cat_cols=self.ctx.cate_list,
-            task_type=self.ctx.task_type,
-            use_data_parallel=self._use_ft_data_parallel(),
-            use_ddp=self._use_ft_ddp(),
-            use_gpu=self.ctx.use_gpu,
-            num_numeric_tokens=self._resolve_numeric_tokens(),
+        self.model = self._create_runtime_ft_model(
             weight_decay=float(resolved_params.get("weight_decay", 0.0)),
-            loss_name=loss_name,
-            distribution=getattr(self.ctx, "distribution", None),
         )
-        self.model = self._apply_dataloader_overrides(self.model)
         if refit_epochs is not None:
             self.model.epochs = int(refit_epochs)
-        self.model.set_params(resolved_params)
-        self.best_params = resolved_params
+        self._apply_model_params(
+            self.model,
+            resolved_params,
+            context="FT final train params",
+        )
+        self.best_params = self._sanitize_best_params(
+            resolved_params,
+            context="FT final train params",
+        )
         loss_plot_path = self.output.plot_path(
             f'{self.ctx.model_nme}/loss/loss_{self.ctx.model_nme}_{self.model_name_prefix}.png')
         self.model.loss_curve_path = loss_plot_path
-        geo_train = self.ctx.train_geo_tokens
-        geo_test = self.ctx.test_geo_tokens
-        fit_kwargs = {}
-        predict_kwargs_train = None
-        predict_kwargs_test = None
-        if geo_train is not None and geo_test is not None:
-            fit_kwargs["geo_train"] = geo_train
-            predict_kwargs_train = {"geo_tokens": geo_train}
-            predict_kwargs_test = {"geo_tokens": geo_test}
+        geo_train = geo_train_full
+        geo_test = geo_test_full
+        fit_kwargs, predict_kwargs_train, predict_kwargs_test = self._build_geo_io_kwargs(
+            geo_train=geo_train,
+            geo_test=geo_test,
+            return_embedding=False,
+        )
         self._fit_predict_cache(
             self.model,
             self.ctx.train_data[self.ctx.factor_nmes],
@@ -473,7 +529,6 @@ class FTTrainer(TrainerBase):
         if not self.best_params:
             raise RuntimeError(
                 "Run tune() first to obtain best FT-Transformer parameters.")
-        loss_name = getattr(self.ctx, "loss_name", "tweedie")
         k = max(2, int(k))
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
         y_all = self.ctx.train_data[self.ctx.resp_nme]
@@ -485,11 +540,11 @@ class FTTrainer(TrainerBase):
 
         resolved_params = dict(self.best_params)
         default_d_model = getattr(self.model, "d_model", 64)
-        adaptive_heads, _ = self._resolve_adaptive_heads(
-            d_model=resolved_params.get("d_model", default_d_model),
-            requested_heads=resolved_params.get("n_heads")
+        resolved_params = self._apply_adaptive_heads(
+            resolved_params,
+            default_d_model=default_d_model,
+            log_adjustment=False,
         )
-        resolved_params["n_heads"] = adaptive_heads
 
         split_iter, _ = self._resolve_ensemble_splits(X_all, k=k)
         if split_iter is None:
@@ -503,21 +558,14 @@ class FTTrainer(TrainerBase):
 
         split_count = 0
         for train_idx, val_idx in split_iter:
-            model = FTTransformerSklearn(
-                model_nme=self.ctx.model_nme,
-                num_cols=self.ctx.num_features,
-                cat_cols=self.ctx.cate_list,
-                task_type=self.ctx.task_type,
-                use_data_parallel=self._use_ft_data_parallel(),
-                use_ddp=self._use_ft_ddp(),
-                use_gpu=self.ctx.use_gpu,
-                num_numeric_tokens=self._resolve_numeric_tokens(),
+            model = self._create_runtime_ft_model(
                 weight_decay=float(resolved_params.get("weight_decay", 0.0)),
-                loss_name=loss_name,
-                distribution=getattr(self.ctx, "distribution", None),
             )
-            model = self._apply_dataloader_overrides(model)
-            model.set_params(resolved_params)
+            self._apply_model_params(
+                model,
+                resolved_params,
+                context="FT ensemble params",
+            )
 
             geo_train = geo_val = None
             if geo_train_full is not None:
@@ -616,33 +664,20 @@ class FTTrainer(TrainerBase):
         return splitter, None, oof_folds
 
     def _build_ft_feature_model(self, resolved_params: Dict[str, Any]) -> FTTransformerSklearn:
-        loss_name = getattr(self.ctx, "loss_name", "tweedie")
-        model = FTTransformerSklearn(
-            model_nme=self.ctx.model_nme,
-            num_cols=self.ctx.num_features,
-            cat_cols=self.ctx.cate_list,
-            task_type=self.ctx.task_type,
-            use_data_parallel=self._use_ft_data_parallel(),
-            use_ddp=self._use_ft_ddp(),
-            use_gpu=self.ctx.use_gpu,
-            num_numeric_tokens=self._resolve_numeric_tokens(),
-            loss_name=loss_name,
-            distribution=getattr(self.ctx, "distribution", None),
+        model = self._create_runtime_ft_model()
+        adjusted_params = self._apply_adaptive_heads(
+            resolved_params,
+            default_d_model=model.d_model,
+            log_adjustment=True,
         )
-        model = self._apply_dataloader_overrides(model)
-        adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
-            d_model=resolved_params.get("d_model", model.d_model),
-            requested_heads=resolved_params.get("n_heads"),
-        )
-        if heads_adjusted:
-            _log(
-                f"[FTTrainer] Auto-adjusted n_heads from "
-                f"{resolved_params.get('n_heads')} to {adaptive_heads} "
-                f"(d_model={resolved_params.get('d_model', model.d_model)})."
-            )
-        resolved_params["n_heads"] = adaptive_heads
+        resolved_params.clear()
+        resolved_params.update(adjusted_params)
         if resolved_params:
-            model.set_params(resolved_params)
+            self._apply_model_params(
+                model,
+                resolved_params,
+                context="FT feature model params",
+            )
         return model
 
     def _oof_predict_train(
@@ -715,22 +750,13 @@ class FTTrainer(TrainerBase):
         if feature_mode not in ("prediction", "embedding"):
             raise ValueError(
                 f"Unsupported feature_mode='{feature_mode}', expected 'prediction' or 'embedding'.")
-
         geo_train = self.ctx.train_geo_tokens
         geo_test = self.ctx.test_geo_tokens
-        fit_kwargs = {}
-        predict_kwargs_train = None
-        predict_kwargs_test = None
-        if geo_train is not None and geo_test is not None:
-            fit_kwargs["geo_train"] = geo_train
-            predict_kwargs_train = {"geo_tokens": geo_train}
-            predict_kwargs_test = {"geo_tokens": geo_test}
-
-        if feature_mode == "embedding":
-            predict_kwargs_train = dict(predict_kwargs_train or {})
-            predict_kwargs_test = dict(predict_kwargs_test or {})
-            predict_kwargs_train["return_embedding"] = True
-            predict_kwargs_test["return_embedding"] = True
+        fit_kwargs, predict_kwargs_train, predict_kwargs_test = self._build_geo_io_kwargs(
+            geo_train=geo_train,
+            geo_test=geo_test,
+            return_embedding=(feature_mode == "embedding"),
+        )
 
         oof_preds = self._oof_predict_train(
             resolved_params,
@@ -783,20 +809,7 @@ class FTTrainer(TrainerBase):
                                          num_loss_weight: float = 1.0,
                                          cat_loss_weight: float = 1.0) -> None:
         """Self-supervised pretraining (masked reconstruction) and cache embeddings."""
-        loss_name = getattr(self.ctx, "loss_name", "tweedie")
-        self.model = FTTransformerSklearn(
-            model_nme=self.ctx.model_nme,
-            num_cols=self.ctx.num_features,
-            cat_cols=self.ctx.cate_list,
-            task_type=self.ctx.task_type,
-            use_data_parallel=self._use_ft_data_parallel(),
-            use_ddp=self._use_ft_ddp(),
-            use_gpu=self.ctx.use_gpu,
-            num_numeric_tokens=self._resolve_numeric_tokens(),
-            loss_name=loss_name,
-            distribution=getattr(self.ctx, "distribution", None),
-        )
-        self.model = self._apply_dataloader_overrides(self.model)
+        self.model = self._create_runtime_ft_model()
         resolved_params = dict(params or {})
         # Reuse supervised tuning structure params unless explicitly overridden.
         if not resolved_params and self.best_params:
@@ -812,17 +825,17 @@ class FTTrainer(TrainerBase):
         cat_loss_weight = float(resolved_params.pop(
             "cat_loss_weight", cat_loss_weight))
 
-        adaptive_heads, heads_adjusted = self._resolve_adaptive_heads(
-            d_model=resolved_params.get("d_model", self.model.d_model),
-            requested_heads=resolved_params.get("n_heads")
+        resolved_params = self._apply_adaptive_heads(
+            resolved_params,
+            default_d_model=self.model.d_model,
+            log_adjustment=True,
         )
-        if heads_adjusted:
-            _log(f"[FTTrainer] Auto-adjusted n_heads from "
-                  f"{resolved_params.get('n_heads')} to {adaptive_heads} "
-                  f"(d_model={resolved_params.get('d_model', self.model.d_model)}).")
-        resolved_params["n_heads"] = adaptive_heads
         if resolved_params:
-            self.model.set_params(resolved_params)
+            self._apply_model_params(
+                self.model,
+                resolved_params,
+                context="FT unsupervised feature params",
+            )
 
         loss_plot_path = self.output.plot_path(
             f'{self.ctx.model_nme}/loss/loss_{self.ctx.model_nme}_FTTransformerUnsupervised.png')
@@ -839,6 +852,7 @@ class FTTrainer(TrainerBase):
         X_val = X_all.iloc[val_idx]
 
         geo_all = self.ctx.train_geo_tokens
+        geo_test_full = self.ctx.test_geo_tokens
         geo_tr = geo_val = None
         if geo_all is not None:
             geo_tr = geo_all.loc[X_tr.index]
@@ -855,13 +869,15 @@ class FTTrainer(TrainerBase):
             cat_loss_weight=cat_loss_weight
         )
 
-        geo_train_full = self.ctx.train_geo_tokens
-        geo_test_full = self.ctx.test_geo_tokens
-        predict_kwargs_train = {"return_embedding": True}
-        predict_kwargs_test = {"return_embedding": True}
-        if geo_train_full is not None and geo_test_full is not None:
-            predict_kwargs_train["geo_tokens"] = geo_train_full
-            predict_kwargs_test["geo_tokens"] = geo_test_full
+        geo_train_full = geo_all
+        _, predict_kwargs_train, predict_kwargs_test = self._build_geo_io_kwargs(
+            geo_train=geo_train_full,
+            geo_test=geo_test_full,
+            return_embedding=True,
+        )
+        if predict_kwargs_train is None or predict_kwargs_test is None:
+            predict_kwargs_train = {"return_embedding": True}
+            predict_kwargs_test = {"return_embedding": True}
 
         self._predict_and_cache(
             self.model,

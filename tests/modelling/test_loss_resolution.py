@@ -195,3 +195,27 @@ def test_config_accepts_positive_gnn_row_limits():
     assert cfg.gnn.max_fit_rows == 50000
     assert cfg.gnn.max_predict_rows == 60000
     assert cfg.gnn.predict_chunk_rows == 10000
+
+
+def test_config_normalizes_invalid_param_policy():
+    cfg = BayesOptConfig(
+        model_nme="demo",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x1"],
+        task_type="regression",
+        invalid_param_policy="WARN",
+    )
+    assert cfg.invalid_param_policy == "warn"
+
+
+def test_config_rejects_invalid_invalid_param_policy():
+    with pytest.raises(ConfigurationError, match="invalid_param_policy"):
+        BayesOptConfig(
+            model_nme="demo",
+            resp_nme="y",
+            weight_nme="w",
+            factor_nmes=["x1"],
+            task_type="regression",
+            invalid_param_policy="drop",
+        )

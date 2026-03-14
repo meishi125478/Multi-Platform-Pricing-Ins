@@ -616,6 +616,332 @@ def _read_json_with_retry(
     )
 
 
+def _collect_allowed_payload_values(
+    allowed_keys: set[str],
+    *sources: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for source in sources:
+        if not source:
+            continue
+        for key, value in source.items():
+            if key in allowed_keys and value is not None:
+                merged[key] = value
+    return merged
+
+
+def _build_dataclass_config_payload(
+    *,
+    deps: BayesOptRunnerDeps,
+    cfg: Dict[str, Any],
+    runtime_cfg: Dict[str, Any],
+    split_cfg: Dict[str, Any],
+    override_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    config_fields = getattr(
+        deps.ropt.BayesOptConfig,
+        "__dataclass_fields__",
+        {},
+    )
+    allowed_config_keys = {
+        key
+        for key, spec in config_fields.items()
+        if getattr(spec, "init", True)
+    }
+    return _collect_allowed_payload_values(
+        allowed_config_keys,
+        cfg,
+        runtime_cfg,
+        split_cfg,
+        override_payload,
+    )
+
+
+def _resolve_runner_parallel_flags(
+    *,
+    args: Any,
+    cfg: Dict[str, Any],
+    ddp_enabled: Optional[bool],
+    dist_active: bool,
+    dataset_rows: int,
+    ddp_min_rows: int,
+    config_path: Path,
+    deps: BayesOptRunnerDeps,
+) -> Dict[str, Any]:
+    use_gpu = bool(cfg.get("use_gpu", True))
+    resolved_ddp_enabled = (
+        bool(ddp_enabled)
+        if ddp_enabled is not None
+        else bool(
+            dist_active
+            and use_gpu
+            and (dataset_rows >= int(ddp_min_rows))
+        )
+    )
+
+    use_resn_dp = bool(
+        (args.use_resn_dp or cfg.get("use_resn_data_parallel", False))
+        and use_gpu
+    )
+    use_ft_dp = bool(
+        (args.use_ft_dp or cfg.get("use_ft_data_parallel", False))
+        and use_gpu
+    )
+    use_resn_ddp = bool(
+        (args.use_resn_ddp or cfg.get("use_resn_ddp", False))
+        and resolved_ddp_enabled
+    )
+    use_ft_ddp = bool(
+        (args.use_ft_ddp or cfg.get("use_ft_ddp", False))
+        and resolved_ddp_enabled
+    )
+    use_gnn_dp = bool(
+        (args.use_gnn_dp or cfg.get("use_gnn_data_parallel", False))
+        and use_gpu
+    )
+
+    gnn_use_ann = cfg.get("gnn_use_approx_knn", True)
+    if args.gnn_no_ann:
+        gnn_use_ann = False
+    gnn_threshold = (
+        args.gnn_ann_threshold
+        if args.gnn_ann_threshold is not None
+        else cfg.get("gnn_approx_knn_threshold", 50000)
+    )
+    gnn_graph_cache = args.gnn_graph_cache or cfg.get("gnn_graph_cache")
+    if isinstance(gnn_graph_cache, str) and gnn_graph_cache.strip():
+        resolved_cache = deps.resolve_path(gnn_graph_cache, config_path.parent)
+        if resolved_cache is not None:
+            gnn_graph_cache = str(resolved_cache)
+    gnn_max_gpu_nodes = (
+        args.gnn_max_gpu_nodes
+        if args.gnn_max_gpu_nodes is not None
+        else cfg.get("gnn_max_gpu_knn_nodes", 200000)
+    )
+    gnn_gpu_mem_ratio = (
+        args.gnn_gpu_mem_ratio
+        if args.gnn_gpu_mem_ratio is not None
+        else cfg.get("gnn_knn_gpu_mem_ratio", 0.9)
+    )
+    gnn_gpu_mem_overhead = (
+        args.gnn_gpu_mem_overhead
+        if args.gnn_gpu_mem_overhead is not None
+        else cfg.get("gnn_knn_gpu_mem_overhead", 2.0)
+    )
+    return {
+        "ddp_enabled": resolved_ddp_enabled,
+        "use_gpu": use_gpu,
+        "use_resn_dp": use_resn_dp,
+        "use_ft_dp": use_ft_dp,
+        "use_resn_ddp": use_resn_ddp,
+        "use_ft_ddp": use_ft_ddp,
+        "use_gnn_dp": use_gnn_dp,
+        "gnn_use_ann": gnn_use_ann,
+        "gnn_threshold": gnn_threshold,
+        "gnn_graph_cache": gnn_graph_cache,
+        "gnn_max_gpu_nodes": gnn_max_gpu_nodes,
+        "gnn_gpu_mem_ratio": gnn_gpu_mem_ratio,
+        "gnn_gpu_mem_overhead": gnn_gpu_mem_overhead,
+    }
+
+
+def _resolve_model_override_fields(
+    *,
+    args: Any,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    ft_role = args.ft_role or cfg.get("ft_role", "model")
+    if args.ft_as_feature and args.ft_role is None:
+        if str(cfg.get("ft_role", "model")) == "model":
+            ft_role = "embedding"
+    return {
+        "binary_target": cfg.get("binary_target") or cfg.get("binary_resp_nme"),
+        "task_type": str(cfg.get("task_type", "regression")),
+        "feature_list": cfg.get("feature_list"),
+        "categorical_features": cfg.get("categorical_features"),
+        "region_province_col": cfg.get("region_province_col"),
+        "region_city_col": cfg.get("region_city_col"),
+        "region_effect_alpha": cfg.get("region_effect_alpha"),
+        "geo_feature_nmes": cfg.get("geo_feature_nmes"),
+        "geo_token_hidden_dim": cfg.get("geo_token_hidden_dim"),
+        "geo_token_layers": cfg.get("geo_token_layers"),
+        "geo_token_dropout": cfg.get("geo_token_dropout"),
+        "geo_token_k_neighbors": cfg.get("geo_token_k_neighbors"),
+        "geo_token_learning_rate": cfg.get("geo_token_learning_rate"),
+        "geo_token_epochs": cfg.get("geo_token_epochs"),
+        "ft_role": ft_role,
+        "ft_feature_prefix": str(
+            cfg.get("ft_feature_prefix", args.ft_feature_prefix)
+        ),
+        "ft_num_numeric_tokens": cfg.get("ft_num_numeric_tokens"),
+    }
+
+
+def _resolve_preprocess_bundle_options(
+    *,
+    use_shared_preprocess: bool,
+    ddp_enabled: bool,
+    dist_rank: int,
+    shared_bundle_path: Optional[Path],
+) -> Dict[str, Any]:
+    bundle_ready = bool(
+        use_shared_preprocess
+        and ddp_enabled
+        and shared_bundle_path is not None
+    )
+    return {
+        "save_preprocess_bundle": bool(bundle_ready and dist_rank == 0),
+        "load_preprocess_bundle": bool(bundle_ready and dist_rank != 0),
+        "preprocess_bundle_path": str(shared_bundle_path) if bundle_ready else None,
+    }
+
+
+def _resolve_requested_model_keys(
+    *,
+    args_model_keys: Sequence[str],
+    args_stack_model_keys: Optional[Sequence[str]],
+    cfg_stack_model_keys: Optional[Sequence[str]],
+    ft_role: str,
+    dedupe_preserve_order: Callable[[List[str]], List[str]],
+) -> List[str]:
+    if "all" in args_model_keys:
+        requested_keys = ["glm", "xgb", "resn", "ft", "gnn"]
+    else:
+        requested_keys = list(args_model_keys)
+    requested_keys = dedupe_preserve_order(requested_keys)
+
+    if ft_role != "model":
+        requested_keys = [key for key in requested_keys if key != "ft"]
+        if not requested_keys:
+            stack_keys = args_stack_model_keys or cfg_stack_model_keys
+            if stack_keys:
+                if "all" in stack_keys:
+                    requested_keys = ["glm", "xgb", "resn", "gnn"]
+                else:
+                    requested_keys = [key for key in stack_keys if key != "ft"]
+                requested_keys = dedupe_preserve_order(requested_keys)
+
+    return requested_keys
+
+
+def _build_model_override_payload(model_overrides: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "task_type": model_overrides["task_type"],
+        "binary_resp_nme": model_overrides["binary_target"],
+        "cate_list": model_overrides["categorical_features"],
+        "region_province_col": model_overrides["region_province_col"],
+        "region_city_col": model_overrides["region_city_col"],
+        "region_effect_alpha": model_overrides["region_effect_alpha"],
+        "geo_feature_nmes": model_overrides["geo_feature_nmes"],
+        "geo_token_hidden_dim": model_overrides["geo_token_hidden_dim"],
+        "geo_token_layers": model_overrides["geo_token_layers"],
+        "geo_token_dropout": model_overrides["geo_token_dropout"],
+        "geo_token_k_neighbors": model_overrides["geo_token_k_neighbors"],
+        "geo_token_learning_rate": model_overrides["geo_token_learning_rate"],
+        "geo_token_epochs": model_overrides["geo_token_epochs"],
+        "ft_role": model_overrides["ft_role"],
+        "ft_feature_prefix": model_overrides["ft_feature_prefix"],
+        "ft_num_numeric_tokens": model_overrides["ft_num_numeric_tokens"],
+    }
+
+
+def _build_runtime_override_payload(
+    *,
+    cfg: Dict[str, Any],
+    runtime_cfg: Dict[str, Any],
+    parallel_flags: Dict[str, Any],
+    output_dir: Optional[str],
+    reuse_best_params: bool,
+) -> Dict[str, Any]:
+    return {
+        "use_gpu": parallel_flags["use_gpu"],
+        "use_resn_data_parallel": parallel_flags["use_resn_dp"],
+        "use_ft_data_parallel": parallel_flags["use_ft_dp"],
+        "use_gnn_data_parallel": parallel_flags["use_gnn_dp"],
+        "use_resn_ddp": parallel_flags["use_resn_ddp"],
+        "use_ft_ddp": parallel_flags["use_ft_ddp"],
+        "output_dir": output_dir,
+        "xgb_max_depth_max": runtime_cfg["xgb_max_depth_max"],
+        "xgb_n_estimators_max": runtime_cfg["xgb_n_estimators_max"],
+        "xgb_gpu_id": runtime_cfg["xgb_gpu_id"],
+        "xgb_cleanup_per_fold": runtime_cfg["xgb_cleanup_per_fold"],
+        "xgb_cleanup_synchronize": runtime_cfg["xgb_cleanup_synchronize"],
+        "xgb_use_dmatrix": runtime_cfg["xgb_use_dmatrix"],
+        "ft_cleanup_per_fold": runtime_cfg["ft_cleanup_per_fold"],
+        "ft_cleanup_synchronize": runtime_cfg["ft_cleanup_synchronize"],
+        "resn_cleanup_per_fold": runtime_cfg["resn_cleanup_per_fold"],
+        "resn_cleanup_synchronize": runtime_cfg["resn_cleanup_synchronize"],
+        "gnn_cleanup_per_fold": runtime_cfg["gnn_cleanup_per_fold"],
+        "gnn_cleanup_synchronize": runtime_cfg["gnn_cleanup_synchronize"],
+        "optuna_cleanup_synchronize": runtime_cfg["optuna_cleanup_synchronize"],
+        "resn_weight_decay": cfg.get("resn_weight_decay"),
+        "final_ensemble": bool(cfg.get("final_ensemble", False)),
+        "final_ensemble_k": int(cfg.get("final_ensemble_k", 3)),
+        "final_refit": bool(cfg.get("final_refit", True)),
+        "optuna_storage": runtime_cfg["optuna_storage"],
+        "optuna_study_prefix": runtime_cfg["optuna_study_prefix"],
+        "best_params_files": runtime_cfg["best_params_files"],
+        "gnn_use_approx_knn": parallel_flags["gnn_use_ann"],
+        "gnn_approx_knn_threshold": parallel_flags["gnn_threshold"],
+        "gnn_graph_cache": parallel_flags["gnn_graph_cache"],
+        "gnn_max_gpu_knn_nodes": parallel_flags["gnn_max_gpu_nodes"],
+        "gnn_knn_gpu_mem_ratio": parallel_flags["gnn_gpu_mem_ratio"],
+        "gnn_knn_gpu_mem_overhead": parallel_flags["gnn_gpu_mem_overhead"],
+        "reuse_best_params": bool(reuse_best_params),
+        "bo_sample_limit": runtime_cfg["bo_sample_limit"],
+        "cache_predictions": runtime_cfg["cache_predictions"],
+        "prediction_cache_dir": runtime_cfg["prediction_cache_dir"],
+        "prediction_cache_format": runtime_cfg["prediction_cache_format"],
+        "save_preprocess": runtime_cfg["save_preprocess"],
+        "preprocess_artifact_path": runtime_cfg["preprocess_artifact_path"],
+    }
+
+
+def _build_split_override_payload(split_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "cv_strategy": split_cfg["cv_strategy"] or split_cfg["split_strategy"],
+        "cv_group_col": split_cfg["cv_group_col"] or split_cfg["split_group_col"],
+        "cv_time_col": split_cfg["cv_time_col"] or split_cfg["split_time_col"],
+        "cv_time_ascending": split_cfg["cv_time_ascending"],
+        "cv_splits": split_cfg["cv_splits"],
+        "ft_oof_folds": split_cfg["ft_oof_folds"],
+        "ft_oof_strategy": split_cfg["ft_oof_strategy"],
+        "ft_oof_shuffle": split_cfg["ft_oof_shuffle"],
+    }
+
+
+def _build_override_payload(
+    *,
+    model_name: str,
+    cfg: Dict[str, Any],
+    model_overrides: Dict[str, Any],
+    runtime_override_payload: Dict[str, Any],
+    split_override_payload: Dict[str, Any],
+    preprocess_bundle_options: Dict[str, Any],
+    val_ratio: float,
+    rand_seed: Optional[int],
+    epochs: int,
+    plot_path_style: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model_nme": model_name,
+        "resp_nme": cfg["target"],
+        "weight_nme": cfg["weight"],
+        "factor_nmes": model_overrides["feature_list"],
+        "prop_test": val_ratio,
+        "rand_seed": rand_seed,
+        "epochs": epochs,
+        "plot_path_style": plot_path_style or "nested",
+        "save_preprocess_bundle": preprocess_bundle_options["save_preprocess_bundle"],
+        "load_preprocess_bundle": preprocess_bundle_options["load_preprocess_bundle"],
+        "preprocess_bundle_path": preprocess_bundle_options["preprocess_bundle_path"],
+    }
+    payload.update(_build_model_override_payload(model_overrides))
+    payload.update(runtime_override_payload)
+    payload.update(split_override_payload)
+    return payload
+
+
 def run_bayesopt_entry_training(
     args: Any,
     *,
@@ -647,10 +973,6 @@ def run_bayesopt_entry_training(
     )
     runtime_cfg = deps.resolve_runtime_config(cfg)
     ddp_min_rows = runtime_cfg["ddp_min_rows"]
-    bo_sample_limit = runtime_cfg["bo_sample_limit"]
-    cache_predictions = runtime_cfg["cache_predictions"]
-    prediction_cache_dir = runtime_cfg["prediction_cache_dir"]
-    prediction_cache_format = runtime_cfg["prediction_cache_format"]
     report_cfg = deps.resolve_report_config(cfg)
     report_output_dir = report_cfg["report_output_dir"]
     report_group_cols = report_cfg["report_group_cols"]
@@ -677,20 +999,12 @@ def run_bayesopt_entry_training(
     split_group_col = split_cfg["split_group_col"]
     split_time_col = split_cfg["split_time_col"]
     split_time_ascending = split_cfg["split_time_ascending"]
-    cv_strategy = split_cfg["cv_strategy"]
     cv_group_col = split_cfg["cv_group_col"]
     cv_time_col = split_cfg["cv_time_col"]
-    cv_time_ascending = split_cfg["cv_time_ascending"]
-    cv_splits = split_cfg["cv_splits"]
-    ft_oof_folds = split_cfg["ft_oof_folds"]
-    ft_oof_strategy = split_cfg["ft_oof_strategy"]
-    ft_oof_shuffle = split_cfg["ft_oof_shuffle"]
     train_data_path_cfg = split_cfg["train_data_path"]
     test_data_path_cfg = split_cfg["test_data_path"]
     split_cache_path_cfg = split_cfg["split_cache_path"]
     split_cache_force_rebuild = split_cfg["split_cache_force_rebuild"]
-    save_preprocess = runtime_cfg["save_preprocess"]
-    preprocess_artifact_path = runtime_cfg["preprocess_artifact_path"]
     rand_seed = runtime_cfg["rand_seed"]
     epochs = runtime_cfg["epochs"]
     output_cfg = deps.resolve_output_dirs(
@@ -701,23 +1015,6 @@ def run_bayesopt_entry_training(
     output_dir = output_cfg["output_dir"]
     reuse_best_params = bool(
         args.reuse_best_params or runtime_cfg["reuse_best_params"])
-    xgb_max_depth_max = runtime_cfg["xgb_max_depth_max"]
-    xgb_n_estimators_max = runtime_cfg["xgb_n_estimators_max"]
-    xgb_gpu_id = runtime_cfg["xgb_gpu_id"]
-    xgb_cleanup_per_fold = runtime_cfg["xgb_cleanup_per_fold"]
-    xgb_cleanup_synchronize = runtime_cfg["xgb_cleanup_synchronize"]
-    xgb_use_dmatrix = runtime_cfg["xgb_use_dmatrix"]
-    ft_cleanup_per_fold = runtime_cfg["ft_cleanup_per_fold"]
-    ft_cleanup_synchronize = runtime_cfg["ft_cleanup_synchronize"]
-    resn_cleanup_per_fold = runtime_cfg["resn_cleanup_per_fold"]
-    resn_cleanup_synchronize = runtime_cfg["resn_cleanup_synchronize"]
-    gnn_cleanup_per_fold = runtime_cfg["gnn_cleanup_per_fold"]
-    gnn_cleanup_synchronize = runtime_cfg["gnn_cleanup_synchronize"]
-    optuna_cleanup_synchronize = runtime_cfg["optuna_cleanup_synchronize"]
-    optuna_storage = runtime_cfg["optuna_storage"]
-    optuna_study_prefix = runtime_cfg["optuna_study_prefix"]
-    best_params_files = runtime_cfg["best_params_files"]
-    plot_path_style = runtime_cfg["plot_path_style"]
     stream_split_csv = runtime_cfg["stream_split_csv"]
     stream_split_chunksize = runtime_cfg["stream_split_chunksize"]
 
@@ -854,6 +1151,33 @@ def run_bayesopt_entry_training(
                 flush=True,
             )
 
+        def _load_dataset_for_model() -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+            if use_stream_split:
+                print(
+                    f"[Data] streaming random split enabled "
+                    f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
+                    flush=True,
+                )
+            return _load_and_split_dataset(
+                deps=deps,
+                data_path=data_path,
+                data_format=data_format,
+                dtype_map=dtype_map,
+                required_columns=required_columns,
+                use_stream_split=use_stream_split,
+                holdout_ratio=holdout_ratio,
+                rand_seed=rand_seed,
+                stream_split_chunksize=int(stream_split_chunksize),
+                split_strategy=split_strategy,
+                split_group_col=split_group_col,
+                split_time_col=split_time_col,
+                split_time_ascending=split_time_ascending,
+                train_data_path=train_data_path,
+                test_data_path=test_data_path,
+                split_cache_path=split_cache_path,
+                split_cache_force_rebuild=bool(split_cache_force_rebuild),
+            )
+
         if use_shared_preprocess:
             shared_meta_path, shared_bundle_path = _resolve_ddp_preprocess_paths(
                 output_dir=output_dir,
@@ -862,31 +1186,7 @@ def run_bayesopt_entry_training(
                 config_sha=config_sha,
             )
             if dist_rank == 0:
-                if use_stream_split:
-                    print(
-                        f"[Data] streaming random split enabled "
-                        f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
-                        flush=True,
-                    )
-                train_df, test_df, dataset_rows = _load_and_split_dataset(
-                    deps=deps,
-                    data_path=data_path,
-                    data_format=data_format,
-                    dtype_map=dtype_map,
-                    required_columns=required_columns,
-                    use_stream_split=use_stream_split,
-                    holdout_ratio=holdout_ratio,
-                    rand_seed=rand_seed,
-                    stream_split_chunksize=int(stream_split_chunksize),
-                    split_strategy=split_strategy,
-                    split_group_col=split_group_col,
-                    split_time_col=split_time_col,
-                    split_time_ascending=split_time_ascending,
-                    train_data_path=train_data_path,
-                    test_data_path=test_data_path,
-                    split_cache_path=split_cache_path,
-                    split_cache_force_rebuild=bool(split_cache_force_rebuild),
-                )
+                train_df, test_df, dataset_rows = _load_dataset_for_model()
                 ddp_enabled = bool(
                     dist_active
                     and cfg.get("use_gpu", True)
@@ -920,229 +1220,65 @@ def run_bayesopt_entry_training(
                     )
         else:
             if not skip_data_load_for_non_main:
-                if use_stream_split:
-                    print(
-                        f"[Data] streaming random split enabled "
-                        f"(chunksize={int(stream_split_chunksize)}) for {data_path}",
-                        flush=True,
-                    )
-                train_df, test_df, dataset_rows = _load_and_split_dataset(
-                    deps=deps,
-                    data_path=data_path,
-                    data_format=data_format,
-                    dtype_map=dtype_map,
-                    required_columns=required_columns,
-                    use_stream_split=use_stream_split,
-                    holdout_ratio=holdout_ratio,
-                    rand_seed=rand_seed,
-                    stream_split_chunksize=int(stream_split_chunksize),
-                    split_strategy=split_strategy,
-                    split_group_col=split_group_col,
-                    split_time_col=split_time_col,
-                    split_time_ascending=split_time_ascending,
-                    train_data_path=train_data_path,
-                    test_data_path=test_data_path,
-                    split_cache_path=split_cache_path,
-                    split_cache_force_rebuild=bool(split_cache_force_rebuild),
-                )
+                train_df, test_df, dataset_rows = _load_dataset_for_model()
 
-        use_resn_dp = bool((args.use_resn_dp or cfg.get(
-            "use_resn_data_parallel", False)) and cfg.get("use_gpu", True))
-        use_ft_dp = bool((args.use_ft_dp or cfg.get(
-            "use_ft_data_parallel", False)) and cfg.get("use_gpu", True))
-        if ddp_enabled is None:
-            ddp_enabled = bool(
-                dist_active
-                and cfg.get("use_gpu", True)
-                and (dataset_rows >= int(ddp_min_rows))
-            )
-        use_resn_ddp = (args.use_resn_ddp or cfg.get(
-            "use_resn_ddp", False)) and ddp_enabled
-        use_ft_ddp = (args.use_ft_ddp or cfg.get(
-            "use_ft_ddp", False)) and ddp_enabled
-        use_gnn_dp = bool((args.use_gnn_dp or cfg.get(
-            "use_gnn_data_parallel", False)) and cfg.get("use_gpu", True))
-        gnn_use_ann = cfg.get("gnn_use_approx_knn", True)
-        if args.gnn_no_ann:
-            gnn_use_ann = False
-        gnn_threshold = args.gnn_ann_threshold if args.gnn_ann_threshold is not None else cfg.get(
-            "gnn_approx_knn_threshold", 50000)
-        gnn_graph_cache = args.gnn_graph_cache or cfg.get("gnn_graph_cache")
-        if isinstance(gnn_graph_cache, str) and gnn_graph_cache.strip():
-            resolved_cache = deps.resolve_path(gnn_graph_cache, config_path.parent)
-            if resolved_cache is not None:
-                gnn_graph_cache = str(resolved_cache)
-        gnn_max_gpu_nodes = args.gnn_max_gpu_nodes if args.gnn_max_gpu_nodes is not None else cfg.get(
-            "gnn_max_gpu_knn_nodes", 200000)
-        gnn_gpu_mem_ratio = args.gnn_gpu_mem_ratio if args.gnn_gpu_mem_ratio is not None else cfg.get(
-            "gnn_knn_gpu_mem_ratio", 0.9)
-        gnn_gpu_mem_overhead = args.gnn_gpu_mem_overhead if args.gnn_gpu_mem_overhead is not None else cfg.get(
-            "gnn_knn_gpu_mem_overhead", 2.0)
-
-        binary_target = cfg.get("binary_target") or cfg.get("binary_resp_nme")
-        task_type = str(cfg.get("task_type", "regression"))
-        feature_list = cfg.get("feature_list")
-        categorical_features = cfg.get("categorical_features")
-        use_gpu = bool(cfg.get("use_gpu", True))
-        region_province_col = cfg.get("region_province_col")
-        region_city_col = cfg.get("region_city_col")
-        region_effect_alpha = cfg.get("region_effect_alpha")
-        geo_feature_nmes = cfg.get("geo_feature_nmes")
-        geo_token_hidden_dim = cfg.get("geo_token_hidden_dim")
-        geo_token_layers = cfg.get("geo_token_layers")
-        geo_token_dropout = cfg.get("geo_token_dropout")
-        geo_token_k_neighbors = cfg.get("geo_token_k_neighbors")
-        geo_token_learning_rate = cfg.get("geo_token_learning_rate")
-        geo_token_epochs = cfg.get("geo_token_epochs")
-
-        ft_role = args.ft_role or cfg.get("ft_role", "model")
-        if args.ft_as_feature and args.ft_role is None:
-            if str(cfg.get("ft_role", "model")) == "model":
-                ft_role = "embedding"
-        ft_feature_prefix = str(
-            cfg.get("ft_feature_prefix", args.ft_feature_prefix))
-        ft_num_numeric_tokens = cfg.get("ft_num_numeric_tokens")
-
-        config_fields = getattr(
-            deps.ropt.BayesOptConfig,
-            "__dataclass_fields__",
-            {},
+        parallel_flags = _resolve_runner_parallel_flags(
+            args=args,
+            cfg=cfg,
+            ddp_enabled=ddp_enabled,
+            dist_active=dist_active,
+            dataset_rows=dataset_rows,
+            ddp_min_rows=ddp_min_rows,
+            config_path=config_path,
+            deps=deps,
         )
-        allowed_config_keys = {
-            key
-            for key, spec in config_fields.items()
-            if getattr(spec, "init", True)
-        }
-        config_payload = {
-            k: v for k, v in cfg.items() if k in allowed_config_keys and v is not None
-        }
-        config_payload.update({
-            k: v
-            for k, v in runtime_cfg.items()
-            if k in allowed_config_keys and v is not None
-        })
-        config_payload.update({
-            k: v
-            for k, v in split_cfg.items()
-            if k in allowed_config_keys and v is not None
-        })
-        save_preprocess_bundle = bool(
-            use_shared_preprocess
-            and ddp_enabled
-            and dist_rank == 0
-            and shared_bundle_path is not None
+        ddp_enabled = parallel_flags["ddp_enabled"]
+
+        model_overrides = _resolve_model_override_fields(args=args, cfg=cfg)
+        ft_role = model_overrides["ft_role"]
+
+        preprocess_bundle_options = _resolve_preprocess_bundle_options(
+            use_shared_preprocess=use_shared_preprocess,
+            ddp_enabled=bool(ddp_enabled),
+            dist_rank=dist_rank,
+            shared_bundle_path=shared_bundle_path,
         )
-        load_preprocess_bundle = bool(
-            use_shared_preprocess
-            and ddp_enabled
-            and dist_rank != 0
-            and shared_bundle_path is not None
+        runtime_override_payload = _build_runtime_override_payload(
+            cfg=cfg,
+            runtime_cfg=runtime_cfg,
+            parallel_flags=parallel_flags,
+            output_dir=output_dir,
+            reuse_best_params=reuse_best_params,
         )
-        override_payload = {
-            "model_nme": model_name,
-            "resp_nme": cfg["target"],
-            "weight_nme": cfg["weight"],
-            "factor_nmes": feature_list,
-            "task_type": task_type,
-            "binary_resp_nme": binary_target,
-            "cate_list": categorical_features,
-            "prop_test": val_ratio,
-            "rand_seed": rand_seed,
-            "epochs": epochs,
-            "use_gpu": use_gpu,
-            "use_resn_data_parallel": use_resn_dp,
-            "use_ft_data_parallel": use_ft_dp,
-            "use_gnn_data_parallel": use_gnn_dp,
-            "use_resn_ddp": use_resn_ddp,
-            "use_ft_ddp": use_ft_ddp,
-            "output_dir": output_dir,
-            "xgb_max_depth_max": xgb_max_depth_max,
-            "xgb_n_estimators_max": xgb_n_estimators_max,
-            "xgb_gpu_id": xgb_gpu_id,
-            "xgb_cleanup_per_fold": xgb_cleanup_per_fold,
-            "xgb_cleanup_synchronize": xgb_cleanup_synchronize,
-            "xgb_use_dmatrix": xgb_use_dmatrix,
-            "ft_cleanup_per_fold": ft_cleanup_per_fold,
-            "ft_cleanup_synchronize": ft_cleanup_synchronize,
-            "resn_cleanup_per_fold": resn_cleanup_per_fold,
-            "resn_cleanup_synchronize": resn_cleanup_synchronize,
-            "gnn_cleanup_per_fold": gnn_cleanup_per_fold,
-            "gnn_cleanup_synchronize": gnn_cleanup_synchronize,
-            "optuna_cleanup_synchronize": optuna_cleanup_synchronize,
-            "resn_weight_decay": cfg.get("resn_weight_decay"),
-            "final_ensemble": bool(cfg.get("final_ensemble", False)),
-            "final_ensemble_k": int(cfg.get("final_ensemble_k", 3)),
-            "final_refit": bool(cfg.get("final_refit", True)),
-            "optuna_storage": optuna_storage,
-            "optuna_study_prefix": optuna_study_prefix,
-            "best_params_files": best_params_files,
-            "gnn_use_approx_knn": gnn_use_ann,
-            "gnn_approx_knn_threshold": gnn_threshold,
-            "gnn_graph_cache": gnn_graph_cache,
-            "gnn_max_gpu_knn_nodes": gnn_max_gpu_nodes,
-            "gnn_knn_gpu_mem_ratio": gnn_gpu_mem_ratio,
-            "gnn_knn_gpu_mem_overhead": gnn_gpu_mem_overhead,
-            "region_province_col": region_province_col,
-            "region_city_col": region_city_col,
-            "region_effect_alpha": region_effect_alpha,
-            "geo_feature_nmes": geo_feature_nmes,
-            "geo_token_hidden_dim": geo_token_hidden_dim,
-            "geo_token_layers": geo_token_layers,
-            "geo_token_dropout": geo_token_dropout,
-            "geo_token_k_neighbors": geo_token_k_neighbors,
-            "geo_token_learning_rate": geo_token_learning_rate,
-            "geo_token_epochs": geo_token_epochs,
-            "ft_role": ft_role,
-            "ft_feature_prefix": ft_feature_prefix,
-            "ft_num_numeric_tokens": ft_num_numeric_tokens,
-            "reuse_best_params": reuse_best_params,
-            "bo_sample_limit": bo_sample_limit,
-            "cache_predictions": cache_predictions,
-            "prediction_cache_dir": prediction_cache_dir,
-            "prediction_cache_format": prediction_cache_format,
-            "cv_strategy": cv_strategy or split_strategy,
-            "cv_group_col": cv_group_col or split_group_col,
-            "cv_time_col": cv_time_col or split_time_col,
-            "cv_time_ascending": cv_time_ascending,
-            "cv_splits": cv_splits,
-            "ft_oof_folds": ft_oof_folds,
-            "ft_oof_strategy": ft_oof_strategy,
-            "ft_oof_shuffle": ft_oof_shuffle,
-            "save_preprocess": save_preprocess,
-            "preprocess_artifact_path": preprocess_artifact_path,
-            "save_preprocess_bundle": save_preprocess_bundle,
-            "load_preprocess_bundle": load_preprocess_bundle,
-            "preprocess_bundle_path": (
-                str(shared_bundle_path)
-                if use_shared_preprocess and ddp_enabled and shared_bundle_path is not None
-                else None
-            ),
-            "plot_path_style": plot_path_style or "nested",
-        }
-        config_payload.update({
-            k: v
-            for k, v in override_payload.items()
-            if k in allowed_config_keys and v is not None
-        })
+        split_override_payload = _build_split_override_payload(split_cfg)
+        override_payload = _build_override_payload(
+            model_name=model_name,
+            cfg=cfg,
+            model_overrides=model_overrides,
+            runtime_override_payload=runtime_override_payload,
+            split_override_payload=split_override_payload,
+            preprocess_bundle_options=preprocess_bundle_options,
+            val_ratio=val_ratio,
+            rand_seed=rand_seed,
+            epochs=epochs,
+            plot_path_style=runtime_cfg["plot_path_style"],
+        )
+        config_payload = _build_dataclass_config_payload(
+            deps=deps,
+            cfg=cfg,
+            runtime_cfg=runtime_cfg,
+            split_cfg=split_cfg,
+            override_payload=override_payload,
+        )
         config = deps.ropt.BayesOptConfig.from_flat_dict(config_payload)
 
-        if "all" in args.model_keys:
-            requested_keys = ["glm", "xgb", "resn", "ft", "gnn"]
-        else:
-            requested_keys = args.model_keys
-        requested_keys = deps.dedupe_preserve_order(requested_keys)
-
-        if ft_role != "model":
-            requested_keys = [k for k in requested_keys if k != "ft"]
-            if not requested_keys:
-                stack_keys = args.stack_model_keys or cfg.get(
-                    "stack_model_keys")
-                if stack_keys:
-                    if "all" in stack_keys:
-                        requested_keys = ["glm", "xgb", "resn", "gnn"]
-                    else:
-                        requested_keys = [k for k in stack_keys if k != "ft"]
-                    requested_keys = deps.dedupe_preserve_order(requested_keys)
+        requested_keys = _resolve_requested_model_keys(
+            args_model_keys=args.model_keys,
+            args_stack_model_keys=args.stack_model_keys,
+            cfg_stack_model_keys=cfg.get("stack_model_keys"),
+            ft_role=ft_role,
+            dedupe_preserve_order=deps.dedupe_preserve_order,
+        )
         known_model_keys = {"glm", "xgb", "resn", "ft", "gnn"}
         invalid_requested = [k for k in requested_keys if k not in known_model_keys]
         if invalid_requested:

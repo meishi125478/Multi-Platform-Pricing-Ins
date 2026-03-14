@@ -69,6 +69,7 @@ class BayesOptConfig:
         use_gnn_data_parallel: Use DataParallel for GNN
         ft_role: FT-Transformer role ('model', 'embedding', 'unsupervised_embedding')
         cv_strategy: CV strategy ('random', 'group', 'time', 'stratified')
+        invalid_param_policy: Handling for unsupported tuned params ('warn', 'error', 'ignore')
         build_oht: Whether to build one-hot encoded features (default True)
         oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
         keep_unscaled_oht: Keep unscaled one-hot copy in memory (default False)
@@ -195,6 +196,7 @@ class BayesOptConfig:
     preprocess_bundle_path: Optional[str] = None
     plot_path_style: str = "nested"
     bo_sample_limit: Optional[int] = None
+    invalid_param_policy: str = "warn"
     build_oht: bool = True
     oht_sparse_csr: bool = True
     keep_unscaled_oht: bool = False
@@ -573,6 +575,16 @@ class BayesOptConfig:
                     errors.append(
                         f"gnn_predict_chunk_rows must be >= 1 when provided, got {gnn_predict_chunk_rows}"
                     )
+
+        # Validate unsupported-parameter handling policy.
+        invalid_param_policy = str(self.invalid_param_policy).strip().lower()
+        if invalid_param_policy not in {"warn", "error", "ignore"}:
+            errors.append(
+                "invalid_param_policy must be one of {'warn', 'error', 'ignore'}, "
+                f"got '{self.invalid_param_policy}'"
+            )
+        else:
+            self.invalid_param_policy = invalid_param_policy
 
         # Validate JSON-driven Optuna search spaces.
         for field_name in (

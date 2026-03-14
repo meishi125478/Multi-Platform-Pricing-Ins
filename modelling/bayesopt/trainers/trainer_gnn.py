@@ -21,6 +21,18 @@ def _log(*args, **kwargs) -> None:
     log_print(_logger, *args, **kwargs)
 
 class GNNTrainer(TrainerBase):
+    _GNN_PARAM_KEYS = {
+        "hidden_dim",
+        "num_layers",
+        "k_neighbors",
+        "dropout",
+        "learning_rate",
+        "epochs",
+        "patience",
+        "tw_power",
+        "weight_decay",
+    }
+
     def __init__(self, context: "BayesOptModel") -> None:
         super().__init__(context, 'GNN', 'GNN')
         self.model: Optional[GraphNeuralNetSklearn] = None
@@ -52,7 +64,11 @@ class GNNTrainer(TrainerBase):
         self._clean_gpu(synchronize=synchronize)
 
     def _build_model(self, params: Optional[Dict[str, Any]] = None) -> GraphNeuralNetSklearn:
-        params = params or {}
+        params = self._sanitize_with_allowlist(
+            params,
+            allowed_keys=set(self._GNN_PARAM_KEYS),
+            context="GNN model params",
+        )
         dist_cfg = self._dist_cfg()
         base_tw_power = self.ctx.default_tweedie_power()
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
@@ -137,6 +153,18 @@ class GNNTrainer(TrainerBase):
             distribution=getattr(self.ctx, "distribution", None),
         )
         return self._apply_dataloader_overrides(model)
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        return self._sanitize_with_allowlist(
+            params,
+            allowed_keys=set(self._GNN_PARAM_KEYS),
+            context=f"{context} (GNN params)",
+        )
 
     def cross_val(self, trial: optuna.trial.Trial) -> float:
         base_tw_power = self.ctx.default_tweedie_power()
@@ -394,6 +422,11 @@ class GNNTrainer(TrainerBase):
             _log(f"[load] Warning: Model file not found: {path}")
             return
         payload = torch_load(path, map_location='cpu', weights_only=False)
+        if isinstance(payload, dict) and isinstance(payload.get("best_params"), dict):
+            payload["best_params"] = self._sanitize_best_params(
+                dict(payload["best_params"]),
+                context="checkpoint_load",
+            )
         try:
             model, params, warning = rebuild_gnn_model_from_payload(
                 payload=payload,
@@ -406,5 +439,9 @@ class GNNTrainer(TrainerBase):
         if warning:
             _log(f"[GNN load] Warning: State dict mismatch, loading with strict=False: {warning}")
         self.model = model
-        self.best_params = dict(params) if isinstance(params, dict) else None
+        self.best_params = (
+            self._sanitize_best_params(dict(params), context="checkpoint_load")
+            if isinstance(params, dict)
+            else None
+        )
         self.ctx.gnn_best = self.model

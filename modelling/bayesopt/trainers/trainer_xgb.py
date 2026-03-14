@@ -433,12 +433,24 @@ def _xgb_cuda_available() -> bool:
     return False
 
 class XGBTrainer(TrainerBase):
+    _DEFAULT_TUNED_PARAM_KEYS = {
+        "learning_rate",
+        "gamma",
+        "max_depth",
+        "n_estimators",
+        "min_child_weight",
+        "reg_alpha",
+        "reg_lambda",
+        "tweedie_variance_power",
+    }
+
     def __init__(self, context: "BayesOptModel") -> None:
         super().__init__(context, 'Xgboost', 'Xgboost')
         self.model: Optional[xgb.XGBModel] = None
         self._xgb_use_gpu = False
         self._xgb_gpu_warned = False
         self._xgb_chunk_warned = False
+        self._xgb_param_allowlist: Optional[set[str]] = None
 
     def _build_sklearn_estimator(self, params: Dict[str, Any]) -> xgb.XGBModel:
         if self.ctx.task_type == 'classification':
@@ -591,9 +603,37 @@ class XGBTrainer(TrainerBase):
         # Avoid pruning away the full search budget when max_evals is tiny.
         return self._resolve_optuna_total_trials() > 2
 
+    def _resolve_xgb_param_allowlist(self) -> set[str]:
+        cached = getattr(self, "_xgb_param_allowlist", None)
+        if cached is not None:
+            return set(cached)
+        allow = set(self._DEFAULT_TUNED_PARAM_KEYS)
+        try:
+            probe = self._build_sklearn_estimator({})
+            allow.update(str(k) for k in probe.get_params().keys())
+        except Exception:
+            pass
+        self._xgb_param_allowlist = set(allow)
+        return set(allow)
+
     def _sanitize_tuned_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep tuned params unchanged so XGBoost can surface unused-parameter warnings."""
-        return dict(params or {})
+        return self._sanitize_with_allowlist(
+            params,
+            allowed_keys=self._resolve_xgb_param_allowlist(),
+            context="XGBoost tuned params",
+        )
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        return self._sanitize_with_allowlist(
+            params,
+            allowed_keys=self._resolve_xgb_param_allowlist(),
+            context=f"{context} (XGBoost params)",
+        )
 
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:

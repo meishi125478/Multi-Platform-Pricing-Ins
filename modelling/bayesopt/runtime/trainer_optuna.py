@@ -26,6 +26,18 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerOptunaMixin:
+    def _sanitize_best_params_payload(
+        self,
+        params: Optional[Dict[str, Any]],
+        *,
+        context: str,
+    ) -> Dict[str, Any]:
+        sanitized = dict(params or {})
+        sanitize_fn = getattr(self, "_sanitize_best_params", None)
+        if callable(sanitize_fn):
+            sanitized = dict(sanitize_fn(sanitized, context=context) or {})
+        return sanitized
+
     @staticmethod
     def _get_trials(
         study: optuna.study.Study,
@@ -267,6 +279,12 @@ class TrainerOptunaMixin:
                 best_params = getattr(best, "params", None)
                 if not best_params:
                     return
+                best_params = self._sanitize_best_params_payload(
+                    best_params,
+                    context="optuna_checkpoint",
+                )
+                if not best_params:
+                    return
                 self._persist_best_params_csv(best_params)
             except Exception:
                 return
@@ -332,7 +350,10 @@ class TrainerOptunaMixin:
             )
 
         self.best_trial = study.best_trial
-        self.best_params = dict(getattr(self.best_trial, "params", None) or {})
+        self.best_params = self._sanitize_best_params_payload(
+            getattr(self.best_trial, "params", None),
+            context="optuna_best_trial",
+        )
         if not self.best_params:
             raise RuntimeError(
                 f"[Optuna][{self.label}] Best trial has empty params; cannot continue."
@@ -429,7 +450,10 @@ class TrainerOptunaMixin:
             if cmd == "STOP":
                 best_params = payload.get("best_params")
                 if best_params is not None:
-                    self.best_params = best_params
+                    self.best_params = self._sanitize_best_params_payload(
+                        best_params,
+                        context="ddp_stop_payload",
+                    )
                 break
             if cmd == "RUN":
                 params = payload.get("params") or {}

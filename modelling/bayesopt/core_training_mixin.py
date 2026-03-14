@@ -56,14 +56,38 @@ class BayesOptTrainingMixin:
         return []
 
     def _maybe_load_best_params(self, model_key: str, trainer: "TrainerBase") -> None:
+        def _sanitize_loaded(params: Optional[Dict[str, Any]], source: str) -> Optional[Dict[str, Any]]:
+            if not isinstance(params, dict):
+                return None
+            sanitize_fn = getattr(trainer, "_sanitize_best_params", None)
+            if callable(sanitize_fn):
+                return dict(sanitize_fn(dict(params), context=source) or {})
+            return dict(params)
+
+        def _apply_loaded(
+            params: Optional[Dict[str, Any]],
+            *,
+            source: str,
+            message: str,
+            study_name: Optional[str] = None,
+        ) -> None:
+            trainer.best_params = _sanitize_loaded(params, source)
+            trainer.best_trial = None
+            if study_name is not None:
+                trainer.study_name = study_name
+            _log(message)
+
         # 1) If best_params_files is specified, load and skip tuning.
         best_params_files = getattr(self.config, "best_params_files", None) or {}
         best_params_file = best_params_files.get(model_key)
         if best_params_file and not trainer.best_params:
-            trainer.best_params = IOUtils.load_params_file(best_params_file)
-            trainer.best_trial = None
-            _log(
-                f"[Optuna][{trainer.label}] Loaded best_params from {best_params_file}; skip tuning."
+            _apply_loaded(
+                IOUtils.load_params_file(best_params_file),
+                source="best_params_file",
+                message=(
+                    f"[Optuna][{trainer.label}] Loaded best_params from "
+                    f"{best_params_file}; skip tuning."
+                ),
             )
 
         # 2) If reuse_best_params is enabled, prefer version snapshots; else load legacy CSV.
@@ -72,12 +96,19 @@ class BayesOptTrainingMixin:
             payload = self.version_manager.load_latest(f"{model_key}_best")
             best_params = None if payload is None else payload.get("best_params")
             if best_params:
-                trainer.best_params = best_params
-                trainer.best_trial = None
-                trainer.study_name = payload.get(
-                    "study_name") if isinstance(payload, dict) else None
-                _log(
-                    f"[Optuna][{trainer.label}] Reusing best_params from versions snapshot.")
+                _apply_loaded(
+                    best_params,
+                    source="version_snapshot",
+                    message=(
+                        f"[Optuna][{trainer.label}] Reusing best_params "
+                        "from versions snapshot."
+                    ),
+                    study_name=(
+                        payload.get("study_name")
+                        if isinstance(payload, dict)
+                        else None
+                    ),
+                )
                 return
 
             params_path = best_params_csv_path(
@@ -91,10 +122,13 @@ class BayesOptTrainingMixin:
                 trainer.label,
             )
             if params is not None:
-                trainer.best_params = params
-                trainer.best_trial = None
-                _log(
-                    f"[Optuna][{trainer.label}] Reusing best_params from {params_path}."
+                _apply_loaded(
+                    params,
+                    source="best_params_csv",
+                    message=(
+                        f"[Optuna][{trainer.label}] Reusing best_params from "
+                        f"{params_path}."
+                    ),
                 )
 
     # Generic optimization entry point.

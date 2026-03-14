@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import platform
@@ -12,7 +11,91 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterable, Optional, Sequence
 
+
+class _MissingTrainingConfigError(ValueError):
+    """Raised when no runnable training config can be resolved."""
+
+
 class AppControllerRuntimeMixin:
+    @staticmethod
+    def _dump_json(payload: Dict[str, Any]) -> str:
+        return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _extract_task_mode(config: Dict[str, Any]) -> str:
+        runner = config.get("runner", {})
+        if not isinstance(runner, dict):
+            return "entry"
+        return str(runner.get("mode", "entry") or "entry")
+
+    def _write_temp_config(
+        self,
+        config: Dict[str, Any],
+        *,
+        base_dir: Path,
+        prefix: str = "temp_config_",
+        suffix: str = ".json",
+    ) -> Path:
+        fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=base_dir)
+        temp_config_path = Path(temp_path)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(config, handle, indent=2)
+        return temp_config_path
+
+    def _resolve_training_config(
+        self,
+        config_json: str,
+    ) -> tuple[Dict[str, Any], str, Path, Optional[Path]]:
+        temp_config_path: Optional[Path] = None
+        if config_json:
+            config = json.loads(config_json)
+            task_mode = self._extract_task_mode(config)
+            base_dir = self._default_base_dir(self.current_config_dir)
+            temp_config_path = self._write_temp_config(config, base_dir=base_dir)
+            return config, task_mode, temp_config_path, temp_config_path
+        if self.current_config_path and self.current_config_path.exists():
+            config_path = self.current_config_path
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            task_mode = self._extract_task_mode(config)
+            return config, task_mode, config_path, None
+        if self.current_config:
+            config = self.current_config
+            task_mode = self._extract_task_mode(config)
+            base_dir = self._default_base_dir(self.current_config_dir)
+            temp_config_path = self._write_temp_config(config, base_dir=base_dir)
+            return config, task_mode, temp_config_path, temp_config_path
+        raise _MissingTrainingConfigError("No configuration provided")
+
+    def _resolve_existing_config_path(
+        self,
+        path_value: str,
+        *,
+        candidate_dirs: Iterable[Optional[Path]],
+    ) -> Path:
+        path_obj = Path(path_value).expanduser()
+        if path_obj.is_absolute():
+            resolved = path_obj.resolve()
+            if resolved.exists():
+                return resolved
+            raise FileNotFoundError(path_value)
+
+        for root in candidate_dirs:
+            if root is None:
+                continue
+            candidate = (Path(root).resolve() / path_obj).resolve()
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(path_value)
+
+    def _resolve_model_override_paths(
+        self,
+        **path_specs: tuple[Optional[str], Optional[Any]],
+    ) -> Dict[str, Optional[str]]:
+        resolved: Dict[str, Optional[str]] = {}
+        for key, (manual_path, uploaded_file) in path_specs.items():
+            resolved[key] = self._resolve_override_path(manual_path, uploaded_file)
+        return resolved
+
     def run_workflow_config_ui(self, workflow_config_json: str) -> Generator[tuple[str, str], None, None]:
         """Run plotting/prediction/compare/pre-oneway from workflow JSON config."""
         try:
@@ -55,31 +138,9 @@ class AppControllerRuntimeMixin:
         """
         temp_config_path: Optional[Path] = None
         try:
-            if config_json:
-                config = json.loads(config_json)
-                task_mode = config.get('runner', {}).get('mode', 'entry')
-                base_dir = self._default_base_dir(self.current_config_dir)
-                fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
-                temp_config_path = Path(temp_path)
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2)
-                config_path = temp_config_path
-            elif self.current_config_path and self.current_config_path.exists():
-                config_path = self.current_config_path
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-                task_mode = config.get('runner', {}).get('mode', 'entry')
-            elif self.current_config:
-                config = self.current_config
-                task_mode = config.get('runner', {}).get('mode', 'entry')
-                base_dir = self._default_base_dir(self.current_config_dir)
-                fd, temp_path = tempfile.mkstemp(prefix="temp_config_", suffix=".json", dir=base_dir)
-                temp_config_path = Path(temp_path)
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2)
-                config_path = temp_config_path
-            else:
-                yield "No configuration provided", ""
-                return
+            _, task_mode, config_path, temp_config_path = self._resolve_training_config(
+                config_json
+            )
 
             runner = self._get_runner()
             log_generator = runner.run_task(str(config_path))
@@ -92,6 +153,9 @@ class AppControllerRuntimeMixin:
 
             yield f"Task [{task_mode}] completed!", full_log
 
+        except _MissingTrainingConfigError:
+            yield "No configuration provided", ""
+            return
         except Exception as e:
             error_msg = f"Error during task execution: {str(e)}"
             yield error_msg, error_msg
@@ -118,11 +182,10 @@ class AppControllerRuntimeMixin:
             # Save to temp file
             base_dir = self._default_base_dir(self.current_config_dir)
             temp_path = (base_dir / "temp_ft_step1_config.json").resolve()
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(step1_config, f, indent=2)
+            temp_path.write_text(self._dump_json(step1_config), encoding="utf-8")
 
             self.current_step1_config = str(temp_path)
-            step1_json = json.dumps(step1_config, indent=2, ensure_ascii=False)
+            step1_json = self._dump_json(step1_config)
 
             return "Step 1 config prepared. Click 'Run Step 1' to train FT embeddings.", step1_json
 
@@ -142,28 +205,14 @@ class AppControllerRuntimeMixin:
             return "Step 1 config not found. Run Step 1 first.", "", ""
 
         try:
-            step1_path = Path(step1_config_path).expanduser()
-            if not step1_path.is_absolute():
-                candidate_dirs: Iterable[Path] = (
+            step1_path = self._resolve_existing_config_path(
+                step1_config_path,
+                candidate_dirs=(
                     self.current_config_dir,
                     self.working_dir,
                     Path.cwd(),
-                )
-                resolved_candidate = None
-                for root in candidate_dirs:
-                    if root is None:
-                        continue
-                    candidate = (Path(root).resolve() / step1_path).resolve()
-                    if candidate.exists():
-                        resolved_candidate = candidate
-                        break
-                if resolved_candidate is None:
-                    return "Step 1 config not found. Run Step 1 first.", "", ""
-                step1_path = resolved_candidate
-            else:
-                step1_path = step1_path.resolve()
-                if not step1_path.exists():
-                    return "Step 1 config not found. Run Step 1 first.", "", ""
+                ),
+            )
 
             models = [m.strip() for m in target_models.split(',') if m.strip()]
             data_dir_value = str(augmented_data_dir or "").strip() or "./DataFTUnsupervised"
@@ -188,7 +237,7 @@ class AppControllerRuntimeMixin:
             if xgb_cfg:
                 xgb_cfg_path = save_dir / "config_xgb_from_ft_unsupervised.json"
                 xgb_cfg_path.write_text(
-                    json.dumps(xgb_cfg, indent=2, ensure_ascii=False),
+                    self._dump_json(xgb_cfg),
                     encoding="utf-8",
                 )
                 saved_paths["xgb"] = str(xgb_cfg_path)
@@ -196,7 +245,7 @@ class AppControllerRuntimeMixin:
             if resn_cfg:
                 resn_cfg_path = save_dir / "config_resn_from_ft_unsupervised.json"
                 resn_cfg_path.write_text(
-                    json.dumps(resn_cfg, indent=2, ensure_ascii=False),
+                    self._dump_json(resn_cfg),
                     encoding="utf-8",
                 )
                 saved_paths["resn"] = str(resn_cfg_path)
@@ -212,10 +261,8 @@ class AppControllerRuntimeMixin:
             if "resn" in saved_paths:
                 status_lines.append(f"Saved ResN config: {saved_paths['resn']}")
             status_msg = "\n".join(status_lines)
-            xgb_json = json.dumps(
-                xgb_cfg, indent=2, ensure_ascii=False) if xgb_cfg else ""
-            resn_json = json.dumps(
-                resn_cfg, indent=2, ensure_ascii=False) if resn_cfg else ""
+            xgb_json = self._dump_json(xgb_cfg) if xgb_cfg else ""
+            resn_json = self._dump_json(resn_cfg) if resn_cfg else ""
 
             return status_msg, xgb_json, resn_json
 
@@ -520,11 +567,9 @@ class AppControllerRuntimeMixin:
     ):
         workflows_module = self._load_workflows_module()
         selected_factors = self._normalize_feature_values(oneway_factors)
-        resolved_xgb_model_path = self._resolve_override_path(
-            xgb_model_path, xgb_model_file
-        )
-        resolved_resn_model_path = self._resolve_override_path(
-            resn_model_path, resn_model_file
+        resolved_paths = self._resolve_model_override_paths(
+            xgb=(xgb_model_path, xgb_model_file),
+            resn=(resn_model_path, resn_model_file),
         )
         yield from self._run_workflow_with_preview(
             "Direct Plot",
@@ -541,8 +586,8 @@ class AppControllerRuntimeMixin:
             oneway_features=selected_factors or None,
             train_data_path=train_data_path or None,
             test_data_path=test_data_path or None,
-            xgb_model_path=resolved_xgb_model_path,
-            resn_model_path=resolved_resn_model_path,
+            xgb_model_path=resolved_paths["xgb"],
+            resn_model_path=resolved_paths["resn"],
             model_search_dir=str(self.working_dir),
         )
 
@@ -565,14 +610,10 @@ class AppControllerRuntimeMixin:
     ):
         workflows_module = self._load_workflows_module()
         selected_factors = self._normalize_feature_values(oneway_factors)
-        resolved_xgb_model_path = self._resolve_override_path(
-            xgb_model_path, xgb_model_file
-        )
-        resolved_resn_model_path = self._resolve_override_path(
-            resn_model_path, resn_model_file
-        )
-        resolved_ft_model_path = self._resolve_override_path(
-            ft_model_path, ft_model_file
+        resolved_paths = self._resolve_model_override_paths(
+            xgb=(xgb_model_path, xgb_model_file),
+            resn=(resn_model_path, resn_model_file),
+            ft=(ft_model_path, ft_model_file),
         )
         yield from self._run_workflow_with_preview(
             "Embed Plot",
@@ -591,9 +632,9 @@ class AppControllerRuntimeMixin:
             oneway_features=selected_factors or None,
             train_data_path=train_data_path or None,
             test_data_path=test_data_path or None,
-            xgb_model_path=resolved_xgb_model_path,
-            resn_model_path=resolved_resn_model_path,
-            ft_model_path=resolved_ft_model_path,
+            xgb_model_path=resolved_paths["xgb"],
+            resn_model_path=resolved_paths["resn"],
+            ft_model_path=resolved_paths["ft"],
             model_search_dir=str(self.working_dir),
         )
 
@@ -614,14 +655,10 @@ class AppControllerRuntimeMixin:
         resn_model_path: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
-        resolved_ft_model_path = self._resolve_override_path(
-            ft_model_path, ft_model_file
-        )
-        resolved_xgb_model_path = self._resolve_override_path(
-            xgb_model_path, xgb_model_file
-        )
-        resolved_resn_model_path = self._resolve_override_path(
-            resn_model_path, resn_model_file
+        resolved_paths = self._resolve_model_override_paths(
+            ft=(ft_model_path, ft_model_file),
+            xgb=(xgb_model_path, xgb_model_file),
+            resn=(resn_model_path, resn_model_file),
         )
         yield from self._run_workflow(
             "Prediction",
@@ -633,9 +670,9 @@ class AppControllerRuntimeMixin:
             output_path=output_path,
             model_name=model_name or None,
             model_keys=model_keys,
-            ft_model_path=resolved_ft_model_path,
-            xgb_model_path=resolved_xgb_model_path,
-            resn_model_path=resolved_resn_model_path,
+            ft_model_path=resolved_paths["ft"],
+            xgb_model_path=resolved_paths["xgb"],
+            resn_model_path=resolved_paths["resn"],
             model_search_dir=str(self.working_dir),
         )
 
@@ -662,14 +699,10 @@ class AppControllerRuntimeMixin:
         if model_key_norm not in {"xgb", "resn"}:
             raise ValueError("model_key must be one of: xgb, resn.")
         label = "Compare XGB" if model_key_norm == "xgb" else "Compare ResNet"
-        resolved_direct_model_path = self._resolve_override_path(
-            direct_model_path, direct_model_file
-        )
-        resolved_ft_embed_model_path = self._resolve_override_path(
-            ft_embed_model_path, ft_embed_model_file
-        )
-        resolved_ft_model_path = self._resolve_override_path(
-            ft_model_path, ft_model_file
+        resolved_paths = self._resolve_model_override_paths(
+            direct=(direct_model_path, direct_model_file),
+            ft_embed=(ft_embed_model_path, ft_embed_model_file),
+            ft=(ft_model_path, ft_model_file),
         )
         yield from self._run_compare_ui(
             model_key=model_key_norm,
@@ -683,9 +716,9 @@ class AppControllerRuntimeMixin:
             n_bins_override=n_bins_override,
             train_data_path=train_data_path,
             test_data_path=test_data_path,
-            direct_model_path=resolved_direct_model_path or "",
-            ft_embed_model_path=resolved_ft_embed_model_path or "",
-            ft_model_path=resolved_ft_model_path or "",
+            direct_model_path=resolved_paths["direct"] or "",
+            ft_embed_model_path=resolved_paths["ft_embed"] or "",
+            ft_model_path=resolved_paths["ft"] or "",
         )
 
     def _run_compare_ui(

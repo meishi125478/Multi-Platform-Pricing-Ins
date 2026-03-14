@@ -31,6 +31,7 @@ class ResNetTrainer(TrainerBase):
         self.enable_distributed_optuna = bool(
             getattr(dist_cfg, "use_resn_ddp", False) and context.use_gpu
         )
+        self._param_probe_model: Optional[ResNetSklearn] = None
 
     def _dist_cfg(self):
         return getattr(self.ctx.config, "distributed", self.ctx.config)
@@ -106,9 +107,30 @@ class ResNetTrainer(TrainerBase):
             key: value for key, value in params.items()
             if key not in handled_keys
         }
+        extra_params = self._filter_params_by_model_support(
+            model,
+            extra_params,
+            context="ResNet model params",
+        )
         if extra_params:
             model.set_params(extra_params)
         return self._apply_dataloader_overrides(model)
+
+    def _sanitize_best_params(
+        self,
+        params: Dict[str, Any],
+        *,
+        context: str = "best_params",
+    ) -> Dict[str, Any]:
+        probe = self._param_probe_model
+        if probe is None:
+            probe = self._build_model({})
+            self._param_probe_model = probe
+        return self._filter_params_by_model_support(
+            probe,
+            params,
+            context=f"{context} (ResNet params)",
+        )
 
     # ========= Cross-validation (for BayesOpt) =========
     def cross_val(self, trial: optuna.trial.Trial) -> float:
@@ -307,17 +329,25 @@ class ResNetTrainer(TrainerBase):
         if os.path.exists(path):
             payload = torch_load(path, map_location='cpu', weights_only=False)
             params_fallback = (
-                dict(self.best_params)
+                self._sanitize_best_params(dict(self.best_params), context="checkpoint_load")
                 if isinstance(self.best_params, dict)
                 else None
             )
+            if isinstance(payload, dict) and isinstance(payload.get("best_params"), dict):
+                payload["best_params"] = self._sanitize_best_params(
+                    dict(payload["best_params"]),
+                    context="checkpoint_load",
+                )
             resn_loaded, resolved_params = rebuild_resn_model_from_payload(
                 payload=payload,
                 model_builder=self._build_model,
                 params_fallback=params_fallback,
                 require_params=False,
             )
-            self.best_params = resolved_params
+            self.best_params = self._sanitize_best_params(
+                resolved_params,
+                context="checkpoint_load",
+            )
             self._move_to_device(resn_loaded)
             self.model = resn_loaded
             self.ctx.resn_best = self.model

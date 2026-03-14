@@ -17,33 +17,71 @@ class DummyCtx:
         self.config = types.SimpleNamespace(use_ft_ddp=False, geo_feature_nmes=["geo"])
         self.train_data = train_df
         self.test_data = test_df
+        self.model_nme = "dummy_ft"
+        self.num_features = ["x"]
+        self.cate_list = []
+        self.train_geo_tokens = None
+        self.test_geo_tokens = None
+        self.geo_token_cols = []
+        self.geo_gnn_model = None
         self._build_calls = []
+        self._last_params = None
 
     def _build_geo_tokens(self, _params=None):
+        self._last_params = _params
         self._build_calls.append(
             (self.train_data.copy(deep=True), self.test_data.copy(deep=True))
         )
         return self.train_data.copy(deep=True), self.test_data.copy(deep=True), ["geo_token"], None
 
 
-def test_geo_token_split_uses_fold_and_restores_context():
-    train = pd.DataFrame({"geo": ["a", "b", "c", "d"], "x": [1, 2, 3, 4]})
-    test = pd.DataFrame({"geo": ["e"], "x": [5]})
+def test_apply_model_params_drops_unsupported_geo_keys():
+    train = pd.DataFrame({"geo": ["a", "b"], "x": [1, 2]})
+    test = pd.DataFrame({"geo": ["c"], "x": [3]})
     ctx = DummyCtx(train, test)
     trainer = FTTrainer(ctx)
 
-    X_train = train.iloc[[0, 1]]
-    X_val = train.iloc[[2, 3]]
+    class DummyModel:
+        def __init__(self):
+            self.calls = []
+            self.d_model = 32
+            self.dropout = 0.0
 
-    orig_train = ctx.train_data
-    orig_test = ctx.test_data
+        def set_params(self, params):
+            self.calls.append(dict(params))
+            if any(key.startswith("geo_token_") for key in params):
+                raise AssertionError("geo params must not be passed directly")
+            return self
 
-    result = trainer._build_geo_tokens_for_split(X_train, X_val, geo_params={"k": 1})
+    model = DummyModel()
+    filtered = trainer._apply_model_params(
+        model,
+        {
+            "d_model": 64,
+            "dropout": 0.1,
+            "geo_token_hidden_dim": 32,
+            "geo_token_layers": 2,
+        },
+    )
 
-    assert ctx.train_data is orig_train
-    assert ctx.test_data is orig_test
-    assert result is not None
+    assert filtered == {"d_model": 64, "dropout": 0.1}
+    assert model.calls == [{"d_model": 64, "dropout": 0.1}]
 
-    train_snapshot, test_snapshot = ctx._build_calls[0]
-    assert train_snapshot.equals(train.loc[X_train.index])
-    assert test_snapshot.equals(train.loc[X_val.index])
+
+def test_sanitize_best_params_filters_geo_and_unknown_keys():
+    train = pd.DataFrame({"geo": ["a", "b", "c"], "x": [1, 2, 3]})
+    test = pd.DataFrame({"geo": ["d"], "x": [4]})
+    ctx = DummyCtx(train, test)
+    trainer = FTTrainer(ctx)
+
+    sanitized = trainer._sanitize_best_params(
+        {
+            "d_model": 64,
+            "dropout": 0.1,
+            "geo_token_hidden_dim": 16,
+            "geo_token_layers": 1,
+            "not_a_ft_param": 999,
+        },
+        context="test",
+    )
+    assert sanitized == {"d_model": 64, "dropout": 0.1}
