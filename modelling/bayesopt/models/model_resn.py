@@ -146,9 +146,9 @@ class ResNetSequential(nn.Module):
 
 
 class _LazyTabularDataset(Dataset):
-    """Lazy map-style dataset to avoid materializing full torch tensors."""
+    """Lazy map-style dataset with worker-friendly row streaming."""
 
-    def __init__(self, X, y, w=None):
+    def __init__(self, X, y, w=None, *, materialize_dense: bool = False):
         self.X = X
         self.y = y
         self.w = w
@@ -161,7 +161,10 @@ class _LazyTabularDataset(Dataset):
             raise ValueError(
                 f"w length {len(w)} does not match X length {self._len}."
             )
-        self._dense_X = self._try_dense_matrix(X)
+        # Worker-safety default:
+        # - For DDP + workers>0, avoid full dense materialization because each
+        #   spawned worker gets its own dataset copy and can blow up host memory.
+        self._dense_X = self._try_dense_matrix(X) if bool(materialize_dense) else None
         self._dense_y = self._to_dense_vector(y)
         self._dense_w = self._to_dense_vector(w) if w is not None else None
 
@@ -439,16 +442,35 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
             X_val_tensor = y_val_tensor = w_val_tensor = None
         return X_tensor, y_tensor, w_tensor, X_val_tensor, y_val_tensor, w_val_tensor, has_val
 
-    def _build_train_val_datasets(self, X_train, y_train, w_train, X_val, y_val, w_val):
+    def _build_train_val_datasets(
+        self,
+        X_train,
+        y_train,
+        w_train,
+        X_val,
+        y_val,
+        w_val,
+        *,
+        materialize_dense: bool = False,
+    ):
         self._validate_inputs(X_train, y_train, w_train, "train")
         has_val = X_val is not None and y_val is not None
         if X_val is not None or y_val is not None or w_val is not None:
             if not has_val:
                 raise ValueError("validation X and y must both be provided.")
             self._validate_inputs(X_val, y_val, w_val, "val")
-        train_dataset = _LazyTabularDataset(X_train, y_train, w_train)
+        train_dataset = _LazyTabularDataset(
+            X_train,
+            y_train,
+            w_train,
+            materialize_dense=materialize_dense,
+        )
         val_dataset = _LazyTabularDataset(
-            X_val, y_val, w_val) if has_val else None
+            X_val,
+            y_val,
+            w_val,
+            materialize_dense=materialize_dense,
+        ) if has_val else None
         return train_dataset, val_dataset, has_val
 
     def forward(self, x):
@@ -468,8 +490,34 @@ class ResNetSklearn(TorchTrainerMixin, nn.Module):
             X_val=None, y_val=None, w_val=None, trial=None):
         use_lazy = bool(getattr(self, "use_lazy_dataset", True))
         if use_lazy:
+            # Mirror FT worker-friendly behavior: prefer row-streaming dataset
+            # whenever DDP or worker multiprocessing is expected.
+            profile = self._resolve_resource_profile()
+            expected_workers = self._resolve_num_workers(8, profile=profile)
+            force_dense = str(
+                os.environ.get("BAYESOPT_RESN_LAZY_MATERIALIZE_DENSE", "")
+            ).strip().lower() in {"1", "true", "yes", "y", "on"}
+            materialize_dense = bool(
+                force_dense or (
+                    (not self.is_ddp_enabled) and expected_workers <= 0
+                )
+            )
+            if not getattr(self, "_lazy_dataset_mode_logged", False):
+                _log(
+                    ">>> ResNet lazy dataset mode: "
+                    f"{'dense-cache' if materialize_dense else 'row-stream'} "
+                    f"(ddp={self.is_ddp_enabled}, expected_workers={expected_workers}).",
+                    flush=True,
+                )
+                self._lazy_dataset_mode_logged = True
             train_dataset, val_dataset, has_val = self._build_train_val_datasets(
-                X_train, y_train, w_train, X_val, y_val, w_val
+                X_train,
+                y_train,
+                w_train,
+                X_val,
+                y_val,
+                w_val,
+                materialize_dense=materialize_dense,
             )
             if not getattr(self, "_lazy_dataset_logged", False):
                 _log(

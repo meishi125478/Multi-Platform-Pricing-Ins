@@ -8,6 +8,7 @@ import pytest
 
 from ins_pricing.cli.utils.cli_config import resolve_runtime_config, resolve_split_config
 from ins_pricing.modelling.bayesopt.runtime.entry_runner_training import (
+    _build_runtime_override_payload,
     _load_and_split_dataset,
 )
 from ins_pricing.utils.paths import load_dataset
@@ -253,5 +254,42 @@ def test_resolve_split_and_runtime_config_expose_new_fields():
     assert split_cfg["train_data_path"] == "./cache/train.csv"
     assert split_cfg["test_data_path"] == "./cache/test.csv"
 
-    runtime_cfg = resolve_runtime_config({"rand_seed": None})
+    runtime_cfg = resolve_runtime_config(
+        {
+            "rand_seed": None,
+            "ft_search_space": {"n_heads": {"type": "categorical", "choices": [1, 2]}},
+            "ft_unsupervised_search_space": {"d_model": {"type": "int", "low": 16, "high": 32}},
+            "resn_search_space": {"hidden_dim": {"type": "int", "low": 16, "high": 64}},
+            "xgb_search_space": {"max_depth": {"type": "int", "low": 3, "high": 8}},
+        }
+    )
     assert runtime_cfg["rand_seed"] == 13
+    assert isinstance(runtime_cfg["ft_search_space"], dict)
+    assert isinstance(runtime_cfg["ft_unsupervised_search_space"], dict)
+    assert isinstance(runtime_cfg["resn_search_space"], dict)
+    assert isinstance(runtime_cfg["xgb_search_space"], dict)
+
+    payload = _build_runtime_override_payload(
+        cfg={},
+        runtime_cfg=runtime_cfg,
+        parallel_flags={
+            "use_gpu": False,
+            "use_resn_dp": False,
+            "use_ft_dp": False,
+            "use_gnn_dp": False,
+            "use_resn_ddp": False,
+            "use_ft_ddp": False,
+            "gnn_use_ann": True,
+            "gnn_threshold": 50000,
+            "gnn_graph_cache": None,
+            "gnn_max_gpu_nodes": None,
+            "gnn_gpu_mem_ratio": 0.9,
+            "gnn_gpu_mem_overhead": 2.0,
+        },
+        output_dir=None,
+        reuse_best_params=False,
+    )
+    assert isinstance(payload["ft_search_space"], dict)
+    assert isinstance(payload["ft_unsupervised_search_space"], dict)
+    assert isinstance(payload["resn_search_space"], dict)
+    assert isinstance(payload["xgb_search_space"], dict)

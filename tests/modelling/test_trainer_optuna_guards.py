@@ -3,6 +3,7 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 optuna = pytest.importorskip("optuna")
@@ -198,6 +199,68 @@ def test_run_study_and_extract_applies_best_param_sanitizer(tmp_path: Path) -> N
     assert "drop_me" not in trainer.best_params
 
 
+def test_run_study_and_extract_falls_back_when_global_best_params_are_empty(tmp_path: Path) -> None:
+    trainer = _DummyTrainer(tmp_path)
+    study = trainer._create_study()
+
+    # Seed a "global best" trial with empty params (e.g., legacy study content).
+    def _empty_best(_trial: optuna.trial.Trial) -> float:
+        return 0.01
+
+    # Seed another completed trial that has real tunable params.
+    def _with_params(trial: optuna.trial.Trial) -> float:
+        trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+        return 0.1
+
+    study.optimize(_empty_best, n_trials=1)
+    study.optimize(_with_params, n_trials=1)
+
+    progress_counter = {"count": 0}
+    objective_wrapper = trainer._make_objective_wrapper(
+        _with_params,
+        total_trials=2,
+        progress_counter=progress_counter,
+        barrier_on_end=False,
+    )
+    checkpoint_callback = trainer._make_checkpoint_callback()
+
+    trainer._run_study_and_extract(
+        study=study,
+        objective_wrapper=objective_wrapper,
+        checkpoint_callback=checkpoint_callback,
+        total_trials=2,
+        progress_counter=progress_counter,
+    )
+
+    assert isinstance(trainer.best_params, dict)
+    assert "learning_rate" in trainer.best_params
+    assert trainer.best_trial is not None
+    assert "learning_rate" in trainer.best_trial.params
+
+
+def test_checkpoint_callback_falls_back_when_global_best_params_are_empty(tmp_path: Path) -> None:
+    trainer = _DummyTrainer(tmp_path)
+    study = trainer._create_study()
+
+    def _empty_best(_trial: optuna.trial.Trial) -> float:
+        return 0.01
+
+    def _with_params(trial: optuna.trial.Trial) -> float:
+        trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+        return 0.1
+
+    study.optimize(_empty_best, n_trials=1)
+    study.optimize(_with_params, n_trials=1)
+
+    callback = trainer._make_checkpoint_callback()
+    callback(study, None)
+
+    path = Path(trainer._best_params_csv_path())
+    assert path.exists()
+    saved = pd.read_csv(path)
+    assert "learning_rate" in saved.columns
+
+
 def _make_minimal_xgb_trainer(invalid_param_policy: str = "warn") -> XGBTrainer:
     trainer = object.__new__(XGBTrainer)
     trainer.label = "Xgboost"
@@ -227,3 +290,4 @@ def test_xgb_sanitize_tuned_params_raises_under_error_policy() -> None:
         trainer._sanitize_tuned_params(
             {"learning_rate": 1e-3, "geo_token_hidden_dim": 32}
         )
+

@@ -99,10 +99,27 @@ class DatasetPreprocessor:
             if test_has_binary:
                 self.test_data['w_binary_act'] = self.test_data[cfg.binary_resp_nme] * \
                     self.test_data[cfg.weight_nme]
-        # High-quantile clipping absorbs outliers; removing it lets extremes dominate loss.
-        q99 = self.train_data[cfg.resp_nme].quantile(0.999)
-        self.train_data[cfg.resp_nme] = self.train_data[cfg.resp_nme].clip(
-            upper=q99)
+        clip_enabled = bool(getattr(cfg, "target_clip_enabled", True))
+        clip_quantile = getattr(cfg, "target_clip_quantile", 0.999)
+        if clip_enabled and clip_quantile is not None:
+            clip_q = float(clip_quantile)
+            clip_upper = self.train_data[cfg.resp_nme].quantile(clip_q)
+            if pd.notna(clip_upper):
+                self.train_data[cfg.resp_nme] = self.train_data[cfg.resp_nme].clip(
+                    upper=float(clip_upper)
+                )
+                _log(
+                    "[Preprocess] target clipping enabled: "
+                    f"q={clip_q:.6g}, upper={float(clip_upper):.6g}",
+                    flush=True,
+                )
+            else:
+                _log(
+                    "[Preprocess] target clipping skipped: computed quantile is NaN.",
+                    flush=True,
+                )
+        else:
+            _log("[Preprocess] target clipping disabled by config.", flush=True)
         cate_list = list(cfg.cate_list or [])
         if cate_list:
             for cate in cate_list:

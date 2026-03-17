@@ -174,6 +174,11 @@ class TrainerCVPredictionMixin:
                     "Missing Optuna trial for parameter sampling.")
             params = {name: sampler(trial)
                       for name, sampler in hyperparameter_space.items()}
+            _log(
+                f"[Optuna][{self.label}] trial_id={getattr(trial, 'number', 'unknown')} "
+                f"sampled params={params}",
+                flush=True,
+            )
             if self._should_use_distributed_optuna():
                 self._distributed_prepare_trial(params)
         X_all, y_all, w_all = data_provider()

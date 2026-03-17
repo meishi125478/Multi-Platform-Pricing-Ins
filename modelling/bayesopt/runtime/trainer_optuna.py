@@ -50,6 +50,70 @@ class TrainerOptunaMixin:
         except TypeError:
             return study.get_trials(states=states)
 
+    @staticmethod
+    def _trial_sort_key(trial: optuna.trial.FrozenTrial) -> tuple[float, int]:
+        raw_value = getattr(trial, "value", None)
+        try:
+            value = float(raw_value) if raw_value is not None else float("inf")
+        except Exception:
+            value = float("inf")
+        try:
+            number = int(getattr(trial, "number", -1))
+        except Exception:
+            number = -1
+        return value, number
+
+    def _resolve_best_trial_with_params(
+        self,
+        study: optuna.study.Study,
+        *,
+        context: str,
+    ) -> tuple[Optional[optuna.trial.FrozenTrial], Dict[str, Any]]:
+        try:
+            study_best_trial = study.best_trial
+        except Exception:
+            study_best_trial = None
+
+        selected_trial = study_best_trial
+        selected_params: Dict[str, Any] = {}
+        if selected_trial is not None:
+            selected_params = self._sanitize_best_params_payload(
+                getattr(selected_trial, "params", None),
+                context=f"{context}_best_trial",
+            )
+        if selected_params:
+            return selected_trial, selected_params
+
+        complete_trials = self._get_trials(
+            study,
+            states=(optuna.trial.TrialState.COMPLETE,),
+        )
+        nonempty_trials: list[tuple[optuna.trial.FrozenTrial, Dict[str, Any]]] = []
+        for trial in complete_trials:
+            params = self._sanitize_best_params_payload(
+                getattr(trial, "params", None),
+                context=f"{context}_complete_trial_{getattr(trial, 'number', 'unknown')}",
+            )
+            if params:
+                nonempty_trials.append((trial, params))
+
+        if not nonempty_trials:
+            return selected_trial, {}
+
+        nonempty_trials.sort(key=lambda item: self._trial_sort_key(item[0]))
+        fallback_trial, fallback_params = nonempty_trials[0]
+        if study_best_trial is not None:
+            _log(
+                f"[Optuna][{self.label}] Best trial "
+                f"(trial_id={getattr(study_best_trial, 'number', 'unknown')}, "
+                f"value={getattr(study_best_trial, 'value', None)}) has empty params; "
+                f"fallback to non-empty trial "
+                f"(trial_id={getattr(fallback_trial, 'number', 'unknown')}, "
+                f"value={getattr(fallback_trial, 'value', None)}).",
+                flush=True,
+            )
+        return fallback_trial, fallback_params
+
     def _wait_with_deadline_fallback(
         self,
         wait_fn: Callable[[], Any],
@@ -175,8 +239,12 @@ class TrainerOptunaMixin:
         return str(path)
 
     def _persist_best_params_csv(self, params: Dict[str, Any]) -> None:
-        pd.DataFrame(params, index=[0]).to_csv(
-            self._best_params_csv_path(), index=False
+        path = self._best_params_csv_path()
+        pd.DataFrame(params, index=[0]).to_csv(path, index=False)
+        _log(
+            f"[Optuna][{self.label}] best_params saved to {path} "
+            f"(keys={sorted(list(params.keys()))})",
+            flush=True,
         )
 
     def _create_study(self) -> optuna.study.Study:
@@ -273,14 +341,8 @@ class TrainerOptunaMixin:
 
         def checkpoint_callback(check_study: optuna.study.Study, _trial) -> None:
             try:
-                best = getattr(check_study, "best_trial", None)
-                if best is None:
-                    return
-                best_params = getattr(best, "params", None)
-                if not best_params:
-                    return
-                best_params = self._sanitize_best_params_payload(
-                    best_params,
+                _best_trial, best_params = self._resolve_best_trial_with_params(
+                    check_study,
                     context="optuna_checkpoint",
                 )
                 if not best_params:
@@ -349,14 +411,20 @@ class TrainerOptunaMixin:
                 "xgb_n_estimators_max), then rerun."
             )
 
-        self.best_trial = study.best_trial
-        self.best_params = self._sanitize_best_params_payload(
-            getattr(self.best_trial, "params", None),
-            context="optuna_best_trial",
+        selected_trial, selected_params = self._resolve_best_trial_with_params(
+            study,
+            context="optuna_extract",
         )
+
+        self.best_trial = selected_trial
+        self.best_params = selected_params
         if not self.best_params:
             raise RuntimeError(
-                f"[Optuna][{self.label}] Best trial has empty params; cannot continue."
+                f"[Optuna][{self.label}] Best trial has empty params and no "
+                "completed trial provides usable params; cannot continue. "
+                "This can happen when reusing an Optuna study created with an "
+                "empty search space. Consider clearing/rotating optuna_storage "
+                "or updating optuna_study_prefix."
             )
         self._persist_best_params_csv(self.best_params)
 

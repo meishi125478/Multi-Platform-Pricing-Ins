@@ -73,6 +73,8 @@ class BayesOptConfig:
         build_oht: Whether to build one-hot encoded features (default True)
         oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
         keep_unscaled_oht: Keep unscaled one-hot copy in memory (default False)
+        target_clip_enabled: Whether to clip extreme target values before training (default True)
+        target_clip_quantile: Upper quantile used for target clipping (default 0.999)
         dataloader_multiprocessing_context: Optional DataLoader multiprocessing start method
             ('fork', 'spawn', or 'forkserver')
 
@@ -200,6 +202,8 @@ class BayesOptConfig:
     build_oht: bool = True
     oht_sparse_csr: bool = True
     keep_unscaled_oht: bool = False
+    target_clip_enabled: bool = True
+    target_clip_quantile: Optional[float] = 0.999
     cache_predictions: bool = False
     prediction_cache_dir: Optional[str] = None
     prediction_cache_format: str = "parquet"
@@ -355,6 +359,20 @@ class BayesOptConfig:
                     )
         if not isinstance(self.keep_unscaled_oht, bool):
             errors.append("keep_unscaled_oht must be a boolean.")
+        if not isinstance(self.target_clip_enabled, bool):
+            errors.append("target_clip_enabled must be a boolean.")
+        if self.target_clip_quantile is not None:
+            try:
+                clip_q = float(self.target_clip_quantile)
+            except (TypeError, ValueError):
+                errors.append("target_clip_quantile must be numeric or null.")
+            else:
+                if not (0.0 < clip_q <= 1.0):
+                    errors.append(
+                        f"target_clip_quantile must be in (0, 1], got {self.target_clip_quantile!r}."
+                    )
+                else:
+                    self.target_clip_quantile = clip_q
         if not isinstance(self.oht_sparse_csr, bool):
             errors.append("oht_sparse_csr must be a boolean.")
         if not isinstance(self.save_preprocess_bundle, bool):

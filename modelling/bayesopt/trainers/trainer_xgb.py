@@ -796,6 +796,7 @@ class XGBTrainer(TrainerBase):
         self.model = self._build_estimator()
         self.model.set_params(**tuned_best_params)
         use_refit = bool(getattr(self.ctx.config, "final_refit", True))
+        _log(f"[XGBoost] final_refit={use_refit}.", flush=True)
         predict_fn = None
         if self.ctx.task_type == 'classification':
             def _predict_proba(X, **_kwargs):
@@ -823,6 +824,7 @@ class XGBTrainer(TrainerBase):
             )
             self.model.fit(X_train, y_train, **fit_kwargs)
             best_iter = getattr(self.model, "best_iteration", None)
+            _log(f"[XGBoost] split-train finished; best_iteration={best_iter}.", flush=True)
             if use_refit and best_iter is not None:
                 refit_model = self._build_estimator()
                 refit_params = dict(tuned_best_params)
@@ -835,9 +837,15 @@ class XGBTrainer(TrainerBase):
                 refit_kwargs.pop("early_stopping_rounds", None)
                 refit_kwargs.pop("eval_metric", None)
                 refit_kwargs.setdefault("verbose", False)
+                _log(
+                    f"[XGBoost] final_refit start on full train data; "
+                    f"n_estimators={refit_params['n_estimators']}.",
+                    flush=True,
+                )
                 try:
                     refit_model.fit(X_all, y_all, **refit_kwargs)
                     self.model = refit_model
+                    _log("[XGBoost] final_refit completed.", flush=True)
                 except Exception as exc:
                     if _is_host_memory_error(exc):
                         _log(
@@ -848,7 +856,18 @@ class XGBTrainer(TrainerBase):
                         )
                     else:
                         raise
+            elif use_refit and best_iter is None:
+                _log(
+                    "[XGBoost] final_refit skipped: best_iteration is unavailable.",
+                    flush=True,
+                )
+            else:
+                _log("[XGBoost] final_refit disabled by config.", flush=True)
         else:
+            _log(
+                "[XGBoost] no train/val split resolved; training directly on full train data.",
+                flush=True,
+            )
             fit_kwargs = dict(self.ctx.fit_params or {})
             fit_kwargs.setdefault("sample_weight", w_all)
             fit_kwargs.pop("eval_metric", None)

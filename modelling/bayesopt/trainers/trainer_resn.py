@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
+import torch
 from sklearn.metrics import log_loss
 
 from ins_pricing.modelling.bayesopt.checkpoints import rebuild_resn_model_from_payload
@@ -132,6 +133,84 @@ class ResNetTrainer(TrainerBase):
             context=f"{context} (ResNet params)",
         )
 
+    def _resolve_resn_cv_standardize_device(self) -> str:
+        raw = str(
+            os.environ.get("BAYESOPT_RESN_CV_STANDARDIZE_DEVICE", "cpu")
+        ).strip().lower()
+        if raw in {"gpu", "cuda"}:
+            return "cuda"
+        if raw in {"auto"}:
+            if bool(getattr(self.ctx, "use_gpu", False)) and torch.cuda.is_available():
+                return "cuda"
+            return "cpu"
+        return "cpu"
+
+    def _standardize_fold_fast(
+        self,
+        X_train,
+        X_val,
+        columns: Optional[List[str]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Standardize selected columns with optional GPU acceleration.
+
+        Returns numpy arrays to reduce pandas copy pressure in CV folds.
+        """
+        if hasattr(X_train, "columns"):
+            train_cols = list(X_train.columns)
+            cols = [c for c in (columns or []) if c in train_cols]
+            col_idx = [train_cols.index(c) for c in cols]
+            X_train_np = X_train.to_numpy(dtype=np.float32, copy=True)
+            X_val_np = X_val.to_numpy(dtype=np.float32, copy=True)
+        else:
+            X_train_np = np.asarray(X_train, dtype=np.float32).copy()
+            X_val_np = np.asarray(X_val, dtype=np.float32).copy()
+            col_idx = list(range(X_train_np.shape[1])) if X_train_np.ndim == 2 else []
+
+        if not col_idx:
+            return X_train_np, X_val_np
+
+        mode = self._resolve_resn_cv_standardize_device()
+        if not getattr(self, "_resn_cv_standardize_mode_logged", False):
+            _log(
+                f"[ResNet] CV standardize device={mode} "
+                "(env BAYESOPT_RESN_CV_STANDARDIZE_DEVICE).",
+                flush=True,
+            )
+            self._resn_cv_standardize_mode_logged = True
+
+        if mode == "cuda":
+            if not (bool(getattr(self.ctx, "use_gpu", False)) and torch.cuda.is_available()):
+                _log(
+                    "[ResNet] Requested CUDA standardization but GPU is unavailable; fallback to CPU.",
+                    flush=True,
+                )
+            else:
+                try:
+                    device = torch.device("cuda", torch.cuda.current_device())
+                    tr = torch.as_tensor(X_train_np[:, col_idx], device=device)
+                    va = torch.as_tensor(X_val_np[:, col_idx], device=device)
+                    mean = tr.mean(dim=0)
+                    std = tr.std(dim=0, unbiased=False)
+                    std = torch.where(std < 1e-6, torch.ones_like(std), std)
+                    X_train_np[:, col_idx] = ((tr - mean) / std).cpu().numpy()
+                    X_val_np[:, col_idx] = ((va - mean) / std).cpu().numpy()
+                    return X_train_np, X_val_np
+                except Exception as exc:
+                    _log(
+                        f"[ResNet] CUDA standardization failed; fallback to CPU ({exc}).",
+                        flush=True,
+                    )
+
+        # CPU fast path (numpy)
+        tr_cols = X_train_np[:, col_idx]
+        va_cols = X_val_np[:, col_idx]
+        mean = tr_cols.mean(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        std = tr_cols.std(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        std = np.where(std < 1e-6, 1.0, std).astype(np.float32, copy=False)
+        X_train_np[:, col_idx] = (tr_cols - mean) / std
+        X_val_np[:, col_idx] = (va_cols - mean) / std
+        return X_train_np, X_val_np
+
     # ========= Cross-validation (for BayesOpt) =========
     def cross_val(self, trial: optuna.trial.Trial) -> float:
         # ResNet CV focuses on memory control:
@@ -163,8 +242,11 @@ class ResNetTrainer(TrainerBase):
             return self._build_model(params_local)
 
         def preprocess_fn(X_train, X_val):
-            X_train_s, X_val_s, _ = self._standardize_fold(
-                X_train, X_val, self.ctx.num_features)
+            X_train_s, X_val_s = self._standardize_fold_fast(
+                X_train,
+                X_val,
+                columns=self.ctx.num_features,
+            )
             return X_train_s, X_val_s
 
         def fit_predict(model, X_train, y_train, w_train, X_val, y_val, w_val, trial_obj):
