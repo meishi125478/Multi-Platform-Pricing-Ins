@@ -1,4 +1,4 @@
-﻿"""Configuration and path-resolution methods for PricingApp."""
+"""Configuration and path-resolution methods for PricingApp."""
 
 from __future__ import annotations
 
@@ -265,8 +265,24 @@ class AppControllerConfigMixin:
         except Exception as exc:
             return f"Failed to load oneway factors: {exc}", [], []
 
+    @staticmethod
+    def _int_or_none(value, default=0) -> Optional[int]:
+        """Parse a numeric UI value: returns None if <= default, else int."""
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return None
+        return v if v > default else None
+
+    @staticmethod
+    def _str_or_none(value) -> Optional[str]:
+        """Return stripped string or None if empty."""
+        s = str(value or "").strip()
+        return s if s else None
+
     def build_config_from_ui(
         self,
+        # ── Core Data & Task ──
         data_dir: str,
         model_list: str,
         model_categories: str,
@@ -275,6 +291,8 @@ class AppControllerConfigMixin:
         feature_list: str,
         categorical_features: str,
         task_type: str,
+        distribution: str,
+        binary_resp_nme: str,
         prop_test: float,
         holdout_ratio: float,
         val_ratio: float,
@@ -285,95 +303,181 @@ class AppControllerConfigMixin:
         use_gpu: bool,
         model_keys: str,
         max_evals: int,
+        plot_curves: bool,
+        # ── Split & Pre-split ──
+        split_group_col: str,
+        split_time_col: str,
+        split_time_ascending: bool,
+        train_data_path: str,
+        test_data_path: str,
+        split_cache_path: str,
+        split_cache_force_rebuild: bool,
+        # ── Cross-Validation ──
+        cv_strategy: str,
+        cv_splits: int,
+        cv_group_col: str,
+        cv_time_col: str,
+        cv_time_ascending: bool,
+        # ── XGBoost ──
         xgb_max_depth_max: int,
         xgb_n_estimators_max: int,
         xgb_gpu_id: int,
-        xgb_cleanup_per_fold: bool,
-        xgb_cleanup_synchronize: bool,
         xgb_use_dmatrix: bool,
         xgb_chunk_size: int,
+        xgb_cleanup_per_fold: bool,
+        xgb_cleanup_synchronize: bool,
         xgb_search_space_json: str,
-        resn_search_space_json: str,
-        ft_search_space_json: str,
-        ft_unsupervised_search_space_json: str,
-        ft_cleanup_per_fold: bool,
-        ft_cleanup_synchronize: bool,
-        resn_cleanup_per_fold: bool,
-        resn_cleanup_synchronize: bool,
+        # ── ResNet ──
         resn_use_lazy_dataset: bool,
         resn_predict_batch_size: int,
+        resn_weight_decay: float,
+        resn_cleanup_per_fold: bool,
+        resn_cleanup_synchronize: bool,
+        resn_search_space_json: str,
+        # ── FT-Transformer ──
+        ft_role: str,
+        ft_feature_prefix: str,
+        ft_num_numeric_tokens: int,
+        ft_use_lazy_dataset: bool,
+        ft_predict_batch_size: int,
+        ft_oof_folds: int,
+        ft_oof_strategy: str,
+        ft_oof_shuffle: bool,
+        ft_cleanup_per_fold: bool,
+        ft_cleanup_synchronize: bool,
+        ft_search_space_json: str,
+        ft_unsupervised_search_space_json: str,
+        # ── GNN ──
+        gnn_use_approx_knn: bool,
+        gnn_approx_knn_threshold: int,
+        gnn_max_gpu_knn_nodes: int,
+        gnn_knn_gpu_mem_ratio: float,
+        gnn_knn_gpu_mem_overhead: float,
+        gnn_max_fit_rows: int,
+        gnn_max_predict_rows: int,
+        gnn_predict_chunk_rows: int,
+        gnn_graph_cache: str,
         gnn_cleanup_per_fold: bool,
         gnn_cleanup_synchronize: bool,
+        # ── Distributed ──
+        nproc_per_node: int,
+        ddp_min_rows: int,
+        use_resn_ddp: bool,
+        use_ft_ddp: bool,
+        use_resn_data_parallel: bool,
+        use_ft_data_parallel: bool,
+        use_gnn_data_parallel: bool,
+        # ── Preprocessing ──
+        build_oht: bool,
+        oht_sparse_csr: bool,
+        keep_unscaled_oht: bool,
+        infer_categorical_max_unique: int,
+        infer_categorical_max_ratio: float,
+        # ── Geographic ──
+        geo_feature_nmes: str,
+        region_province_col: str,
+        region_city_col: str,
+        region_effect_alpha: float,
+        geo_token_hidden_dim: int,
+        geo_token_layers: int,
+        geo_token_dropout: float,
+        geo_token_k_neighbors: int,
+        geo_token_learning_rate: float,
+        geo_token_epochs: int,
+        # ── Ensemble & Refit ──
+        final_ensemble: bool,
+        final_ensemble_k: int,
+        final_refit: bool,
+        reuse_best_params: bool,
+        # ── Output & Caching ──
+        optuna_study_prefix: str,
         optuna_cleanup_synchronize: bool,
+        cache_predictions: bool,
+        prediction_cache_format: str,
+        dataloader_workers: int,
+        bo_sample_limit: int,
+        # ── Plot Settings ──
+        plot_enable: bool,
+        plot_n_bins: int,
+        plot_oneway: bool,
+        plot_oneway_pred: bool,
+        plot_pre_oneway: bool,
+        plot_double_lift: bool,
+        # ── Calibration ──
+        calibration_enable: bool,
+        calibration_method: str,
+        calibration_max_rows: int,
+        calibration_seed: int,
+        # ── Threshold ──
+        threshold_enable: bool,
+        threshold_metric: str,
+        threshold_grid: int,
+        threshold_max_rows: int,
+        threshold_seed: int,
+        # ── Bootstrap ──
+        bootstrap_enable: bool,
+        bootstrap_n_samples: int,
+        bootstrap_ci: float,
+        bootstrap_seed: int,
+        # ── Advanced ──
         config_overrides_json: str,
     ) -> tuple[str, str]:
         """Build configuration from UI parameters."""
         try:
             # Parse comma-separated lists
-            model_list = [x.strip()
-                          for x in model_list.split(',') if x.strip()]
-            model_categories = [x.strip()
-                                for x in model_categories.split(',') if x.strip()]
-            feature_list = [x.strip()
-                            for x in feature_list.split(',') if x.strip()]
-            categorical_features = [
+            model_list_parsed = [x.strip() for x in model_list.split(',') if x.strip()]
+            model_categories_parsed = [x.strip() for x in model_categories.split(',') if x.strip()]
+            feature_list_parsed = [x.strip() for x in feature_list.split(',') if x.strip()]
+            categorical_features_parsed = [
                 x.strip() for x in categorical_features.split(',') if x.strip()]
-            model_keys = [x.strip()
-                          for x in model_keys.split(',') if x.strip()]
-            parsed_xgb_chunk_size: Optional[int] = None
-            try:
-                chunk_size_val = int(xgb_chunk_size)
-            except (TypeError, ValueError):
-                chunk_size_val = 0
-            if chunk_size_val > 0:
-                parsed_xgb_chunk_size = chunk_size_val
-            parsed_resn_predict_batch_size: Optional[int] = None
-            try:
-                resn_pred_bs_val = int(resn_predict_batch_size)
-            except (TypeError, ValueError):
-                resn_pred_bs_val = 0
-            if resn_pred_bs_val > 0:
-                parsed_resn_predict_batch_size = resn_pred_bs_val
-            xgb_search_space = self._parse_json_dict(
-                xgb_search_space_json,
-                "xgb_search_space_json",
-            )
-            resn_search_space = self._parse_json_dict(
-                resn_search_space_json,
-                "resn_search_space_json",
-            )
-            ft_search_space = self._parse_json_dict(
-                ft_search_space_json,
-                "ft_search_space_json",
-            )
-            ft_unsupervised_search_space = self._parse_json_dict(
-                ft_unsupervised_search_space_json,
-                "ft_unsupervised_search_space_json",
-            )
-            config_overrides = self._parse_json_dict(
-                config_overrides_json,
-                "config_overrides_json",
-            )
+            model_keys_parsed = [x.strip() for x in model_keys.split(',') if x.strip()]
 
+            # Parse optional int fields (0 → None)
+            parsed_xgb_chunk_size = self._int_or_none(xgb_chunk_size)
+            parsed_resn_predict_batch_size = self._int_or_none(resn_predict_batch_size)
+            parsed_ft_predict_batch_size = self._int_or_none(ft_predict_batch_size)
+
+            # Parse search spaces
+            xgb_search_space = self._parse_json_dict(xgb_search_space_json, "xgb_search_space_json")
+            resn_search_space = self._parse_json_dict(resn_search_space_json, "resn_search_space_json")
+            ft_search_space = self._parse_json_dict(ft_search_space_json, "ft_search_space_json")
+            ft_unsupervised_search_space = self._parse_json_dict(
+                ft_unsupervised_search_space_json, "ft_unsupervised_search_space_json")
+            config_overrides = self._parse_json_dict(config_overrides_json, "config_overrides_json")
+
+            # Build base config via ConfigBuilder (uses params already in its signature)
             config = self.config_builder.build_config(
                 data_dir=data_dir,
-                model_list=model_list,
-                model_categories=model_categories,
+                model_list=model_list_parsed,
+                model_categories=model_categories_parsed,
                 target=target,
                 weight=weight,
-                feature_list=feature_list,
-                categorical_features=categorical_features,
+                feature_list=feature_list_parsed,
+                categorical_features=categorical_features_parsed,
                 task_type=task_type,
+                distribution=self._str_or_none(distribution),
+                binary_resp_nme=self._str_or_none(binary_resp_nme),
                 prop_test=prop_test,
                 holdout_ratio=holdout_ratio,
                 val_ratio=val_ratio,
                 split_strategy=split_strategy,
+                train_data_path=self._str_or_none(train_data_path),
+                test_data_path=self._str_or_none(test_data_path),
+                split_cache_path=self._str_or_none(split_cache_path),
+                split_cache_force_rebuild=split_cache_force_rebuild,
                 rand_seed=rand_seed,
                 epochs=epochs,
                 output_dir=output_dir,
                 use_gpu=use_gpu,
-                model_keys=model_keys,
+                model_keys=model_keys_parsed,
                 max_evals=max_evals,
+                build_oht=build_oht,
+                oht_sparse_csr=oht_sparse_csr,
+                keep_unscaled_oht=keep_unscaled_oht,
+                plot_curves=plot_curves,
+                infer_categorical_max_unique=int(infer_categorical_max_unique),
+                infer_categorical_max_ratio=float(infer_categorical_max_ratio),
+                optuna_study_prefix=str(optuna_study_prefix or "pricing"),
                 xgb_max_depth_max=xgb_max_depth_max,
                 xgb_n_estimators_max=xgb_n_estimators_max,
                 xgb_gpu_id=xgb_gpu_id,
@@ -382,19 +486,160 @@ class AppControllerConfigMixin:
                 xgb_use_dmatrix=xgb_use_dmatrix,
                 xgb_chunk_size=parsed_xgb_chunk_size,
                 xgb_search_space=xgb_search_space,
-                resn_search_space=resn_search_space,
-                ft_search_space=ft_search_space,
-                ft_unsupervised_search_space=ft_unsupervised_search_space,
+                cache_predictions=cache_predictions,
+                prediction_cache_format=prediction_cache_format,
+                dataloader_workers=int(dataloader_workers),
+                use_resn_data_parallel=use_resn_data_parallel,
+                use_ft_data_parallel=use_ft_data_parallel,
+                use_gnn_data_parallel=use_gnn_data_parallel,
+                use_resn_ddp=use_resn_ddp,
+                use_ft_ddp=use_ft_ddp,
+                ddp_min_rows=int(ddp_min_rows),
+                ft_role=ft_role,
+                ft_feature_prefix=ft_feature_prefix,
                 ft_cleanup_per_fold=ft_cleanup_per_fold,
                 ft_cleanup_synchronize=ft_cleanup_synchronize,
+                ft_use_lazy_dataset=ft_use_lazy_dataset,
+                ft_predict_batch_size=parsed_ft_predict_batch_size,
+                ft_search_space=ft_search_space,
+                ft_unsupervised_search_space=ft_unsupervised_search_space,
                 resn_cleanup_per_fold=resn_cleanup_per_fold,
                 resn_cleanup_synchronize=resn_cleanup_synchronize,
                 resn_use_lazy_dataset=resn_use_lazy_dataset,
                 resn_predict_batch_size=parsed_resn_predict_batch_size,
+                resn_search_space=resn_search_space,
                 gnn_cleanup_per_fold=gnn_cleanup_per_fold,
                 gnn_cleanup_synchronize=gnn_cleanup_synchronize,
+                gnn_max_fit_rows=self._int_or_none(gnn_max_fit_rows),
+                gnn_max_predict_rows=self._int_or_none(gnn_max_predict_rows),
+                gnn_predict_chunk_rows=self._int_or_none(gnn_predict_chunk_rows),
                 optuna_cleanup_synchronize=optuna_cleanup_synchronize,
+                nproc_per_node=int(nproc_per_node),
             )
+
+            # ── Apply extra parameters not in ConfigBuilder.build_config() ──
+            # These are set directly on the config dict (they exist in default_config).
+            extra: Dict[str, Any] = {}
+
+            # Split extended
+            if self._str_or_none(split_group_col):
+                extra["split_group_col"] = split_group_col.strip()
+            if self._str_or_none(split_time_col):
+                extra["split_time_col"] = split_time_col.strip()
+            extra["split_time_ascending"] = bool(split_time_ascending)
+
+            # Cross-validation
+            cv_strategy_val = self._str_or_none(cv_strategy)
+            if cv_strategy_val:
+                extra["cv_strategy"] = cv_strategy_val
+            cv_splits_val = self._int_or_none(cv_splits)
+            if cv_splits_val:
+                extra["cv_splits"] = cv_splits_val
+            if self._str_or_none(cv_group_col):
+                extra["cv_group_col"] = cv_group_col.strip()
+            if self._str_or_none(cv_time_col):
+                extra["cv_time_col"] = cv_time_col.strip()
+            extra["cv_time_ascending"] = bool(cv_time_ascending)
+
+            # FT extended
+            ft_num_val = self._int_or_none(ft_num_numeric_tokens)
+            if ft_num_val:
+                extra["ft_num_numeric_tokens"] = ft_num_val
+            ft_oof_val = self._int_or_none(ft_oof_folds)
+            if ft_oof_val:
+                extra["ft_oof_folds"] = ft_oof_val
+            ft_oof_strat = self._str_or_none(ft_oof_strategy)
+            if ft_oof_strat:
+                extra["ft_oof_strategy"] = ft_oof_strat
+            extra["ft_oof_shuffle"] = bool(ft_oof_shuffle)
+
+            # ResNet extended
+            try:
+                extra["resn_weight_decay"] = float(resn_weight_decay)
+            except (TypeError, ValueError):
+                pass
+
+            # GNN extended
+            extra["gnn_use_approx_knn"] = bool(gnn_use_approx_knn)
+            extra["gnn_approx_knn_threshold"] = int(gnn_approx_knn_threshold)
+            extra["gnn_max_gpu_knn_nodes"] = int(gnn_max_gpu_knn_nodes)
+            extra["gnn_knn_gpu_mem_ratio"] = float(gnn_knn_gpu_mem_ratio)
+            extra["gnn_knn_gpu_mem_overhead"] = float(gnn_knn_gpu_mem_overhead)
+            gnn_cache = self._str_or_none(gnn_graph_cache)
+            if gnn_cache:
+                extra["gnn_graph_cache"] = gnn_cache
+
+            # Geographic / Regional
+            geo_nmes = [x.strip() for x in str(geo_feature_nmes or "").split(',') if x.strip()]
+            if geo_nmes:
+                extra["geo_feature_nmes"] = geo_nmes
+            if self._str_or_none(region_province_col):
+                extra["region_province_col"] = region_province_col.strip()
+            if self._str_or_none(region_city_col):
+                extra["region_city_col"] = region_city_col.strip()
+            extra["region_effect_alpha"] = float(region_effect_alpha)
+            extra["geo_token_hidden_dim"] = int(geo_token_hidden_dim)
+            extra["geo_token_layers"] = int(geo_token_layers)
+            extra["geo_token_dropout"] = float(geo_token_dropout)
+            extra["geo_token_k_neighbors"] = int(geo_token_k_neighbors)
+            extra["geo_token_learning_rate"] = float(geo_token_learning_rate)
+            extra["geo_token_epochs"] = int(geo_token_epochs)
+
+            # Ensemble & Refit
+            extra["final_ensemble"] = bool(final_ensemble)
+            extra["final_ensemble_k"] = int(final_ensemble_k)
+            extra["final_refit"] = bool(final_refit)
+            extra["reuse_best_params"] = bool(reuse_best_params)
+
+            # BO sample limit
+            bo_limit = self._int_or_none(bo_sample_limit)
+            if bo_limit:
+                extra["bo_sample_limit"] = bo_limit
+
+            # Plot settings (nested dict)
+            extra["plot"] = {
+                "enable": bool(plot_enable),
+                "n_bins": int(plot_n_bins),
+                "oneway": bool(plot_oneway),
+                "oneway_pred": bool(plot_oneway_pred),
+                "pre_oneway": bool(plot_pre_oneway),
+                "double_lift": bool(plot_double_lift),
+            }
+
+            # Calibration (nested dict)
+            cal_max = self._int_or_none(calibration_max_rows)
+            extra["calibration"] = {
+                "enable": bool(calibration_enable),
+                "method": str(calibration_method or "sigmoid"),
+                "max_rows": cal_max,
+                "seed": int(calibration_seed),
+            }
+
+            # Threshold (nested dict)
+            thr_max = self._int_or_none(threshold_max_rows)
+            extra["threshold"] = {
+                "enable": bool(threshold_enable),
+                "value": None,
+                "metric": str(threshold_metric or "f1"),
+                "min_positive_rate": None,
+                "grid": int(threshold_grid),
+                "max_rows": thr_max,
+                "seed": int(threshold_seed),
+            }
+
+            # Bootstrap (nested dict)
+            extra["bootstrap"] = {
+                "enable": bool(bootstrap_enable),
+                "metrics": [],
+                "n_samples": int(bootstrap_n_samples),
+                "ci": float(bootstrap_ci),
+                "seed": int(bootstrap_seed),
+            }
+
+            # Deep-merge extra params into config
+            config = self._deep_merge_dict(config, extra)
+
+            # Deep-merge user-provided JSON overrides last (highest priority)
             if config_overrides:
                 config = self._deep_merge_dict(config, config_overrides)
 

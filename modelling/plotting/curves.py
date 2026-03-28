@@ -198,8 +198,31 @@ def double_lift_table(
     pred2_weighted: bool = False,
     actual_weighted: bool = True,
 ) -> pd.DataFrame:
-    pred1_arr, actual_arr, weight_arr = _align_arrays(pred1, actual, weight)
-    pred2_arr, _, _ = _align_arrays(pred2, actual, weight_arr)
+    pred1_arr = _to_1d(pred1, "pred1")
+    pred2_arr = _to_1d(pred2, "pred2")
+    actual_arr = _to_1d(actual, "actual")
+    if len(pred1_arr) != len(pred2_arr):
+        raise ValueError("pred1 and pred2 must have the same length.")
+    if len(pred1_arr) != len(actual_arr):
+        raise ValueError("pred1 and actual must have the same length.")
+    if weight is None:
+        weight_arr = np.ones_like(pred1_arr, dtype=float)
+    else:
+        weight_arr = _to_1d(weight, "weight")
+        if len(weight_arr) != len(pred1_arr):
+            raise ValueError("weight must have the same length as pred1.")
+
+    # Keep all arrays aligned under one shared finite-mask.
+    mask = (
+        np.isfinite(pred1_arr)
+        & np.isfinite(pred2_arr)
+        & np.isfinite(actual_arr)
+        & np.isfinite(weight_arr)
+    )
+    pred1_arr = pred1_arr[mask]
+    pred2_arr = pred2_arr[mask]
+    actual_arr = actual_arr[mask]
+    weight_arr = weight_arr[mask]
 
     weight_safe = np.maximum(weight_arr, EPS)
     pred1_raw = pred1_arr / weight_safe if pred1_weighted else pred1_arr

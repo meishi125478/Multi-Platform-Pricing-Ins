@@ -160,6 +160,26 @@ class TestDataCleaning:
         with pytest.raises(DataValidationError):
             prepare_raw_features(raw, artifacts)
 
+    def test_prepare_raw_features_preserves_unseen_categorical_values(self):
+        """Unseen categories at inference time should not be coerced to NaN."""
+        from ins_pricing.production.preprocess import prepare_raw_features
+
+        raw = pd.DataFrame(
+            {
+                "gender": ["M", "X", None],
+            }
+        )
+        artifacts = {
+            "factor_nmes": ["gender"],
+            "num_features": [],
+            "cate_list": ["gender"],
+            "cat_categories": {"gender": ["M", "F"]},
+        }
+
+        prepared = prepare_raw_features(raw, artifacts)
+        values = prepared["gender"].astype("object").tolist()
+        assert values == ["M", "X", "<NA>"]
+
 
 class TestFeatureSelection:
     """Test feature selection operations."""

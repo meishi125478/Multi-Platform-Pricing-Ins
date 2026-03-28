@@ -73,9 +73,15 @@ def _coerce_categorical(
     categories: Optional[Sequence[str]] = None,
     fill_value: str = "<NA>",
 ) -> pd.Series:
-    out = series.astype("object").fillna(fill_value)
+    out = series.astype("object").where(series.notna(), fill_value)
     if categories:
-        out = pd.Categorical(out, categories=list(categories))
+        base_categories = list(categories)
+        base_set = set(base_categories)
+        observed_values = pd.unique(out)
+        extra_categories = [
+            value for value in observed_values if value not in base_set
+        ]
+        out = pd.Categorical(out, categories=base_categories + extra_categories)
     return out
 
 

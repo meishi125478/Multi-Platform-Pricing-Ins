@@ -79,6 +79,7 @@ class FTTrainer(TrainerBase):
             "num_cols": self.ctx.num_features,
             "cat_cols": self.ctx.cate_list,
             "task_type": self.ctx.task_type,
+            "epochs": int(getattr(self.ctx, "epochs", 100)),
             "use_data_parallel": self._use_ft_data_parallel(),
             "use_ddp": self._use_ft_ddp(),
             "use_gpu": bool(getattr(self.ctx, "use_gpu", False)),
@@ -247,13 +248,17 @@ class FTTrainer(TrainerBase):
                 self._distributed_prepare_trial(params)
 
         X_all = self.ctx.train_data[self.ctx.factor_nmes]
-        max_rows_for_ft_bo = min(1_000_000, int(len(X_all) / 2))
-        if max_rows_for_ft_bo > 0 and len(X_all) > max_rows_for_ft_bo:
+        default_limit = min(1_000_000, int(len(X_all) / 2))
+        effective_limit = self._resolve_effective_sample_limit(
+            base_limit=default_limit if default_limit > 0 else None,
+            n_rows=len(X_all),
+        )
+        if effective_limit is not None and len(X_all) > effective_limit:
             sampled_idx = self._resolve_time_sample_indices(
-                X_all, max_rows_for_ft_bo)
+                X_all, effective_limit)
             if sampled_idx is None:
                 X_all = X_all.sample(
-                    n=max_rows_for_ft_bo,
+                    n=effective_limit,
                     random_state=self.ctx.rand_seed,
                 )
             else:

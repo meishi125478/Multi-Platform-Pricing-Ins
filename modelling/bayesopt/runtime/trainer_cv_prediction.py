@@ -19,6 +19,43 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerCVPredictionMixin:
+    @staticmethod
+    def _cv_fold_weight(y_val: Any, w_val: Optional[Any]) -> float:
+        """Compute aggregation weight for one CV validation fold."""
+        if w_val is not None:
+            w_arr = np.asarray(w_val, dtype=float).reshape(-1)
+            if w_arr.size > 0:
+                valid = np.isfinite(w_arr) & (w_arr > 0)
+                w_sum = float(np.sum(w_arr[valid]))
+                if w_sum > 0:
+                    return w_sum
+
+        y_arr = np.asarray(y_val).reshape(-1)
+        if y_arr.size == 0:
+            return 0.0
+        if np.issubdtype(y_arr.dtype, np.number):
+            return float(np.sum(np.isfinite(y_arr)))
+        return float(np.sum(pd.notna(y_arr)))
+
+    @staticmethod
+    def _aggregate_cv_losses(losses: List[float], fold_weights: List[float]) -> float:
+        """Aggregate fold losses with fold-level weights; fallback to simple mean."""
+        if not losses:
+            raise ValueError("No fold losses available for CV aggregation.")
+        loss_arr = np.asarray(losses, dtype=float).reshape(-1)
+        weight_arr = np.asarray(fold_weights, dtype=float).reshape(-1)
+        if loss_arr.size != weight_arr.size:
+            raise ValueError("CV aggregation size mismatch between losses and weights.")
+
+        valid = np.isfinite(loss_arr) & np.isfinite(weight_arr) & (weight_arr > 0)
+        if np.any(valid):
+            return float(np.average(loss_arr[valid], weights=weight_arr[valid]))
+
+        finite_losses = np.isfinite(loss_arr)
+        if np.any(finite_losses):
+            return float(np.mean(loss_arr[finite_losses]))
+        return float(np.mean(loss_arr))
+
     def _classification_prediction_outputs(self) -> str:
         cfg = getattr(self.ctx, "config", None)
         raw = getattr(cfg, "classification_prediction_outputs", "score")
@@ -146,6 +183,39 @@ class TrainerCVPredictionMixin:
         resolver = CVStrategyResolver(self.ctx.config, base_data, self.ctx.rand_seed)
         return resolver.create_kfold_splitter(X_all, k)
 
+    def _resolve_effective_sample_limit(
+        self,
+        *,
+        base_limit: Optional[int],
+        n_rows: int,
+    ) -> Optional[int]:
+        """Resolve effective BO sample limit with config override precedence."""
+        resolved_base: Optional[int] = None
+        if base_limit is not None:
+            try:
+                base_int = int(base_limit)
+            except (TypeError, ValueError):
+                base_int = 0
+            if base_int > 0:
+                resolved_base = base_int
+
+        cfg_limit: Optional[int] = None
+        ctx_config = getattr(self.ctx, "config", None)
+        raw_cfg_limit = getattr(ctx_config, "bo_sample_limit", None)
+        if raw_cfg_limit is not None:
+            try:
+                cfg_int = int(raw_cfg_limit)
+            except (TypeError, ValueError):
+                cfg_int = 0
+            if cfg_int > 0:
+                cfg_limit = cfg_int
+
+        # Explicit bo_sample_limit overrides model-specific default caps.
+        limit = cfg_limit if cfg_limit is not None else resolved_base
+        if limit is None:
+            return None
+        return min(limit, max(0, int(n_rows)))
+
     def cross_val_generic(
             self,
             trial: optuna.trial.Trial,
@@ -182,17 +252,15 @@ class TrainerCVPredictionMixin:
             if self._should_use_distributed_optuna():
                 self._distributed_prepare_trial(params)
         X_all, y_all, w_all = data_provider()
-        ctx_config = getattr(self.ctx, "config", None)
-        cfg_limit = getattr(ctx_config, "bo_sample_limit", None)
-        if cfg_limit is not None:
-            cfg_limit = int(cfg_limit)
-            if cfg_limit > 0:
-                sample_limit = cfg_limit if sample_limit is None else min(sample_limit, cfg_limit)
-        if sample_limit is not None and len(X_all) > sample_limit:
-            sampled_idx = self._resolve_time_sample_indices(X_all, int(sample_limit))
+        effective_limit = self._resolve_effective_sample_limit(
+            base_limit=sample_limit,
+            n_rows=len(X_all),
+        )
+        if effective_limit is not None and len(X_all) > effective_limit:
+            sampled_idx = self._resolve_time_sample_indices(X_all, int(effective_limit))
             if sampled_idx is None:
                 sampled_idx = X_all.sample(
-                    n=sample_limit,
+                    n=effective_limit,
                     random_state=self.ctx.rand_seed
                 ).index
             X_all = X_all.loc[sampled_idx]
@@ -220,6 +288,7 @@ class TrainerCVPredictionMixin:
                 split_iter = splitter
 
         losses: List[float] = []
+        fold_weights: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(split_iter):
             X_train = X_all.iloc[train_idx]
             y_train = y_all.iloc[train_idx]
@@ -245,13 +314,14 @@ class TrainerCVPredictionMixin:
                         fit_kwargs["sample_weight"] = w_train
                     model.fit(X_train, y_train, **fit_kwargs)
                     y_pred = model.predict(X_val)
-                losses.append(metric_fn(y_val, y_pred, w_val))
+                losses.append(float(metric_fn(y_val, y_pred, w_val)))
+                fold_weights.append(self._cv_fold_weight(y_val, w_val))
             finally:
                 if cleanup_fn:
                     cleanup_fn(model)
                 self._clean_gpu()
 
-        return float(np.mean(losses))
+        return self._aggregate_cv_losses(losses, fold_weights)
 
     def _predict_and_cache(self,
                            model,

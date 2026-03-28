@@ -176,6 +176,7 @@ def run_pre_oneway(
                     feature=feature,
                     weight_col=weight_col,
                     target_col=target_col,
+                    target_weighted=False,
                     n_bins=int(n_bins),
                     is_categorical=is_categorical,
                     save_path=str(save_path),
@@ -313,40 +314,95 @@ def _run_prediction_plot_workflow(
         print("[Plot] Missing target values in train split; skip plots.")
         return "Skipped plotting due to missing target values."
 
-    n_bins = cfg.get("plot", {}).get("n_bins", 10)
-    oneway_source = plot_train if len(plot_train) > 0 else plot_test
+    plot_cfg = cfg.get("plot", {}) if isinstance(cfg.get("plot"), dict) else {}
+    n_bins = plot_cfg.get("n_bins", 10)
+
+    raw_split_scope = str(
+        plot_cfg.get("split_scope", cfg.get("plot_split_scope", "both")) or "both"
+    ).strip().lower()
+    split_scope_aliases = {
+        "both": "both",
+        "all": "both",
+        "train": "train",
+        "model": "train",
+        "training": "train",
+        "valid": "valid",
+        "val": "valid",
+        "validation": "valid",
+        "test": "valid",
+    }
+    split_scope = split_scope_aliases.get(raw_split_scope)
+    if split_scope is None:
+        raise ValueError(
+            f"Unsupported plot split scope: {raw_split_scope!r}. "
+            "Use one of: train, valid, both."
+        )
+
+    all_datasets = []
+    if train_ready:
+        all_datasets.append(("train", "Train Data", plot_train))
+    if test_ready:
+        all_datasets.append(("valid", "Validation Data", plot_test))
+
+    if split_scope == "train":
+        datasets = [item for item in all_datasets if item[0] == "train"]
+    elif split_scope == "valid":
+        datasets = [item for item in all_datasets if item[0] == "valid"]
+    else:
+        datasets = list(all_datasets)
+
+    if not datasets:
+        available = [tag for tag, _title, _df in all_datasets]
+        raise ValueError(
+            f"Requested split_scope={split_scope!r}, but available splits are {available}."
+        )
+    print(f"[Plot] split_scope={split_scope}, datasets={[title for _tag, title, _df in datasets]}")
+
     for pred_key in model_keys:
         pred_label = _model_label(pred_key)
         pred_col = f"pred_{pred_key}"
         pred_tag = _safe_tag(pred_label or pred_col)
         output_root, plot_style = _get_plot_config(pred_key)
         for feature in oneway_features:
-            if feature not in oneway_source.columns:
+            feature_datasets = [
+                (split_title, split_df)
+                for _split_tag, split_title, split_df in datasets
+                if pred_col in split_df.columns and feature in split_df.columns
+            ]
+            if not feature_datasets:
                 continue
+
+            style = PlotStyle()
+            fig, axes = plt.subplots(1, len(feature_datasets), figsize=PLOT_GRID_FIGSIZE)
+            if len(feature_datasets) == 1:
+                axes = [axes]
+            for ax, (split_title, split_df) in zip(axes, feature_datasets):
+                plot_cols = list(dict.fromkeys([feature, weight_col, "w_act", pred_col]))
+                plot_input = split_df.loc[:, plot_cols]
+                plot_oneway(
+                    plot_input,
+                    feature=feature,
+                    weight_col=weight_col,
+                    target_col="w_act",
+                    target_weighted=True,
+                    pred_col=pred_col,
+                    pred_label=pred_label,
+                    n_bins=n_bins,
+                    is_categorical=feature in oneway_categorical,
+                    title=f"Analysis of {feature} ({split_title})",
+                    ax=ax,
+                    show=False,
+                    style=style,
+                )
+            plt.subplots_adjust(wspace=0.3)
+
             save_path = _resolve_plot_path(
                 output_root,
                 plot_style,
                 f"{model_name}/oneway/post",
                 f"00_{model_name}_{feature}_oneway_{pred_tag}.png",
             )
-            plot_oneway(
-                oneway_source,
-                feature=feature,
-                weight_col=weight_col,
-                target_col="w_act",
-                pred_col=pred_col,
-                pred_label=pred_label,
-                n_bins=n_bins,
-                is_categorical=feature in oneway_categorical,
-                save_path=save_path,
-                show=False,
-            )
-
-    datasets = []
-    if train_ready:
-        datasets.append(("Train Data", plot_train))
-    if test_ready:
-        datasets.append(("Test Data", plot_test))
+            finalize_figure(fig, save_path=save_path, show=False, style=style)
 
     def _plot_lift_for_model(pred_key: str, pred_label: str) -> None:
         if not datasets:
@@ -356,7 +412,7 @@ def _run_prediction_plot_workflow(
         fig, axes = plt.subplots(1, len(datasets), figsize=PLOT_GRID_FIGSIZE)
         if len(datasets) == 1:
             axes = [axes]
-        for ax, (title, data) in zip(axes, datasets):
+        for ax, (_split_tag, title, data) in zip(axes, datasets):
             pred_col = f"pred_{pred_key}"
             if pred_col not in data.columns:
                 continue
@@ -390,17 +446,14 @@ def _run_prediction_plot_workflow(
 
     if (
         all(k in model_keys for k in ["xgb", "resn"])
-        and all(
-            any(f"pred_{k}" in frame.columns for frame in (plot_train, plot_test))
-            for k in ["xgb", "resn"]
-        )
+        and all(any(f"pred_{k}" in frame.columns for _tag, _title, frame in datasets) for k in ["xgb", "resn"])
         and datasets
     ):
         style = PlotStyle()
         fig, axes = plt.subplots(1, len(datasets), figsize=PLOT_GRID_FIGSIZE)
         if len(datasets) == 1:
             axes = [axes]
-        for ax, (title, data) in zip(axes, datasets):
+        for ax, (_split_tag, title, data) in zip(axes, datasets):
             plot_double_lift_curve(
                 data["pred_xgb"].values,
                 data["pred_resn"].values,

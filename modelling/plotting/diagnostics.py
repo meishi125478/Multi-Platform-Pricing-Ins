@@ -72,6 +72,7 @@ def plot_oneway(
     feature: str,
     weight_col: str,
     target_col: str,
+    target_weighted: bool = True,
     pred_col: Optional[str] = None,
     pred_weighted: bool = False,
     pred_label: Optional[str] = None,
@@ -83,6 +84,12 @@ def plot_oneway(
     save_path: Optional[str] = None,
     style: Optional[PlotStyle] = None,
 ) -> Optional[plt.Figure]:
+    """Plot one-way actual/predicted curves with exposure bars.
+
+    `act_v` is computed as `sum(target * weight) / sum(weight)` when
+    `target_weighted=False`, and as `sum(target_col) / sum(weight)` when
+    `target_weighted=True` (for pre-weighted targets like `w_act`).
+    """
     if feature not in df.columns:
         raise KeyError(f"feature '{feature}' not found in data.")
     if weight_col not in df.columns:
@@ -97,29 +104,41 @@ def plot_oneway(
 
     if is_categorical:
         group_col = feature
-        plot_source = df
+        group_values = df[feature]
     else:
         group_col = f"{feature}_bins"
         series = pd.to_numeric(df[feature], errors="coerce")
         try:
-            bins = pd.qcut(series, n_bins, duplicates="drop")
+            group_values = pd.qcut(series, n_bins, duplicates="drop")
         except ValueError:
-            bins = pd.cut(series, bins=max(1, int(n_bins)), duplicates="drop")
-        plot_source = df.assign(**{group_col: bins})
+            group_values = pd.cut(series, bins=max(1, int(n_bins)), duplicates="drop")
+
+    weight_series = pd.to_numeric(df[weight_col], errors="coerce")
+    target_series = pd.to_numeric(df[target_col], errors="coerce")
+    if target_weighted:
+        target_w = target_series
+    else:
+        target_w = target_series * weight_series
 
     if pred_col is not None:
+        pred_series = pd.to_numeric(df[pred_col], errors="coerce")
         if pred_weighted:
-            plot_source = plot_source.assign(_pred_w=plot_source[pred_col])
+            pred_w = pred_series
         else:
-            plot_source = plot_source.assign(
-                _pred_w=plot_source[pred_col] * plot_source[weight_col]
-            )
+            pred_w = pred_series * weight_series
 
-    plot_data = plot_source.groupby([group_col], observed=True).sum(numeric_only=True)
+    grouped_weight = weight_series.groupby(group_values, observed=True).sum()
+    grouped_target_w = target_w.groupby(group_values, observed=True).sum()
+
+    plot_data = pd.DataFrame({"_weight": grouped_weight, "_target_w": grouped_target_w})
+    if pred_col is not None:
+        plot_data["_pred_w"] = pred_w.groupby(group_values, observed=True).sum()
+
+    plot_data.index.name = group_col
     plot_data.reset_index(inplace=True)
 
-    denom = np.maximum(plot_data[weight_col].to_numpy(dtype=float), EPS)
-    plot_data["act_v"] = plot_data[target_col].to_numpy(dtype=float) / denom
+    denom = np.maximum(plot_data["_weight"].to_numpy(dtype=float), EPS)
+    plot_data["act_v"] = plot_data["_target_w"].to_numpy(dtype=float) / denom
     if pred_col is not None:
         plot_data["pred_v"] = plot_data["_pred_w"].to_numpy(dtype=float) / denom
 
@@ -151,7 +170,7 @@ def plot_oneway(
     ax2 = ax.twinx()
     ax2.bar(
         plot_data.index,
-        plot_data[weight_col],
+        plot_data["_weight"],
         alpha=0.5,
         color=style.weight_color,
     )

@@ -192,6 +192,7 @@ class BayesOptPlottingMixin:
                 feature=c,
                 weight_col=self.weight_nme,
                 target_col="w_act",
+                target_weighted=True,
                 pred_col=pred_col,
                 pred_weighted=pred_weighted,
                 pred_label=pred_label,

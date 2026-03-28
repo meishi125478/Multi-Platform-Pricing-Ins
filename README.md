@@ -17,7 +17,7 @@ between modelling, production, governance, and reporting.
   - `plotting/` — model-agnostic curves, diagnostics, importance, geo visualizations.
   - `explain/` — permutation importance, SHAP, integrated gradients.
   - `evaluation.py` — calibration, threshold selection, bootstrap CI, metrics report.
-- `frontend/` — Gradio web UI (`ConfigBuilder`, `TaskRunner`, `FTWorkflowHelper`).
+- `frontend/` — NiceGUI web UI (`ConfigBuilder`, `TaskRunner`, `FTWorkflowHelper`).
 - `examples/` — demo configs and notebooks (repo only; not packaged).
 - `pricing/` — factor tables, calibration, exposure, data quality, PSI monitoring.
 - `production/` — scoring, preprocessing, inference registry, drift detection, metrics.
@@ -74,7 +74,7 @@ Heavy dependencies are only required when you import or use the related modules:
 - Geo plotting on basemap: `contextily`.
 - Plotting: `matplotlib`.
 - Inference: `torch` only when loading FT/ResNet/GNN models.
-- Frontend: `gradio`.
+- Frontend: `nicegui`.
 
 ## Inference Interface
 

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
+from itertools import combinations
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, List, Optional
 
+import joblib
+import numpy as np
 import pandas as pd
 
 from ins_pricing.modelling.plotting import PlotStyle, plot_double_lift_curve
@@ -362,4 +366,265 @@ def run_double_lift_from_file(
     finalize_figure(fig, save_path=str(save_path), show=False, style=style)
     print(f"Double lift saved to: {save_path}")
     return str(save_path)
+
+
+def run_double_lift_multi_models(
+    *,
+    data_path: str,
+    model_specs: List[Dict[str, Any]],
+    target_col: str,
+    weight_col: str = "weights",
+    n_bins: int = 10,
+    holdout_ratio: Optional[float] = 0.25,
+    split_strategy: str = "random",
+    split_group_col: Optional[str] = None,
+    split_time_col: Optional[str] = None,
+    split_time_ascending: bool = True,
+    rand_seed: int = 13,
+    split_scope: str = "both",
+    output_dir: Optional[str] = None,
+    train_data_path: Optional[str] = None,
+    test_data_path: Optional[str] = None,
+    actual_weighted: bool = False,
+) -> str:
+    """Compare all model pairs with double-lift plots on train/validation splits.
+
+    Each model spec supports either:
+    1) ``loader='artifact_file'`` with ``path`` to a pickled model artifact.
+    2) ``loader='config_predictor'`` with ``config_path`` + ``model_key``.
+    """
+
+    target_col = str(target_col or "").strip()
+    weight_col = str(weight_col or "").strip() or "weights"
+    if not target_col:
+        raise ValueError("target_col is required.")
+    if len(model_specs) < 2:
+        raise ValueError("At least two model_specs are required.")
+
+    def _resolve_path(path_like: Any) -> Path:
+        return Path(str(path_like)).expanduser().resolve()
+
+    def _load_and_validate(path_obj: Path, label: str) -> pd.DataFrame:
+        if not path_obj.exists():
+            raise FileNotFoundError(f"{label} not found: {path_obj}")
+        frame = pd.read_csv(path_obj, low_memory=False)
+        frame = _drop_duplicate_columns(frame, label).reset_index(drop=True)
+        frame.fillna(0, inplace=True)
+        if weight_col not in frame.columns:
+            print(f"[Info] weight_col={weight_col!r} not found in {label}. Using constant 1.0.")
+            frame[weight_col] = 1.0
+        required_cols = [target_col, weight_col]
+        missing_cols = [c for c in required_cols if c not in frame.columns]
+        if missing_cols:
+            raise KeyError(f"{label} missing required columns: {missing_cols}")
+        before_rows = len(frame)
+        frame = frame.dropna(subset=required_cols).reset_index(drop=True)
+        after_rows = len(frame)
+        if after_rows == 0:
+            raise ValueError(f"No valid rows remain in {label} after dropping NA in required columns.")
+        if after_rows < before_rows:
+            print(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
+        return frame
+
+    def _build_predict_fn(spec: Dict[str, Any]) -> Callable[[pd.DataFrame], np.ndarray]:
+        loader = str(spec.get("loader", "artifact_file")).strip().lower()
+        name = str(spec.get("name", "")).strip() or "<unnamed>"
+
+        if loader == "artifact_file":
+            model_path = _resolve_path(spec.get("path"))
+            if not model_path.exists():
+                raise FileNotFoundError(f"{name}: model file not found: {model_path}")
+
+            payload = joblib.load(model_path)
+            if isinstance(payload, dict) and "model" in payload:
+                model = payload.get("model")
+                preprocess_artifacts = payload.get("preprocess_artifacts") or {}
+                payload_features = list(preprocess_artifacts.get("factor_nmes") or [])
+            else:
+                model = payload
+                payload_features = []
+
+            feature_list = list(spec.get("feature_list") or [])
+            if bool(spec.get("feature_list_from_payload", True)) and payload_features:
+                feature_list = payload_features
+
+            task_type = str(spec.get("task_type", "regression")).strip().lower()
+            use_predict_proba = bool(spec.get("use_predict_proba", False))
+
+            def _predict(df: pd.DataFrame) -> np.ndarray:
+                X = df
+                if feature_list:
+                    missing = [c for c in feature_list if c not in df.columns]
+                    if missing:
+                        raise KeyError(f"{name}: missing required features: {missing[:10]}")
+                    X = df[feature_list]
+
+                if task_type in {"binary", "classification"} and use_predict_proba and hasattr(model, "predict_proba"):
+                    pred = model.predict_proba(X)[:, 1]
+                else:
+                    pred = model.predict(X)
+                return np.asarray(pred).reshape(-1)
+
+            return _predict
+
+        if loader == "config_predictor":
+            config_path = _resolve_path(spec.get("config_path"))
+            model_key = str(spec.get("model_key", "")).strip().lower()
+            if not model_key:
+                raise ValueError(f"{name}: model_key is required for config_predictor loader.")
+            predictor = load_predictor_from_config(
+                config_path=config_path,
+                model_key=model_key,
+                model_name=spec.get("model_name"),
+            )
+
+            def _predict(df: pd.DataFrame) -> np.ndarray:
+                pred = predictor.predict(df)
+                return np.asarray(pred).reshape(-1)
+
+            return _predict
+
+        raise ValueError(f"{name}: unsupported loader={loader!r}.")
+
+    explicit_train_path = str(train_data_path or "").strip()
+    explicit_test_path = str(test_data_path or "").strip()
+    use_explicit_split = bool(explicit_train_path or explicit_test_path)
+
+    datasets: List[tuple[str, str, pd.DataFrame]] = []
+    data_path_obj: Optional[Path] = None
+    if use_explicit_split:
+        if explicit_train_path:
+            train_obj = _resolve_path(explicit_train_path)
+            datasets.append(("train", "Train Data", _load_and_validate(train_obj, "multi_compare_train")))
+        if explicit_test_path:
+            test_obj = _resolve_path(explicit_test_path)
+            datasets.append(("valid", "Validation Data", _load_and_validate(test_obj, "multi_compare_valid")))
+    else:
+        data_path_obj = _resolve_path(data_path)
+        raw = _load_and_validate(data_path_obj, "multi_compare_raw")
+        holdout_ratio_val = 0.0 if holdout_ratio is None else float(holdout_ratio)
+        if holdout_ratio_val > 0:
+            train_df, test_df = split_train_test(
+                raw,
+                holdout_ratio=holdout_ratio_val,
+                strategy=str(split_strategy or "random").strip().lower() or "random",
+                group_col=str(split_group_col or "").strip() or None,
+                time_col=str(split_time_col or "").strip() or None,
+                time_ascending=bool(split_time_ascending),
+                rand_seed=int(rand_seed),
+                reset_index_mode="none",
+                ratio_label="holdout_ratio",
+            )
+            train_df = _drop_duplicate_columns(train_df, "multi_compare_train")
+            test_df = _drop_duplicate_columns(test_df, "multi_compare_valid")
+            if len(train_df) > 0:
+                datasets.append(("train", "Train Data", train_df.reset_index(drop=True)))
+            if len(test_df) > 0:
+                datasets.append(("valid", "Validation Data", test_df.reset_index(drop=True)))
+        else:
+            datasets.append(("all", "All Data", raw.reset_index(drop=True)))
+
+    if not datasets:
+        raise ValueError("No dataset is available for multi-model comparison.")
+
+    raw_split_scope = str(split_scope or "both").strip().lower()
+    split_scope_aliases = {
+        "both": "both",
+        "all": "both",
+        "train": "train",
+        "model": "train",
+        "training": "train",
+        "valid": "valid",
+        "val": "valid",
+        "validation": "valid",
+        "test": "valid",
+    }
+    normalized_split_scope = split_scope_aliases.get(raw_split_scope)
+    if normalized_split_scope is None:
+        raise ValueError(
+            f"Unsupported split_scope={raw_split_scope!r}. "
+            "Use one of: train, valid, both."
+        )
+    if normalized_split_scope == "train":
+        datasets = [item for item in datasets if item[0] == "train"]
+    elif normalized_split_scope == "valid":
+        datasets = [item for item in datasets if item[0] == "valid"]
+    if not datasets:
+        raise ValueError(f"No datasets available after split_scope filtering: {normalized_split_scope}.")
+    print(
+        f"[MultiCompare] split_scope={normalized_split_scope}, "
+        f"datasets={[title for _tag, title, _df in datasets]}"
+    )
+
+    predict_fns: Dict[str, Callable[[pd.DataFrame], np.ndarray]] = {}
+    pred_weighted_map: Dict[str, bool] = {}
+    for spec in model_specs:
+        name = str(spec.get("name", "")).strip()
+        if not name:
+            raise ValueError("Each model spec must include a non-empty 'name'.")
+        if name in predict_fns:
+            raise ValueError(f"Duplicate model spec name: {name}")
+        predict_fns[name] = _build_predict_fn(spec)
+        pred_weighted_map[name] = bool(spec.get("pred_weighted", False))
+
+    model_names = list(predict_fns.keys())
+    pairs = list(combinations(model_names, 2))
+    if not pairs:
+        raise ValueError("No model pairs available for comparison.")
+
+    if output_dir:
+        save_root = _resolve_path(output_dir)
+    else:
+        base_dir = data_path_obj.parent if data_path_obj is not None else Path.cwd()
+        save_root = (base_dir / "Results" / "plot" / "multi_model_compare").resolve()
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    n_pairs = len(pairs)
+    n_cols = 2 if n_pairs > 1 else 1
+    n_rows = math.ceil(n_pairs / n_cols)
+    style = PlotStyle()
+
+    for split_tag, split_title, df in datasets:
+        pred_map: Dict[str, np.ndarray] = {}
+        for model_name in model_names:
+            pred_vals = np.asarray(predict_fns[model_name](df), dtype=float).reshape(-1)
+            if len(pred_vals) != len(df):
+                raise ValueError(
+                    f"{model_name}: prediction length mismatch on {split_tag} "
+                    f"({len(pred_vals)} != {len(df)})"
+                )
+            pred_map[model_name] = pred_vals
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 5 * n_rows), squeeze=False)
+        axes_flat = axes.flatten()
+        actual = df[target_col].to_numpy()
+        weight = df[weight_col].to_numpy()
+
+        for i, (name_1, name_2) in enumerate(pairs):
+            ax = axes_flat[i]
+            plot_double_lift_curve(
+                pred_map[name_1],
+                pred_map[name_2],
+                actual,
+                weight,
+                n_bins=int(n_bins),
+                title=f"{split_title}: {name_1} vs {name_2}",
+                label1=name_1,
+                label2=name_2,
+                pred1_weighted=pred_weighted_map.get(name_1, False),
+                pred2_weighted=pred_weighted_map.get(name_2, False),
+                actual_weighted=bool(actual_weighted),
+                ax=ax,
+                show=False,
+                style=style,
+            )
+
+        for j in range(n_pairs, len(axes_flat)):
+            axes_flat[j].axis("off")
+
+        save_path = save_root / f"double_lift_all_pairs_{split_tag}.png"
+        finalize_figure(fig, save_path=str(save_path), show=False, style=style)
+        print(f"Saved: {save_path}")
+
+    return str(save_root)
 

@@ -1,6 +1,6 @@
 # Insurance Pricing Model Frontend
 
-A Gradio-based web interface for configuring and running all insurance pricing model tasks.
+A NiceGUI-based web interface for configuring and running all insurance pricing model tasks.
 
 ## Installation
 
@@ -12,14 +12,6 @@ Or from source:
 
 ```bash
 pip install -e ".[frontend]"
-```
-
-### Linux Note (gradio + huggingface_hub)
-
-If you see `ImportError: cannot import name 'HfFolder'`, pin huggingface_hub:
-
-```bash
-pip install "gradio>=4,<5" "huggingface_hub<0.24"
 ```
 
 ### Apple Silicon (MPS) Note
@@ -34,16 +26,15 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 python -m ins_pricing.frontend.app
 ```
 
-Or from Python:
+Override host/port at runtime (PowerShell):
 
-```python
-from ins_pricing.frontend.app import create_ui
-
-demo = create_ui()
-demo.launch(server_name="0.0.0.0", server_port=8080)
+```powershell
+$env:NICEGUI_HOST="0.0.0.0"
+$env:NICEGUI_PORT="7860"
+python -m ins_pricing.frontend.app
 ```
 
-The web interface opens at `http://localhost:7860` by default.
+The web interface binds to `0.0.0.0:7860` by default.
 
 ## Public API
 
@@ -101,7 +92,7 @@ Example:
 
 ```
 ins_pricing/frontend/
-  app.py                Main Gradio application entry
+  app.py                Main NiceGUI application entry
   app_controller.py     App logic and event handlers
   config_builder.py     ConfigBuilder class
   runner.py             TaskRunner class

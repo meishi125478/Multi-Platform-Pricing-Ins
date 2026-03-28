@@ -737,21 +737,22 @@ class XGBTrainer(TrainerBase):
         y_all = self.ctx.train_data[self.ctx.resp_nme]
         w_all = self.ctx.train_data[self.ctx.weight_nme]
 
-        ctx_config = getattr(self.ctx, "config", None)
-        cfg_limit = getattr(ctx_config, "bo_sample_limit", None)
-        if cfg_limit is not None:
-            cfg_limit = int(cfg_limit)
-            if 0 < cfg_limit < len(X_all):
-                sampled_idx = self._resolve_time_sample_indices(X_all, cfg_limit)
-                if sampled_idx is None:
-                    sampled_idx = X_all.sample(
-                        n=cfg_limit, random_state=self.ctx.rand_seed
-                    ).index
-                X_all = X_all.loc[sampled_idx]
-                y_all = y_all.loc[sampled_idx]
-                w_all = w_all.loc[sampled_idx]
+        effective_limit = self._resolve_effective_sample_limit(
+            base_limit=None,
+            n_rows=len(X_all),
+        )
+        if effective_limit is not None and effective_limit < len(X_all):
+            sampled_idx = self._resolve_time_sample_indices(X_all, effective_limit)
+            if sampled_idx is None:
+                sampled_idx = X_all.sample(
+                    n=effective_limit, random_state=self.ctx.rand_seed
+                ).index
+            X_all = X_all.loc[sampled_idx]
+            y_all = y_all.loc[sampled_idx]
+            w_all = w_all.loc[sampled_idx]
 
         losses: List[float] = []
+        fold_weights: List[float] = []
         for train_idx, val_idx in self.ctx.cv.split(X_all):
             X_train = X_all.iloc[train_idx]
             y_train = y_all.iloc[train_idx].to_numpy(copy=False)
@@ -785,9 +786,10 @@ class XGBTrainer(TrainerBase):
                     tweedie_power=tweedie_variance_power,
                 )
             losses.append(float(loss))
+            fold_weights.append(self._cv_fold_weight(y_val, w_val))
             self._maybe_cleanup_gpu()
 
-        return float(np.mean(losses))
+        return self._aggregate_cv_losses(losses, fold_weights)
 
     def train(self) -> None:
         if not self.best_params:

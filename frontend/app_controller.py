@@ -1,17 +1,18 @@
 ﻿"""
-Insurance Pricing Model Training Frontend
-A Gradio-based web interface for configuring and running insurance pricing models.
+Insurance Pricing Model Training Frontend.
+Frontend controller for configuring and running insurance pricing models.
 """
 
-import os
-from ins_pricing.frontend.ft_workflow import FTWorkflowHelper
-from ins_pricing.frontend.config_builder import ConfigBuilder
-from ins_pricing.frontend.app_controller_config_mixin import AppControllerConfigMixin
-from ins_pricing.frontend.app_controller_runtime_mixin import AppControllerRuntimeMixin
 import importlib.util
 from pathlib import Path
-from typing import Optional, Dict, Any
 from types import SimpleNamespace
+from typing import Any, Dict, Optional
+
+from ins_pricing.frontend.app_controller_config_mixin import AppControllerConfigMixin
+from ins_pricing.frontend.app_controller_runtime_mixin import AppControllerRuntimeMixin
+from ins_pricing.frontend.config_builder import ConfigBuilder
+from ins_pricing.frontend.ft_workflow import FTWorkflowHelper
+
 
 def _ensure_repo_root() -> None:
     if __package__ not in {None, ""}:
@@ -28,39 +29,6 @@ def _ensure_repo_root() -> None:
 
 
 _ensure_repo_root()
-
-os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
-os.environ.setdefault("GRADIO_TELEMETRY_ENABLED", "False")
-os.environ.setdefault("GRADIO_CHECK_VERSION", "False")
-os.environ.setdefault("GRADIO_VERSION_CHECK", "False")
-
-
-
-
-class FrontendDependencyError(RuntimeError):
-    pass
-
-
-def _check_frontend_deps() -> None:
-    """Fail fast with a clear message if frontend deps are incompatible."""
-    try:
-        import gradio  # noqa: F401
-    except Exception as exc:
-        raise FrontendDependencyError(f"Failed to import gradio: {exc}")
-
-    try:
-        import huggingface_hub as hf  # noqa: F401
-    except Exception as exc:
-        raise FrontendDependencyError(
-            f"Failed to import huggingface_hub: {exc}. "
-            "Pin version with `pip install 'huggingface_hub<0.24'`."
-        )
-
-    if not hasattr(hf, 'HfFolder'):
-        raise FrontendDependencyError(
-            'Incompatible huggingface_hub detected: missing HfFolder. '
-            'Please install `huggingface_hub<0.24`.'
-        )
 
 
 class PricingApp(AppControllerRuntimeMixin, AppControllerConfigMixin):
@@ -107,6 +75,6 @@ class PricingApp(AppControllerRuntimeMixin, AppControllerConfigMixin):
     def _get_runner(self):
         if self.runner is None:
             from ins_pricing.frontend.runner import TaskRunner
+
             self.runner = TaskRunner()
         return self.runner
-

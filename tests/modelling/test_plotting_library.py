@@ -71,6 +71,7 @@ def test_plotting_library_outputs(tmp_path, monkeypatch):
         feature="x1",
         weight_col="w",
         target_col="w_act",
+        target_weighted=True,
         n_bins=6,
         save_path=str(tmp_path / "oneway.png"),
     )
@@ -108,6 +109,56 @@ def test_plotting_library_outputs(tmp_path, monkeypatch):
     assert (tmp_path / "oneway.png").exists()
     assert (tmp_path / "geo_heat.png").exists()
     assert (tmp_path / "geo_contour.png").exists()
+
+
+def test_plot_oneway_weighted_target_mean(tmp_path, monkeypatch):
+    _configure_matplotlib(tmp_path, monkeypatch)
+
+    from ins_pricing.modelling.plotting import diagnostics
+    from matplotlib import pyplot as plt
+
+    df = pd.DataFrame(
+        {
+            "seg": ["A", "A", "B", "B"],
+            "target": [1.0, 3.0, 2.0, 4.0],
+            "w": [1.0, 3.0, 1.0, 1.0],
+        }
+    )
+
+    fig, ax = plt.subplots()
+    diagnostics.plot_oneway(
+        df,
+        feature="seg",
+        weight_col="w",
+        target_col="target",
+        target_weighted=False,
+        is_categorical=True,
+        ax=ax,
+        show=False,
+    )
+    labels = [tick.get_text() for tick in ax.get_xticklabels()]
+    values = dict(zip(labels, ax.lines[0].get_ydata()))
+    assert values["A"] == pytest.approx(2.5)
+    assert values["B"] == pytest.approx(3.0)
+    plt.close(fig)
+
+    df["w_act"] = df["target"] * df["w"]
+    fig, ax = plt.subplots()
+    diagnostics.plot_oneway(
+        df,
+        feature="seg",
+        weight_col="w",
+        target_col="w_act",
+        target_weighted=True,
+        is_categorical=True,
+        ax=ax,
+        show=False,
+    )
+    labels = [tick.get_text() for tick in ax.get_xticklabels()]
+    values = dict(zip(labels, ax.lines[0].get_ydata()))
+    assert values["A"] == pytest.approx(2.5)
+    assert values["B"] == pytest.approx(3.0)
+    plt.close(fig)
 
 
 def test_geo_plotting_on_map_optional(tmp_path, monkeypatch):
@@ -148,3 +199,26 @@ def test_geo_plotting_on_map_optional(tmp_path, monkeypatch):
 
     assert (tmp_path / "geo_heat_map.png").exists()
     assert (tmp_path / "geo_contour_map.png").exists()
+
+
+def test_double_lift_table_shared_mask_alignment():
+    from ins_pricing.modelling.plotting import curves
+
+    pred1 = np.array([0.1, np.nan, 0.3, 0.4, np.inf], dtype=float)
+    pred2 = np.array([0.2, 0.2, 0.3, 0.8, 1.0], dtype=float)
+    actual = np.array([1.0, 1.0, np.nan, 2.0, 3.0], dtype=float)
+    weight = np.array([1.0, 1.0, 1.0, 2.0, 1.0], dtype=float)
+
+    # Regression: this used to fail with a length mismatch in a two-stage align flow.
+    out = curves.double_lift_table(
+        pred1,
+        pred2,
+        actual,
+        weight,
+        n_bins=2,
+        pred1_weighted=False,
+        pred2_weighted=False,
+        actual_weighted=False,
+    )
+    # Only rows 0 and 3 are finite across all four arrays => total weight = 3.
+    assert out["weight"].sum() == pytest.approx(3.0)
