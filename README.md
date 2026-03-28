@@ -25,6 +25,21 @@ between modelling, production, governance, and reporting.
 - `reporting/` — Markdown report builder and daily scheduler.
 - `utils/` — validation, features, IO, losses, device management, paths, numerics, metrics, profiling, logging, safe pickle, torch compat.
 
+## Design Focus and Evolution
+
+This module family is built for long-term maintainability, not one-off training scripts.
+
+- Extensibility first
+  - Keep stable public contracts in config, trainer interfaces, and runtime entry points.
+  - Add new models or workflows by extending modules, not by branching core orchestration logic.
+- Refactor-friendly logic boundaries
+  - Separate orchestration (`core`, `runtime`) from algorithm implementations (`trainers`, `models`).
+  - Keep stateful IO and side effects in dedicated layers (`artifacts`, `production`, `governance`) so core logic stays testable.
+- Forward evolution direction
+  - Standardize registries for pluggable model trainers, explainability methods, and evaluation metrics.
+  - Strengthen contract tests around config compatibility and artifact schemas.
+  - Align modelling -> production -> governance interfaces to support future service-oriented deployment.
+
 ## Call Flow (typical)
 
 1. **Model training**

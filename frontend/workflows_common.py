@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, Union
 
 import pandas as pd
+from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
+
+_logger = get_frontend_logger("ins_pricing.frontend.workflows_common")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
 
 _MODEL_FILE_SPEC = {
     "xgb": ("Xgboost", "pkl"),
@@ -36,7 +43,7 @@ def _dedupe_list(values: Iterable[str]) -> List[str]:
 def _drop_duplicate_columns(df: pd.DataFrame, label: str) -> pd.DataFrame:
     if df.columns.duplicated().any():
         dupes = [str(x) for x in df.columns[df.columns.duplicated()]]
-        print(f"[Warn] {label}: dropping duplicate columns: {sorted(set(dupes))}")
+        _log(f"[Warn] {label}: dropping duplicate columns: {sorted(set(dupes))}")
         return df.loc[:, ~df.columns.duplicated()].copy()
     return df
 

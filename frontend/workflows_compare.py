@@ -11,10 +11,10 @@ from typing import Any, Callable, Dict, List, Optional
 import joblib
 import numpy as np
 import pandas as pd
+from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
 
 from ins_pricing.modelling.plotting import PlotStyle, plot_double_lift_curve
 from ins_pricing.modelling.plotting.common import finalize_figure, plt
-from ins_pricing.production.inference import load_predictor_from_config
 
 from .workflows_common import (
     _build_search_roots,
@@ -31,6 +31,24 @@ from .workflows_prediction_utils import (
     load_raw_splits,
     resolve_model_output_override,
 )
+
+_logger = get_frontend_logger("ins_pricing.frontend.workflows_compare")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
+
+
+def _load_predictor_from_cfg(*args, **kwargs):
+    from ins_pricing.production.inference import load_predictor_from_config
+
+    return load_predictor_from_config(*args, **kwargs)
+
+
+def _split_train_test(*args, **kwargs):
+    from ins_pricing.cli.utils.cli_common import split_train_test
+
+    return split_train_test(*args, **kwargs)
 
 
 def run_compare_ft_embed(
@@ -112,13 +130,13 @@ def run_compare_ft_embed(
         label="ft_embed_model_path",
     )
 
-    direct_predictor = load_predictor_from_config(
+    direct_predictor = _load_predictor_from_cfg(
         direct_cfg_path,
         model_key,
         model_name=model_name,
         output_dir=direct_output_override,
     )
-    ft_predictor = load_predictor_from_config(
+    ft_predictor = _load_predictor_from_cfg(
         ft_embed_cfg_path,
         model_key,
         model_name=model_name,
@@ -169,7 +187,7 @@ def run_compare_ft_embed(
     train_ready = "w_act" in plot_train.columns and not plot_train["w_act"].isna().all()
     test_ready = "w_act" in plot_test.columns and not plot_test["w_act"].isna().all()
     if not train_ready and not test_ready:
-        print("[Plot] Missing target values in train split; skip plots.")
+        _log("[Plot] Missing target values in train split; skip plots.")
         return "Skipped plotting due to missing target values."
 
     n_bins = n_bins_override or direct_cfg.get("plot", {}).get("n_bins", 10)
@@ -215,7 +233,7 @@ def run_compare_ft_embed(
         filename,
     )
     finalize_figure(fig, save_path=save_path, show=False, style=style)
-    print(f"Double lift saved to: {save_path}")
+    _log(f"Double lift saved to: {save_path}")
     return str(save_path)
 
 
@@ -271,9 +289,8 @@ def run_double_lift_from_file(
     def _load_and_validate(path_obj: Path, label: str) -> pd.DataFrame:
         frame = pd.read_csv(path_obj, low_memory=False)
         frame = _drop_duplicate_columns(frame, label).reset_index(drop=True)
-        frame.fillna(0, inplace=True)
         if weight_col not in frame.columns:
-            print(f"[Info] weight_col={weight_col!r} not found in {label}. Using constant 1.0.")
+            _log(f"[Info] weight_col={weight_col!r} not found in {label}. Using constant 1.0.")
             frame[weight_col] = 1.0
         missing_cols = [c for c in required_cols if c not in frame.columns]
         if missing_cols:
@@ -284,7 +301,7 @@ def run_double_lift_from_file(
         if after_rows == 0:
             raise ValueError(f"No valid rows remain in {label} after dropping NA in required columns.")
         if after_rows < before_rows:
-            print(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
+            _log(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
         return frame
 
     split_group_col = str(split_group_col or "").strip() or None
@@ -308,7 +325,7 @@ def run_double_lift_from_file(
         assert data_path_obj is not None
         raw = _load_and_validate(data_path_obj, "double_lift_raw")
         if holdout_ratio_val > 0:
-            train_df, test_df = split_train_test(
+            train_df, test_df = _split_train_test(
                 raw,
                 holdout_ratio=holdout_ratio_val,
                 strategy=split_strategy,
@@ -364,7 +381,7 @@ def run_double_lift_from_file(
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     finalize_figure(fig, save_path=str(save_path), show=False, style=style)
-    print(f"Double lift saved to: {save_path}")
+    _log(f"Double lift saved to: {save_path}")
     return str(save_path)
 
 
@@ -409,9 +426,8 @@ def run_double_lift_multi_models(
             raise FileNotFoundError(f"{label} not found: {path_obj}")
         frame = pd.read_csv(path_obj, low_memory=False)
         frame = _drop_duplicate_columns(frame, label).reset_index(drop=True)
-        frame.fillna(0, inplace=True)
         if weight_col not in frame.columns:
-            print(f"[Info] weight_col={weight_col!r} not found in {label}. Using constant 1.0.")
+            _log(f"[Info] weight_col={weight_col!r} not found in {label}. Using constant 1.0.")
             frame[weight_col] = 1.0
         required_cols = [target_col, weight_col]
         missing_cols = [c for c in required_cols if c not in frame.columns]
@@ -423,7 +439,7 @@ def run_double_lift_multi_models(
         if after_rows == 0:
             raise ValueError(f"No valid rows remain in {label} after dropping NA in required columns.")
         if after_rows < before_rows:
-            print(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
+            _log(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
         return frame
 
     def _build_predict_fn(spec: Dict[str, Any]) -> Callable[[pd.DataFrame], np.ndarray]:
@@ -472,7 +488,7 @@ def run_double_lift_multi_models(
             model_key = str(spec.get("model_key", "")).strip().lower()
             if not model_key:
                 raise ValueError(f"{name}: model_key is required for config_predictor loader.")
-            predictor = load_predictor_from_config(
+            predictor = _load_predictor_from_cfg(
                 config_path=config_path,
                 model_key=model_key,
                 model_name=spec.get("model_name"),
@@ -504,7 +520,7 @@ def run_double_lift_multi_models(
         raw = _load_and_validate(data_path_obj, "multi_compare_raw")
         holdout_ratio_val = 0.0 if holdout_ratio is None else float(holdout_ratio)
         if holdout_ratio_val > 0:
-            train_df, test_df = split_train_test(
+            train_df, test_df = _split_train_test(
                 raw,
                 holdout_ratio=holdout_ratio_val,
                 strategy=str(split_strategy or "random").strip().lower() or "random",
@@ -551,7 +567,7 @@ def run_double_lift_multi_models(
         datasets = [item for item in datasets if item[0] == "valid"]
     if not datasets:
         raise ValueError(f"No datasets available after split_scope filtering: {normalized_split_scope}.")
-    print(
+    _log(
         f"[MultiCompare] split_scope={normalized_split_scope}, "
         f"datasets={[title for _tag, title, _df in datasets]}"
     )
@@ -624,7 +640,7 @@ def run_double_lift_multi_models(
 
         save_path = save_root / f"double_lift_all_pairs_{split_tag}.png"
         finalize_figure(fig, save_path=str(save_path), show=False, style=style)
-        print(f"Saved: {save_path}")
+        _log(f"Saved: {save_path}")
 
     return str(save_root)
 

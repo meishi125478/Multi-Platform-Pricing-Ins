@@ -280,6 +280,145 @@ class AppControllerConfigMixin:
         s = str(value or "").strip()
         return s if s else None
 
+    @staticmethod
+    def _parse_csv_values(raw: Any) -> list[str]:
+        return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+
+    def _prepare_build_inputs(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "model_list": self._parse_csv_values(params.get("model_list")),
+            "model_categories": self._parse_csv_values(params.get("model_categories")),
+            "feature_list": self._parse_csv_values(params.get("feature_list")),
+            "categorical_features": self._parse_csv_values(params.get("categorical_features")),
+            "model_keys": self._parse_csv_values(params.get("model_keys")),
+            "xgb_chunk_size": self._int_or_none(params.get("xgb_chunk_size")),
+            "resn_predict_batch_size": self._int_or_none(params.get("resn_predict_batch_size")),
+            "ft_predict_batch_size": self._int_or_none(params.get("ft_predict_batch_size")),
+            "xgb_search_space": self._parse_json_dict(
+                params.get("xgb_search_space_json", ""), "xgb_search_space_json"
+            ),
+            "resn_search_space": self._parse_json_dict(
+                params.get("resn_search_space_json", ""), "resn_search_space_json"
+            ),
+            "ft_search_space": self._parse_json_dict(
+                params.get("ft_search_space_json", ""), "ft_search_space_json"
+            ),
+            "ft_unsupervised_search_space": self._parse_json_dict(
+                params.get("ft_unsupervised_search_space_json", ""),
+                "ft_unsupervised_search_space_json",
+            ),
+            "config_overrides": self._parse_json_dict(
+                params.get("config_overrides_json", ""), "config_overrides_json"
+            ),
+        }
+
+    def _build_extra_config(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {}
+
+        if self._str_or_none(params.get("split_group_col")):
+            extra["split_group_col"] = str(params["split_group_col"]).strip()
+        if self._str_or_none(params.get("split_time_col")):
+            extra["split_time_col"] = str(params["split_time_col"]).strip()
+        extra["split_time_ascending"] = bool(params.get("split_time_ascending"))
+
+        cv_strategy_val = self._str_or_none(params.get("cv_strategy"))
+        if cv_strategy_val:
+            extra["cv_strategy"] = cv_strategy_val
+        cv_splits_val = self._int_or_none(params.get("cv_splits"))
+        if cv_splits_val:
+            extra["cv_splits"] = cv_splits_val
+        if self._str_or_none(params.get("cv_group_col")):
+            extra["cv_group_col"] = str(params["cv_group_col"]).strip()
+        if self._str_or_none(params.get("cv_time_col")):
+            extra["cv_time_col"] = str(params["cv_time_col"]).strip()
+        extra["cv_time_ascending"] = bool(params.get("cv_time_ascending"))
+
+        ft_num_val = self._int_or_none(params.get("ft_num_numeric_tokens"))
+        if ft_num_val:
+            extra["ft_num_numeric_tokens"] = ft_num_val
+        ft_oof_val = self._int_or_none(params.get("ft_oof_folds"))
+        if ft_oof_val:
+            extra["ft_oof_folds"] = ft_oof_val
+        ft_oof_strategy = self._str_or_none(params.get("ft_oof_strategy"))
+        if ft_oof_strategy:
+            extra["ft_oof_strategy"] = ft_oof_strategy
+        extra["ft_oof_shuffle"] = bool(params.get("ft_oof_shuffle"))
+
+        try:
+            extra["resn_weight_decay"] = float(params.get("resn_weight_decay"))
+        except (TypeError, ValueError):
+            pass
+
+        extra["gnn_use_approx_knn"] = bool(params.get("gnn_use_approx_knn"))
+        extra["gnn_approx_knn_threshold"] = int(params.get("gnn_approx_knn_threshold"))
+        extra["gnn_max_gpu_knn_nodes"] = int(params.get("gnn_max_gpu_knn_nodes"))
+        extra["gnn_knn_gpu_mem_ratio"] = float(params.get("gnn_knn_gpu_mem_ratio"))
+        extra["gnn_knn_gpu_mem_overhead"] = float(params.get("gnn_knn_gpu_mem_overhead"))
+        gnn_cache = self._str_or_none(params.get("gnn_graph_cache"))
+        if gnn_cache:
+            extra["gnn_graph_cache"] = gnn_cache
+
+        geo_nmes = self._parse_csv_values(params.get("geo_feature_nmes"))
+        if geo_nmes:
+            extra["geo_feature_nmes"] = geo_nmes
+        if self._str_or_none(params.get("region_province_col")):
+            extra["region_province_col"] = str(params["region_province_col"]).strip()
+        if self._str_or_none(params.get("region_city_col")):
+            extra["region_city_col"] = str(params["region_city_col"]).strip()
+        extra["region_effect_alpha"] = float(params.get("region_effect_alpha"))
+        extra["geo_token_hidden_dim"] = int(params.get("geo_token_hidden_dim"))
+        extra["geo_token_layers"] = int(params.get("geo_token_layers"))
+        extra["geo_token_dropout"] = float(params.get("geo_token_dropout"))
+        extra["geo_token_k_neighbors"] = int(params.get("geo_token_k_neighbors"))
+        extra["geo_token_learning_rate"] = float(params.get("geo_token_learning_rate"))
+        extra["geo_token_epochs"] = int(params.get("geo_token_epochs"))
+
+        extra["final_ensemble"] = bool(params.get("final_ensemble"))
+        extra["final_ensemble_k"] = int(params.get("final_ensemble_k"))
+        extra["final_refit"] = bool(params.get("final_refit"))
+        extra["reuse_best_params"] = bool(params.get("reuse_best_params"))
+
+        bo_limit = self._int_or_none(params.get("bo_sample_limit"))
+        if bo_limit:
+            extra["bo_sample_limit"] = bo_limit
+
+        extra["plot"] = {
+            "enable": bool(params.get("plot_enable")),
+            "n_bins": int(params.get("plot_n_bins")),
+            "oneway": bool(params.get("plot_oneway")),
+            "oneway_pred": bool(params.get("plot_oneway_pred")),
+            "pre_oneway": bool(params.get("plot_pre_oneway")),
+            "double_lift": bool(params.get("plot_double_lift")),
+        }
+
+        cal_max = self._int_or_none(params.get("calibration_max_rows"))
+        extra["calibration"] = {
+            "enable": bool(params.get("calibration_enable")),
+            "method": str(params.get("calibration_method") or "sigmoid"),
+            "max_rows": cal_max,
+            "seed": int(params.get("calibration_seed")),
+        }
+
+        thr_max = self._int_or_none(params.get("threshold_max_rows"))
+        extra["threshold"] = {
+            "enable": bool(params.get("threshold_enable")),
+            "value": None,
+            "metric": str(params.get("threshold_metric") or "f1"),
+            "min_positive_rate": None,
+            "grid": int(params.get("threshold_grid")),
+            "max_rows": thr_max,
+            "seed": int(params.get("threshold_seed")),
+        }
+
+        extra["bootstrap"] = {
+            "enable": bool(params.get("bootstrap_enable")),
+            "metrics": [],
+            "n_samples": int(params.get("bootstrap_n_samples")),
+            "ci": float(params.get("bootstrap_ci")),
+            "seed": int(params.get("bootstrap_seed")),
+        }
+        return extra
+
     def build_config_from_ui(
         self,
         # ── Core Data & Task ──
@@ -424,36 +563,18 @@ class AppControllerConfigMixin:
     ) -> tuple[str, str]:
         """Build configuration from UI parameters."""
         try:
-            # Parse comma-separated lists
-            model_list_parsed = [x.strip() for x in model_list.split(',') if x.strip()]
-            model_categories_parsed = [x.strip() for x in model_categories.split(',') if x.strip()]
-            feature_list_parsed = [x.strip() for x in feature_list.split(',') if x.strip()]
-            categorical_features_parsed = [
-                x.strip() for x in categorical_features.split(',') if x.strip()]
-            model_keys_parsed = [x.strip() for x in model_keys.split(',') if x.strip()]
+            params = dict(locals())
+            params.pop("self", None)
+            parsed = self._prepare_build_inputs(params)
 
-            # Parse optional int fields (0 → None)
-            parsed_xgb_chunk_size = self._int_or_none(xgb_chunk_size)
-            parsed_resn_predict_batch_size = self._int_or_none(resn_predict_batch_size)
-            parsed_ft_predict_batch_size = self._int_or_none(ft_predict_batch_size)
-
-            # Parse search spaces
-            xgb_search_space = self._parse_json_dict(xgb_search_space_json, "xgb_search_space_json")
-            resn_search_space = self._parse_json_dict(resn_search_space_json, "resn_search_space_json")
-            ft_search_space = self._parse_json_dict(ft_search_space_json, "ft_search_space_json")
-            ft_unsupervised_search_space = self._parse_json_dict(
-                ft_unsupervised_search_space_json, "ft_unsupervised_search_space_json")
-            config_overrides = self._parse_json_dict(config_overrides_json, "config_overrides_json")
-
-            # Build base config via ConfigBuilder (uses params already in its signature)
             config = self.config_builder.build_config(
                 data_dir=data_dir,
-                model_list=model_list_parsed,
-                model_categories=model_categories_parsed,
+                model_list=parsed["model_list"],
+                model_categories=parsed["model_categories"],
                 target=target,
                 weight=weight,
-                feature_list=feature_list_parsed,
-                categorical_features=categorical_features_parsed,
+                feature_list=parsed["feature_list"],
+                categorical_features=parsed["categorical_features"],
                 task_type=task_type,
                 distribution=self._str_or_none(distribution),
                 binary_resp_nme=self._str_or_none(binary_resp_nme),
@@ -469,7 +590,7 @@ class AppControllerConfigMixin:
                 epochs=epochs,
                 output_dir=output_dir,
                 use_gpu=use_gpu,
-                model_keys=model_keys_parsed,
+                model_keys=parsed["model_keys"],
                 max_evals=max_evals,
                 build_oht=build_oht,
                 oht_sparse_csr=oht_sparse_csr,
@@ -484,8 +605,8 @@ class AppControllerConfigMixin:
                 xgb_cleanup_per_fold=xgb_cleanup_per_fold,
                 xgb_cleanup_synchronize=xgb_cleanup_synchronize,
                 xgb_use_dmatrix=xgb_use_dmatrix,
-                xgb_chunk_size=parsed_xgb_chunk_size,
-                xgb_search_space=xgb_search_space,
+                xgb_chunk_size=parsed["xgb_chunk_size"],
+                xgb_search_space=parsed["xgb_search_space"],
                 cache_predictions=cache_predictions,
                 prediction_cache_format=prediction_cache_format,
                 dataloader_workers=int(dataloader_workers),
@@ -500,14 +621,14 @@ class AppControllerConfigMixin:
                 ft_cleanup_per_fold=ft_cleanup_per_fold,
                 ft_cleanup_synchronize=ft_cleanup_synchronize,
                 ft_use_lazy_dataset=ft_use_lazy_dataset,
-                ft_predict_batch_size=parsed_ft_predict_batch_size,
-                ft_search_space=ft_search_space,
-                ft_unsupervised_search_space=ft_unsupervised_search_space,
+                ft_predict_batch_size=parsed["ft_predict_batch_size"],
+                ft_search_space=parsed["ft_search_space"],
+                ft_unsupervised_search_space=parsed["ft_unsupervised_search_space"],
                 resn_cleanup_per_fold=resn_cleanup_per_fold,
                 resn_cleanup_synchronize=resn_cleanup_synchronize,
                 resn_use_lazy_dataset=resn_use_lazy_dataset,
-                resn_predict_batch_size=parsed_resn_predict_batch_size,
-                resn_search_space=resn_search_space,
+                resn_predict_batch_size=parsed["resn_predict_batch_size"],
+                resn_search_space=parsed["resn_search_space"],
                 gnn_cleanup_per_fold=gnn_cleanup_per_fold,
                 gnn_cleanup_synchronize=gnn_cleanup_synchronize,
                 gnn_max_fit_rows=self._int_or_none(gnn_max_fit_rows),
@@ -517,129 +638,13 @@ class AppControllerConfigMixin:
                 nproc_per_node=int(nproc_per_node),
             )
 
-            # ── Apply extra parameters not in ConfigBuilder.build_config() ──
-            # These are set directly on the config dict (they exist in default_config).
-            extra: Dict[str, Any] = {}
-
-            # Split extended
-            if self._str_or_none(split_group_col):
-                extra["split_group_col"] = split_group_col.strip()
-            if self._str_or_none(split_time_col):
-                extra["split_time_col"] = split_time_col.strip()
-            extra["split_time_ascending"] = bool(split_time_ascending)
-
-            # Cross-validation
-            cv_strategy_val = self._str_or_none(cv_strategy)
-            if cv_strategy_val:
-                extra["cv_strategy"] = cv_strategy_val
-            cv_splits_val = self._int_or_none(cv_splits)
-            if cv_splits_val:
-                extra["cv_splits"] = cv_splits_val
-            if self._str_or_none(cv_group_col):
-                extra["cv_group_col"] = cv_group_col.strip()
-            if self._str_or_none(cv_time_col):
-                extra["cv_time_col"] = cv_time_col.strip()
-            extra["cv_time_ascending"] = bool(cv_time_ascending)
-
-            # FT extended
-            ft_num_val = self._int_or_none(ft_num_numeric_tokens)
-            if ft_num_val:
-                extra["ft_num_numeric_tokens"] = ft_num_val
-            ft_oof_val = self._int_or_none(ft_oof_folds)
-            if ft_oof_val:
-                extra["ft_oof_folds"] = ft_oof_val
-            ft_oof_strat = self._str_or_none(ft_oof_strategy)
-            if ft_oof_strat:
-                extra["ft_oof_strategy"] = ft_oof_strat
-            extra["ft_oof_shuffle"] = bool(ft_oof_shuffle)
-
-            # ResNet extended
-            try:
-                extra["resn_weight_decay"] = float(resn_weight_decay)
-            except (TypeError, ValueError):
-                pass
-
-            # GNN extended
-            extra["gnn_use_approx_knn"] = bool(gnn_use_approx_knn)
-            extra["gnn_approx_knn_threshold"] = int(gnn_approx_knn_threshold)
-            extra["gnn_max_gpu_knn_nodes"] = int(gnn_max_gpu_knn_nodes)
-            extra["gnn_knn_gpu_mem_ratio"] = float(gnn_knn_gpu_mem_ratio)
-            extra["gnn_knn_gpu_mem_overhead"] = float(gnn_knn_gpu_mem_overhead)
-            gnn_cache = self._str_or_none(gnn_graph_cache)
-            if gnn_cache:
-                extra["gnn_graph_cache"] = gnn_cache
-
-            # Geographic / Regional
-            geo_nmes = [x.strip() for x in str(geo_feature_nmes or "").split(',') if x.strip()]
-            if geo_nmes:
-                extra["geo_feature_nmes"] = geo_nmes
-            if self._str_or_none(region_province_col):
-                extra["region_province_col"] = region_province_col.strip()
-            if self._str_or_none(region_city_col):
-                extra["region_city_col"] = region_city_col.strip()
-            extra["region_effect_alpha"] = float(region_effect_alpha)
-            extra["geo_token_hidden_dim"] = int(geo_token_hidden_dim)
-            extra["geo_token_layers"] = int(geo_token_layers)
-            extra["geo_token_dropout"] = float(geo_token_dropout)
-            extra["geo_token_k_neighbors"] = int(geo_token_k_neighbors)
-            extra["geo_token_learning_rate"] = float(geo_token_learning_rate)
-            extra["geo_token_epochs"] = int(geo_token_epochs)
-
-            # Ensemble & Refit
-            extra["final_ensemble"] = bool(final_ensemble)
-            extra["final_ensemble_k"] = int(final_ensemble_k)
-            extra["final_refit"] = bool(final_refit)
-            extra["reuse_best_params"] = bool(reuse_best_params)
-
-            # BO sample limit
-            bo_limit = self._int_or_none(bo_sample_limit)
-            if bo_limit:
-                extra["bo_sample_limit"] = bo_limit
-
-            # Plot settings (nested dict)
-            extra["plot"] = {
-                "enable": bool(plot_enable),
-                "n_bins": int(plot_n_bins),
-                "oneway": bool(plot_oneway),
-                "oneway_pred": bool(plot_oneway_pred),
-                "pre_oneway": bool(plot_pre_oneway),
-                "double_lift": bool(plot_double_lift),
-            }
-
-            # Calibration (nested dict)
-            cal_max = self._int_or_none(calibration_max_rows)
-            extra["calibration"] = {
-                "enable": bool(calibration_enable),
-                "method": str(calibration_method or "sigmoid"),
-                "max_rows": cal_max,
-                "seed": int(calibration_seed),
-            }
-
-            # Threshold (nested dict)
-            thr_max = self._int_or_none(threshold_max_rows)
-            extra["threshold"] = {
-                "enable": bool(threshold_enable),
-                "value": None,
-                "metric": str(threshold_metric or "f1"),
-                "min_positive_rate": None,
-                "grid": int(threshold_grid),
-                "max_rows": thr_max,
-                "seed": int(threshold_seed),
-            }
-
-            # Bootstrap (nested dict)
-            extra["bootstrap"] = {
-                "enable": bool(bootstrap_enable),
-                "metrics": [],
-                "n_samples": int(bootstrap_n_samples),
-                "ci": float(bootstrap_ci),
-                "seed": int(bootstrap_seed),
-            }
+            extra = self._build_extra_config(params)
 
             # Deep-merge extra params into config
             config = self._deep_merge_dict(config, extra)
 
             # Deep-merge user-provided JSON overrides last (highest priority)
+            config_overrides = parsed["config_overrides"]
             if config_overrides:
                 config = self._deep_merge_dict(config, config_overrides)
 

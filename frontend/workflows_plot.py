@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
 
-from ins_pricing.cli.utils.cli_common import split_train_test
 from ins_pricing.modelling.plotting import (
     PlotStyle,
     plot_double_lift_curve,
@@ -16,7 +16,6 @@ from ins_pricing.modelling.plotting import (
     plot_oneway,
 )
 from ins_pricing.modelling.plotting.common import finalize_figure, plt
-from ins_pricing.production.inference import load_predictor_from_config
 
 from .workflows_common import (
     _build_search_roots,
@@ -36,6 +35,23 @@ from .workflows_prediction_utils import (
 )
 
 PLOT_GRID_FIGSIZE = (11, 5)
+_logger = get_frontend_logger("ins_pricing.frontend.workflows_plot")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
+
+
+def _load_predictor_from_cfg(*args, **kwargs):
+    from ins_pricing.production.inference import load_predictor_from_config
+
+    return load_predictor_from_config(*args, **kwargs)
+
+
+def _split_train_test(*args, **kwargs):
+    from ins_pricing.cli.utils.cli_common import split_train_test
+
+    return split_train_test(*args, **kwargs)
 
 
 def _normalize_oneway_feature_override(raw_value: Any) -> List[str]:
@@ -117,7 +133,7 @@ def run_pre_oneway(
 
     missing = [f for f in features if f not in reference_df.columns]
     if missing:
-        print(f"[Warn] Missing features removed: {missing}")
+        _log(f"[Warn] Missing features removed: {missing}")
         features = [f for f in features if f in reference_df.columns]
         cats = [f for f in cats if f in reference_df.columns]
 
@@ -150,7 +166,7 @@ def run_pre_oneway(
     else:
         assert raw is not None
         if holdout_ratio is not None and float(holdout_ratio) > 0:
-            train_df, _ = split_train_test(
+            train_df, _ = _split_train_test(
                 raw,
                 holdout_ratio=float(holdout_ratio),
                 strategy="random",
@@ -162,7 +178,7 @@ def run_pre_oneway(
         else:
             datasets.append(("all", raw.copy()))
 
-    print(f"Generating oneway plots for {len(features)} features...")
+    _log(f"Generating oneway plots for {len(features)} features...")
     saved = 0
     dataset_count = len(datasets)
     for tag, df in datasets:
@@ -185,12 +201,12 @@ def run_pre_oneway(
                 if save_path.exists():
                     saved += 1
                 if i % 5 == 0 or i == len(features):
-                    print(f"  [{tag}] [{i}/{len(features)}] {feature}")
+                    _log(f"  [{tag}] [{i}/{len(features)}] {feature}")
             except Exception as exc:
-                print(f"  [Warn] [{tag}] {feature} failed: {exc}")
+                _log(f"  [Warn] [{tag}] {feature} failed: {exc}")
 
     total_expected = len(features) * dataset_count
-    print(f"Complete. Saved {saved}/{total_expected} plots to: {out_dir}")
+    _log(f"Complete. Saved {saved}/{total_expected} plots to: {out_dir}")
     return f"Saved {saved} plots to {out_dir}"
 
 
@@ -256,7 +272,7 @@ def _run_prediction_plot_workflow(
         kwargs: Dict[str, object] = {"model_name": model_name}
         if output_override is not None:
             kwargs["output_dir"] = output_override
-        return load_predictor_from_config(model_cfg_path, model_key, **kwargs)
+        return _load_predictor_from_cfg(model_cfg_path, model_key, **kwargs)
 
     model_cfg_map = {"xgb": xgb_cfg_path, "resn": resn_cfg_path}
     model_keys = cfg.get("model_keys") or ["xgb", "resn"]
@@ -311,7 +327,7 @@ def _run_prediction_plot_workflow(
     train_ready = "w_act" in plot_train.columns and not plot_train["w_act"].isna().all()
     test_ready = "w_act" in plot_test.columns and not plot_test["w_act"].isna().all()
     if not train_ready and not test_ready:
-        print("[Plot] Missing target values in train split; skip plots.")
+        _log("[Plot] Missing target values in train split; skip plots.")
         return "Skipped plotting due to missing target values."
 
     plot_cfg = cfg.get("plot", {}) if isinstance(cfg.get("plot"), dict) else {}
@@ -356,7 +372,7 @@ def _run_prediction_plot_workflow(
         raise ValueError(
             f"Requested split_scope={split_scope!r}, but available splits are {available}."
         )
-    print(f"[Plot] split_scope={split_scope}, datasets={[title for _tag, title, _df in datasets]}")
+    _log(f"[Plot] split_scope={split_scope}, datasets={[title for _tag, title, _df in datasets]}")
 
     for pred_key in model_keys:
         pred_label = _model_label(pred_key)
@@ -479,10 +495,10 @@ def _run_prediction_plot_workflow(
         )
         finalize_figure(fig, save_path=save_path, show=False, style=style)
 
-    print("Plots saved under:")
+    _log("Plots saved under:")
     for key in model_keys:
         output_root, _ = _get_plot_config(key)
-        print(f"  - {key}: {output_root}/plot/{model_name}")
+        _log(f"  - {key}: {output_root}/plot/{model_name}")
     return "Plotting complete."
 
 
@@ -523,7 +539,7 @@ def run_plot_direct(
         filtered_features = [f for f in selected_features if not feature_set or f in feature_set]
         ignored = [f for f in selected_features if feature_set and f not in feature_set]
         if ignored:
-            print(f"[Warn] Ignored factors not present in config.feature_list: {ignored}")
+            _log(f"[Warn] Ignored factors not present in config.feature_list: {ignored}")
         if not filtered_features:
             raise ValueError("Selected oneway factors are not present in config.feature_list.")
         feature_list = filtered_features
@@ -622,7 +638,7 @@ def run_plot_embed(
         filtered_features = [f for f in selected_features if not feature_set or f in feature_set]
         ignored = [f for f in selected_features if feature_set and f not in feature_set]
         if ignored:
-            print(f"[Warn] Ignored factors not present in config.feature_list: {ignored}")
+            _log(f"[Warn] Ignored factors not present in config.feature_list: {ignored}")
         if not filtered_features:
             raise ValueError("Selected oneway factors are not present in config.feature_list.")
         base_oneway_features = filtered_features

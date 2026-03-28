@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import pandas as pd
-
-from ins_pricing.production.inference import load_predictor_from_config
+from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
 
 from .workflows_common import (
     _build_search_roots,
@@ -18,6 +17,12 @@ from .workflows_common import (
     _resolve_model_output_dir,
     _resolve_output_dir,
 )
+
+_logger = get_frontend_logger("ins_pricing.frontend.workflows_predict")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
 
 
 def _resolve_model_file_for_prediction(
@@ -47,7 +52,7 @@ def _resolve_model_file_for_prediction(
             raise FileNotFoundError(
                 f"{label} is a directory but model artifact was not found under: {candidate}"
             )
-        print(f"[Info] Found {model_key} model from directory override: {discovered}")
+        _log(f"[Info] Found {model_key} model from directory override: {discovered}")
         return discovered
 
     discovered = _discover_model_file(
@@ -57,7 +62,7 @@ def _resolve_model_file_for_prediction(
         output_roots=[default_output_root] if default_output_root is not None else None,
     )
     if discovered is not None:
-        print(f"[Info] Auto-discovered {model_key} model: {discovered}")
+        _log(f"[Info] Auto-discovered {model_key} model: {discovered}")
         return discovered
 
     expected = (
@@ -69,6 +74,12 @@ def _resolve_model_file_for_prediction(
         f"{label} not found. Expected model artifact under {expected} "
         "or provide an explicit uploaded model file."
     )
+
+
+def _load_predictor_from_cfg(*args, **kwargs):
+    from ins_pricing.production.inference import load_predictor_from_config
+
+    return load_predictor_from_config(*args, **kwargs)
 
 
 def run_predict_ft_embed(
@@ -134,9 +145,7 @@ def run_predict_ft_embed(
     if ft_cfg.get("geo_feature_nmes"):
         raise ValueError("FT with geo tokens is not supported in this workflow.")
 
-    import torch
-
-    print("Loading FT model...")
+    _log("Loading FT model...")
     ft_model_file = _resolve_model_file_for_prediction(
         model_name=model_name,
         model_key="ft",
@@ -146,14 +155,19 @@ def run_predict_ft_embed(
         default_output_root=ft_output_dir,
     )
     ft_model = _load_ft_embedding_model(ft_model_file)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
     if hasattr(ft_model, "device"):
         ft_model.device = device
     if hasattr(ft_model, "to"):
-        ft_model.to(device)
+        try:
+            ft_model.to(device)
+        except Exception:
+            pass
     if hasattr(ft_model, "ft"):
-        ft_model.ft.to(device)
+        try:
+            ft_model.ft.to(device)
+        except Exception:
+            pass
 
     df_new = pd.read_csv(input_path)
     emb = ft_model.predict(df_new, return_embedding=True)
@@ -184,7 +198,9 @@ def run_predict_ft_embed(
             raise ValueError("Feature list missing for XGB model.")
 
         X = df_with_emb[feature_list]
-        if (xgb_task_type or "regression") == "classification" and hasattr(xgb_model, "predict_proba"):
+        task_type = str(xgb_task_type or "regression").strip().lower()
+        is_binary_task = task_type in {"binary", "classification", "binary_classification"}
+        if is_binary_task and hasattr(xgb_model, "predict_proba"):
             pred = xgb_model.predict_proba(X)[:, 1]
         else:
             pred = xgb_model.predict(X)
@@ -205,7 +221,7 @@ def run_predict_ft_embed(
             str(resn_model_file),
             "resolved_resn_model_path",
         )
-        resn_predictor = load_predictor_from_config(
+        resn_predictor = _load_predictor_from_cfg(
             resn_cfg_path,
             "resn",
             model_name=model_name,
@@ -216,6 +232,6 @@ def run_predict_ft_embed(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_path, index=False)
-    print(f"Saved predictions to: {output_path}")
+    _log(f"Saved predictions to: {output_path}")
     return str(output_path)
 

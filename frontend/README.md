@@ -92,14 +92,14 @@ Example:
 
 ```
 ins_pricing/frontend/
-  app.py                Main NiceGUI application entry
-  app_controller.py     App logic and event handlers
+  app.py                NiceGUI application entrypoint
+  ui_frontend.py        UI layout, tabs, and event handlers
+  app_controller.py     Runtime/config orchestration layer
   config_builder.py     ConfigBuilder class
   runner.py             TaskRunner class
-  ft_workflow.py         FTWorkflowHelper for two-step workflows
+  ft_workflow.py        FTWorkflowHelper for two-step workflows
   workflows_common.py   Shared utilities (path resolution, model discovery)
   workflows_predict.py  Prediction workflow (FT embed + XGB/ResN stacking)
-  requirements.txt      Frontend-specific dependencies
 ```
 
 ## Usage Guide

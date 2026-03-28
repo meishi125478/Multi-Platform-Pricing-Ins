@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 import platform
@@ -14,6 +15,37 @@ from typing import Any, Callable, Dict, Generator, Iterable, Optional, Sequence
 
 class _MissingTrainingConfigError(ValueError):
     """Raised when no runnable training config can be resolved."""
+
+
+class _LogBuffer:
+    """Bounded log buffer that keeps the most recent characters."""
+
+    def __init__(self, max_chars: int):
+        self._max_chars = max(200, int(max_chars))
+        self._chunks: deque[str] = deque()
+        self._total_chars = 0
+        self._version = 0
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def extend(self, lines: Sequence[str]) -> None:
+        for raw in lines:
+            chunk = str(raw or "")
+            if not chunk:
+                continue
+            if not chunk.endswith("\n"):
+                chunk = f"{chunk}\n"
+            self._chunks.append(chunk)
+            self._total_chars += len(chunk)
+            self._version += 1
+            while self._total_chars > self._max_chars and self._chunks:
+                removed = self._chunks.popleft()
+                self._total_chars -= len(removed)
+
+    def text(self) -> str:
+        return "".join(self._chunks)
 
 
 class AppControllerRuntimeMixin:
@@ -96,6 +128,38 @@ class AppControllerRuntimeMixin:
             resolved[key] = self._resolve_override_path(manual_path, uploaded_file)
         return resolved
 
+    @staticmethod
+    def _log_char_limit() -> int:
+        raw = os.environ.get("INS_PRICING_FRONTEND_LOG_MAX_CHARS", "").strip()
+        if not raw:
+            return 200_000
+        try:
+            return max(200, int(raw))
+        except ValueError:
+            return 200_000
+
+    def _iter_log_snapshots(self, log_generator: Iterable[str]) -> Generator[str, None, None]:
+        """Yield bounded log snapshots with batched updates."""
+        buffer = _LogBuffer(self._log_char_limit())
+        pending: list[str] = []
+        last_emit = time.monotonic()
+        last_sent_version = -1
+        for log_line in log_generator:
+            pending.append(str(log_line))
+            now = time.monotonic()
+            if len(pending) >= 24 or (now - last_emit) >= 0.2:
+                buffer.extend(pending)
+                pending = []
+                last_emit = now
+                if buffer.version != last_sent_version:
+                    last_sent_version = buffer.version
+                    yield buffer.text()
+
+        if pending:
+            buffer.extend(pending)
+        if buffer.version != last_sent_version:
+            yield buffer.text()
+
     def run_workflow_config_ui(self, workflow_config_json: str) -> Generator[tuple[str, str], None, None]:
         """Run plotting/prediction/compare/pre-oneway from workflow JSON config."""
         try:
@@ -119,8 +183,7 @@ class AppControllerRuntimeMixin:
             )
 
             full_log = ""
-            for log_line in log_generator:
-                full_log += log_line + "\n"
+            for full_log in self._iter_log_snapshots(log_generator):
                 yield f"Workflow [{mode}] in progress...", full_log
 
             yield f"Workflow [{mode}] completed!", full_log
@@ -145,10 +208,8 @@ class AppControllerRuntimeMixin:
             runner = self._get_runner()
             log_generator = runner.run_task(str(config_path))
 
-            # Collect logs
             full_log = ""
-            for log_line in log_generator:
-                full_log += log_line + "\n"
+            for full_log in self._iter_log_snapshots(log_generator):
                 yield f"Task [{task_mode}] in progress...", full_log
 
             yield f"Task [{task_mode}] completed!", full_log
@@ -321,8 +382,7 @@ class AppControllerRuntimeMixin:
             runner = self._get_runner()
             log_generator = runner.run_callable(func, *args, **kwargs)
             full_log = ""
-            for log_line in log_generator:
-                full_log += log_line + "\n"
+            for full_log in self._iter_log_snapshots(log_generator):
                 yield f"{label} in progress...", full_log
             yield f"{label} completed!", full_log
         except Exception as e:
@@ -343,8 +403,7 @@ class AppControllerRuntimeMixin:
             started_at = time.time()
             log_generator = runner.run_callable(func, *args, **kwargs)
             full_log = ""
-            for log_line in log_generator:
-                full_log += log_line + "\n"
+            for full_log in self._iter_log_snapshots(log_generator):
                 yield f"{label} in progress...", full_log, []
 
             previews: list[str] = []

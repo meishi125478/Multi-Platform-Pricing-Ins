@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 import pandas as pd
-
-from ins_pricing.cli.utils.cli_common import split_train_test
+from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
 
 from .workflows_common import (
     _discover_model_file,
@@ -16,6 +15,18 @@ from .workflows_common import (
     _resolve_data_path,
     _resolve_model_output_dir,
 )
+
+_logger = get_frontend_logger("ins_pricing.frontend.workflows_prediction_utils")
+
+
+def _log(*args, **kwargs) -> None:
+    log_print(_logger, *args, **kwargs)
+
+
+def _split_train_test(*args, **kwargs):
+    from ins_pricing.cli.utils.cli_common import split_train_test
+
+    return split_train_test(*args, **kwargs)
 
 DOUBLE_LIFT_FIGSIZE = (11, 5)
 
@@ -74,7 +85,7 @@ def load_raw_splits(
         split_time_ascending = split_cfg.get("split_time_ascending", True)
         rand_seed = split_cfg.get("rand_seed", 13)
 
-        train_raw, test_raw = split_train_test(
+        train_raw, test_raw = _split_train_test(
             raw,
             holdout_ratio=holdout_ratio,
             strategy=split_strategy,
@@ -112,8 +123,6 @@ def build_ft_embedding_frames(
     ft_prefix = ft_cfg.get("ft_feature_prefix", "ft_emb")
 
     if use_runtime_ft_embedding:
-        import torch
-
         if ft_model_path and str(ft_model_path).strip():
             ft_model_path_obj = Path(str(ft_model_path).strip()).resolve()
         else:
@@ -128,20 +137,26 @@ def build_ft_embedding_frames(
             )
             if discovered_ft_model is not None:
                 ft_model_path_obj = discovered_ft_model
-                print(f"[Info] Auto-discovered ft model: {discovered_ft_model}")
+                _log(f"[Info] Auto-discovered ft model: {discovered_ft_model}")
             else:
                 ft_model_path_obj = default_ft_model_path
         if not ft_model_path_obj.exists():
             raise FileNotFoundError(f"FT model file not found: {ft_model_path_obj}")
 
         ft_model = _load_ft_embedding_model(ft_model_path_obj)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = "cpu"
         if hasattr(ft_model, "device"):
             ft_model.device = device
         if hasattr(ft_model, "to"):
-            ft_model.to(device)
+            try:
+                ft_model.to(device)
+            except Exception:
+                pass
         if hasattr(ft_model, "ft"):
-            ft_model.ft.to(device)
+            try:
+                ft_model.ft.to(device)
+            except Exception:
+                pass
 
         emb_train = ft_model.predict(train_raw, return_embedding=True)
         emb_cols = [f"pred_{ft_prefix}_{i}" for i in range(emb_train.shape[1])]
@@ -195,5 +210,5 @@ def resolve_model_output_override(
         )
         if discovered is not None:
             override = _resolve_model_output_dir(str(discovered), f"auto_{label}")
-            print(f"[Info] Auto-discovered {model_key} model: {discovered}")
+            _log(f"[Info] Auto-discovered {model_key} model: {discovered}")
     return override

@@ -70,6 +70,21 @@ bayesopt/
     torch_trainer_mixin.py Shared torch trainer utilities
 ```
 
+## Extensibility and Refactoring Direction
+
+- Keep `BayesOptModel` as the orchestration facade and treat trainers as pluggable strategy units.
+  - New model families should implement `TrainerBase` and be registered through trainer modules.
+- Keep data/side-effect boundaries explicit.
+  - `runtime/` handles execution flow and persistence orchestration.
+  - `trainers/` and `models/` focus on model behavior and optimization logic.
+- Prefer backward-compatible config evolution.
+  - Additive config fields should be the default.
+  - Behavior changes should remain explicit in config flags or versioned runtime logic.
+- Future roadmap
+  - Introduce clearer trainer registry wiring to reduce `if/else` growth in orchestration.
+  - Isolate reusable preprocessing and CV components for cross-model reuse.
+  - Expand contract tests for config parsing, checkpoint compatibility, and artifact schema stability.
+
 ## BayesOptModel Key Methods
 
 ### Training
