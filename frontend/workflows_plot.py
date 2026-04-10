@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
 
@@ -23,6 +24,7 @@ from .workflows_common import (
     _drop_duplicate_columns,
     _infer_categorical_features,
     _parse_csv_list,
+    _resolve_double_lift_dir,
     _resolve_output_dir,
     _resolve_plot_path,
     _resolve_plot_style,
@@ -63,6 +65,110 @@ def _normalize_oneway_feature_override(raw_value: Any) -> List[str]:
         return _dedupe_list([str(x).strip() for x in raw_value if str(x).strip()])
     text = str(raw_value).strip()
     return [text] if text else []
+
+
+def _resolve_predict_chunk_rows(cfg: dict, plot_cfg: dict) -> int:
+    raw = plot_cfg.get(
+        "predict_chunk_rows",
+        plot_cfg.get(
+            "pred_cache_predict_chunk_rows",
+            cfg.get("pred_cache_predict_chunk_rows", 0),
+        ),
+    )
+    try:
+        value = int(raw or 0)
+    except Exception:
+        value = 0
+    return max(0, value)
+
+
+def _predict_vector(
+    predictor,
+    data: pd.DataFrame,
+    *,
+    model_key: str,
+    split_tag: str,
+    chunk_rows: int,
+) -> np.ndarray:
+    if len(data) == 0:
+        return np.asarray([], dtype=float)
+    if chunk_rows <= 0 or len(data) <= chunk_rows:
+        return np.asarray(predictor.predict(data)).reshape(-1)
+
+    pieces: List[np.ndarray] = []
+    for start in range(0, len(data), chunk_rows):
+        end = min(start + chunk_rows, len(data))
+        chunk = data.iloc[start:end]
+        pred_chunk = np.asarray(predictor.predict(chunk)).reshape(-1)
+        if pred_chunk.shape[0] != (end - start):
+            raise ValueError(
+                f"{split_tag.capitalize()} prediction length mismatch for {model_key}: "
+                f"expected={end - start}, got={pred_chunk.shape[0]}"
+            )
+        pieces.append(pred_chunk)
+    if not pieces:
+        return np.asarray([], dtype=float)
+    return np.concatenate(pieces, axis=0)
+
+
+def _required_feature_names_from_predictor(predictor) -> List[str]:
+    artifacts = getattr(predictor, "artifacts", None)
+    if isinstance(artifacts, dict):
+        factor_nmes = list(artifacts.get("factor_nmes") or [])
+        if factor_nmes:
+            return factor_nmes
+    predictor_cfg = getattr(predictor, "cfg", None)
+    if isinstance(predictor_cfg, dict):
+        return list(predictor_cfg.get("feature_list") or [])
+    return []
+
+
+def _log_missing_feature_coverage(
+    *,
+    model_key: str,
+    split_tag: str,
+    frame: pd.DataFrame,
+    required_features: List[str],
+) -> None:
+    if not required_features:
+        return
+    missing = [f for f in required_features if f not in frame.columns]
+    if not missing:
+        return
+    ratio = float(len(missing)) / float(max(len(required_features), 1))
+    sample = missing[:8]
+    _log(
+        f"[Warn] {model_key} {split_tag}: missing {len(missing)}/{len(required_features)} "
+        f"required features. sample={sample}"
+    )
+    if ratio >= 0.2 and any(str(col).startswith("pred_") for col in missing):
+        _log(
+            "[Warn] Missing columns include embedding-like features (pred_*). "
+            "You may be using a non-direct model config in plot_direct."
+        )
+
+
+def _warn_if_near_constant_predictions(
+    *,
+    values: np.ndarray,
+    model_key: str,
+    split_tag: str,
+) -> None:
+    if values.size < 2:
+        return
+    finite = values[np.isfinite(values)]
+    if finite.size < 2:
+        _log(f"[Warn] {model_key} {split_tag}: predictions are non-finite or empty after filtering.")
+        return
+    std = float(np.std(finite))
+    q05, q95 = np.quantile(finite, [0.05, 0.95])
+    spread = float(q95 - q05)
+    scale = max(abs(float(q95)), abs(float(q05)), 1.0)
+    if std <= 1e-8 or spread <= 1e-4 * scale:
+        _log(
+            f"[Warn] {model_key} {split_tag}: predictions are near-constant "
+            f"(std={std:.6g}, q05={q05:.6g}, q95={q95:.6g})."
+        )
 
 
 def run_pre_oneway(
@@ -143,15 +249,10 @@ def run_pre_oneway(
             infer_source = pd.concat([train_payload[0], test_payload[0]], ignore_index=True)
         cats = _infer_categorical_features(infer_source, features)
 
-    default_out_base = (
-        (raw_path.parent if raw_path is not None else Path.cwd())
-        if train_payload is None and test_payload is None
-        else (train_payload[1].parent if train_payload is not None else test_payload[1].parent)
-    )
     out_dir = (
         Path(output_dir).resolve()
         if output_dir
-        else default_out_base / "Results" / "plot" / model_name / "oneway" / "pre"
+        else Path.cwd() / "Results" / "plot" / model_name / "oneway" / "pre"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,6 +383,11 @@ def _run_prediction_plot_workflow(
 
     default_model_labels = {"xgb": "Xgboost", "resn": "ResNet"}
     labels = cfg.get("model_labels") or {}
+    plot_cfg = cfg.get("plot", {}) if isinstance(cfg.get("plot"), dict) else {}
+    n_bins = plot_cfg.get("n_bins", 10)
+    predict_chunk_rows = _resolve_predict_chunk_rows(cfg, plot_cfg)
+    if predict_chunk_rows > 0:
+        _log(f"[Plot] Chunked prediction enabled: {predict_chunk_rows} rows/chunk")
 
     def _model_label(model_key: str) -> str:
         return str(labels.get(model_key, default_model_labels.get(model_key, model_key)))
@@ -291,21 +397,58 @@ def _run_prediction_plot_workflow(
     pred_train = {}
     pred_test = {}
     for key, predictor in predictors.items():
+        required_features = _required_feature_names_from_predictor(predictor)
         if len(train_df) > 0:
-            pred_train[key] = predictor.predict(train_df).reshape(-1)
+            _log_missing_feature_coverage(
+                model_key=key,
+                split_tag="train",
+                frame=train_df,
+                required_features=required_features,
+            )
+        if len(test_df) > 0:
+            _log_missing_feature_coverage(
+                model_key=key,
+                split_tag="valid",
+                frame=test_df,
+                required_features=required_features,
+            )
+        if len(train_df) > 0:
+            pred_train[key] = _predict_vector(
+                predictor,
+                train_df,
+                model_key=key,
+                split_tag="train",
+                chunk_rows=predict_chunk_rows,
+            )
             if len(pred_train[key]) != len(train_df):
                 raise ValueError(f"Train prediction length mismatch for {key}")
+            _warn_if_near_constant_predictions(
+                values=np.asarray(pred_train[key], dtype=float).reshape(-1),
+                model_key=key,
+                split_tag="train",
+            )
         else:
             pred_train[key] = []
         if len(test_df) > 0:
-            pred_test[key] = predictor.predict(test_df).reshape(-1)
+            pred_test[key] = _predict_vector(
+                predictor,
+                test_df,
+                model_key=key,
+                split_tag="valid",
+                chunk_rows=predict_chunk_rows,
+            )
             if len(pred_test[key]) != len(test_df):
                 raise ValueError(f"Test prediction length mismatch for {key}")
+            _warn_if_near_constant_predictions(
+                values=np.asarray(pred_test[key], dtype=float).reshape(-1),
+                model_key=key,
+                split_tag="valid",
+            )
         else:
             pred_test[key] = []
 
-    plot_train = train_raw.copy()
-    plot_test = test_raw.copy()
+    plot_train = train_raw.copy(deep=False)
+    plot_test = test_raw.copy(deep=False)
     for key in model_keys:
         if len(plot_train) > 0:
             plot_train[f"pred_{key}"] = pred_train[key]
@@ -329,9 +472,6 @@ def _run_prediction_plot_workflow(
     if not train_ready and not test_ready:
         _log("[Plot] Missing target values in train split; skip plots.")
         return "Skipped plotting due to missing target values."
-
-    plot_cfg = cfg.get("plot", {}) if isinstance(cfg.get("plot"), dict) else {}
-    n_bins = plot_cfg.get("n_bins", 10)
 
     raw_split_scope = str(
         plot_cfg.get("split_scope", cfg.get("plot_split_scope", "both")) or "both"
@@ -487,13 +627,17 @@ def _run_prediction_plot_workflow(
                 style=style,
             )
         plt.subplots_adjust(wspace=0.3)
-        save_path = _resolve_plot_path(
-            _resolve_output_dir(cfg, cfg_path),
-            _resolve_plot_style(cfg),
-            "",
-            f"02_{model_name}_dlift_xgb_vs_resn.png",
-        )
-        finalize_figure(fig, save_path=save_path, show=False, style=style)
+        double_lift_root = _resolve_double_lift_dir(model_name=model_name)
+        save_path = (
+            double_lift_root
+            / (
+                f"02_{model_name}_dlift_xgb_vs_resn_"
+                f"{_safe_tag(cfg_path.stem)}_"
+                f"xgb_{_safe_tag(xgb_cfg_path.stem)}_"
+                f"resn_{_safe_tag(resn_cfg_path.stem)}.png"
+            )
+        ).resolve()
+        finalize_figure(fig, save_path=str(save_path), show=False, style=style)
 
     _log("Plots saved under:")
     for key in model_keys:
@@ -523,10 +667,17 @@ def run_plot_direct(
     resn_cfg = json.loads(resn_cfg_path.read_text(encoding="utf-8"))
 
     model_name = f"{cfg['model_list'][0]}_{cfg['model_categories'][0]}"
+    cfg_data_dir = str(cfg.get("data_dir", "") or "").strip()
+    xgb_data_dir = str(xgb_cfg.get("data_dir", "") or "").strip()
+    if cfg_data_dir and xgb_data_dir and cfg_data_dir != xgb_data_dir:
+        _log(
+            f"[Info] plot_direct data_dir override: cfg={cfg_data_dir!r} -> "
+            f"xgb_cfg={xgb_data_dir!r}"
+        )
     train_raw, test_raw, _raw, _ = load_raw_splits(
         split_cfg=cfg,
-        data_cfg=cfg,
-        data_cfg_path=cfg_path,
+        data_cfg=xgb_cfg,
+        data_cfg_path=xgb_cfg_path,
         model_name=model_name,
         train_data_path=train_data_path,
         test_data_path=test_data_path,
@@ -555,8 +706,8 @@ def run_plot_direct(
         model_name=model_name,
         train_raw=train_raw,
         test_raw=test_raw,
-        train_df=train_raw.copy(),
-        test_df=test_raw.copy(),
+        train_df=train_raw,
+        test_df=test_raw,
         oneway_features=feature_list,
         oneway_categorical=set(categorical_features),
         xgb_model_path=xgb_model_path,

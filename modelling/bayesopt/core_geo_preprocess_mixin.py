@@ -30,14 +30,87 @@ class BayesOptGeoPreprocessMixin:
             path = Path(self.output_manager.result_dir) / path
         return path
 
+    def _bundle_required_raw_columns(self) -> List[str]:
+        cols: List[str] = [self.resp_nme, self.weight_nme]
+        binary_col = getattr(self, "binary_resp_nme", None)
+        if isinstance(binary_col, str) and binary_col.strip():
+            cols.append(binary_col)
+        for attr in ("cv_group_col", "cv_time_col"):
+            col = getattr(self.config, attr, None)
+            if isinstance(col, str) and col.strip():
+                cols.append(col)
+        region_cfg = getattr(self.config, "region", None)
+        for attr in ("province_col", "city_col"):
+            col = getattr(region_cfg, attr, None)
+            if isinstance(col, str) and col.strip():
+                cols.append(col)
+        geo_cfg = getattr(self.config, "geo_token", None)
+        for col in list(getattr(geo_cfg, "feature_nmes", None) or []):
+            if isinstance(col, str) and col.strip():
+                cols.append(col)
+        deduped: List[str] = []
+        seen = set()
+        for col in cols:
+            if col in seen:
+                continue
+            seen.add(col)
+            deduped.append(col)
+        return deduped
+
+    @staticmethod
+    def _minimal_raw_frame(
+        frame: pd.DataFrame,
+        *,
+        columns: List[str],
+    ) -> pd.DataFrame:
+        selected = [col for col in columns if col in frame.columns]
+        if not selected:
+            return pd.DataFrame(index=frame.index)
+        return frame.reindex(columns=selected, copy=False)
+
+    def _rebuild_minimal_raw_from_scaled(
+        self,
+        *,
+        train_scaled: Any,
+        test_scaled: Any,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if not isinstance(train_scaled, pd.DataFrame) or not isinstance(test_scaled, pd.DataFrame):
+            raise TypeError(
+                "Cannot rebuild raw view: train_oht_scl_data/test_oht_scl_data "
+                "must both be pandas.DataFrame."
+            )
+        required_cols = self._bundle_required_raw_columns()
+        train_raw = pd.DataFrame(index=train_scaled.index)
+        test_raw = pd.DataFrame(index=test_scaled.index)
+        for col in required_cols:
+            if col in train_scaled.columns:
+                train_raw[col] = train_scaled[col]
+            else:
+                train_raw[col] = np.nan
+            if col in test_scaled.columns:
+                test_raw[col] = test_scaled[col]
+            else:
+                test_raw[col] = np.nan
+        return train_raw, test_raw
+
     def _save_preprocess_bundle(self, target: Path) -> None:
+        include_full_raw = bool(getattr(self.config, "preprocess_bundle_include_raw", True))
+        keep_unscaled_oht = bool(getattr(self.config, "keep_unscaled_oht", False))
+        if include_full_raw:
+            train_raw = self.train_data
+            test_raw = self.test_data
+        else:
+            required_cols = self._bundle_required_raw_columns()
+            train_raw = self._minimal_raw_frame(self.train_data, columns=required_cols)
+            test_raw = self._minimal_raw_frame(
+                self.test_data,
+                columns=list(train_raw.columns),
+            )
         payload = {
             "schema_version": 1,
             "model_nme": self.model_nme,
-            "train_data": self.train_data,
-            "test_data": self.test_data,
-            "train_oht_data": self.train_oht_data,
-            "test_oht_data": self.test_oht_data,
+            "train_data": train_raw,
+            "test_data": test_raw,
             "train_oht_scl_data": self.train_oht_scl_data,
             "test_oht_scl_data": self.test_oht_scl_data,
             "var_nmes": list(self.var_nmes),
@@ -46,11 +119,22 @@ class BayesOptGeoPreprocessMixin:
             "numeric_scalers": dict(self.numeric_scalers),
             "ohe_feature_names": list(getattr(self, "ohe_feature_names", []) or []),
             "oht_sparse_csr": bool(getattr(self, "oht_sparse_csr", False)),
+            "preprocess_bundle_include_raw": include_full_raw,
+            "raw_columns": list(train_raw.columns),
         }
+        if keep_unscaled_oht:
+            payload["train_oht_data"] = self.train_oht_data
+            payload["test_oht_data"] = self.test_oht_data
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as fh:
             pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
-        _log(f"[PreprocessBundle] Saved: {target}", flush=True)
+        _log(
+            "[PreprocessBundle] Saved: "
+            f"{target} (include_full_raw={include_full_raw}, "
+            f"raw_cols={len(payload.get('raw_columns', []))}, "
+            f"keep_unscaled_oht={keep_unscaled_oht})",
+            flush=True,
+        )
 
     def _load_preprocess_bundle(self, source: Path) -> None:
         if not source.exists():
@@ -64,8 +148,6 @@ class BayesOptGeoPreprocessMixin:
                 f"Invalid preprocess bundle payload type: {type(payload).__name__}"
             )
         required_keys = [
-            "train_data",
-            "test_data",
             "train_oht_scl_data",
             "test_oht_scl_data",
             "var_nmes",
@@ -78,8 +160,19 @@ class BayesOptGeoPreprocessMixin:
             raise KeyError(
                 f"Preprocess bundle missing keys: {missing}"
             )
-        self.train_data = payload["train_data"]
-        self.test_data = payload["test_data"]
+        train_raw = payload.get("train_data")
+        test_raw = payload.get("test_data")
+        if train_raw is None or test_raw is None:
+            train_raw, test_raw = self._rebuild_minimal_raw_from_scaled(
+                train_scaled=payload["train_oht_scl_data"],
+                test_scaled=payload["test_oht_scl_data"],
+            )
+        if not isinstance(train_raw, pd.DataFrame) or not isinstance(test_raw, pd.DataFrame):
+            raise TypeError(
+                "Preprocess bundle train_data/test_data must be pandas.DataFrame."
+            )
+        self.train_data = train_raw
+        self.test_data = test_raw
         self.train_oht_data = payload.get("train_oht_data")
         self.test_oht_data = payload.get("test_oht_data")
         self.train_oht_scl_data = payload["train_oht_scl_data"]
@@ -90,7 +183,11 @@ class BayesOptGeoPreprocessMixin:
         self.numeric_scalers = dict(payload["numeric_scalers"])
         self.ohe_feature_names = list(payload.get("ohe_feature_names", []) or [])
         self.oht_sparse_csr = bool(payload.get("oht_sparse_csr", False))
-        _log(f"[PreprocessBundle] Loaded: {source}", flush=True)
+        _log(
+            "[PreprocessBundle] Loaded: "
+            f"{source} (raw_cols={len(self.train_data.columns)})",
+            flush=True,
+        )
 
     def default_tweedie_power(self, obj: Optional[str] = None) -> Optional[float]:
         if self.task_type == "classification":

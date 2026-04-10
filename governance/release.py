@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,7 @@ class DeploymentState:
 
 class ReleaseManager:
     """Environment release manager with rollback support."""
+    _ENV_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
     def __init__(
         self,
@@ -53,8 +56,11 @@ class ReleaseManager:
     def _load_json(path: Path, *, default: dict) -> dict:
         if not path.exists():
             return dict(default)
-        with path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise GovernanceError(f"Invalid JSON content in state file: {path}") from exc
         if not isinstance(payload, dict):
             return dict(default)
         merged = dict(default)
@@ -63,8 +69,11 @@ class ReleaseManager:
 
     @staticmethod
     def _save_json(path: Path, payload: dict) -> None:
-        with path.open("w", encoding="utf-8") as fh:
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, ensure_ascii=True)
+            fh.flush()
+        tmp_path.replace(path)
 
     def _load_release_manifest(self) -> dict:
         payload = self._load_json(self._release_manifest_path, default={"releases": {}, "production": {}})
@@ -94,8 +103,47 @@ class ReleaseManager:
         payload.setdefault("production", {})[model_name] = release_id
         return target
 
+    @classmethod
+    def _validate_env(cls, env: str) -> str:
+        normalized = str(env).strip()
+        if not cls._ENV_PATTERN.fullmatch(normalized):
+            raise GovernanceError(
+                f"Invalid environment name '{env}'. "
+                "Use letters, digits, '_' or '-' only."
+            )
+        return normalized
+
+    @staticmethod
+    def _clone_state(state: DeploymentState) -> DeploymentState:
+        active = None
+        if state.active is not None:
+            active = ModelRef(
+                name=state.active.name,
+                version=state.active.version,
+                activated_at=state.active.activated_at,
+                actor=state.active.actor,
+                note=state.active.note,
+            )
+        history = [
+            ModelRef(
+                name=item.name,
+                version=item.version,
+                activated_at=item.activated_at,
+                actor=item.actor,
+                note=item.note,
+            )
+            for item in state.history
+        ]
+        return DeploymentState(
+            env=state.env,
+            active=active,
+            history=history,
+            updated_at=state.updated_at,
+        )
+
     def _state_path(self, env: str) -> Path:
-        return self.state_dir / f"{env}.json"
+        safe_env = self._validate_env(env)
+        return self.state_dir / f"{safe_env}.json"
 
     def _load(self, env: str) -> DeploymentState:
         path = self._state_path(env)
@@ -138,6 +186,7 @@ class ReleaseManager:
         registry_status: str = "production",
     ) -> DeploymentState:
         state = self._load(env)
+        previous_state = self._clone_state(state)
         if state.active and state.active.name == name and state.active.version == version:
             return state
 
@@ -156,7 +205,13 @@ class ReleaseManager:
         self._save(state)
 
         if self.registry and update_registry_status:
-            self.registry.promote(name, version, new_status=registry_status)
+            try:
+                self.registry.promote(name, version, new_status=registry_status)
+            except Exception as exc:
+                self._save(previous_state)
+                raise GovernanceError(
+                    f"Registry promote failed for {name}:{version}; deployment state reverted."
+                ) from exc
 
         if self.audit_logger:
             self.audit_logger.log(
@@ -178,6 +233,7 @@ class ReleaseManager:
         registry_status: str = "production",
     ) -> DeploymentState:
         state = self._load(env)
+        previous_state = self._clone_state(state)
         if not state.history:
             raise ValueError("No history available to rollback.")
 
@@ -194,7 +250,13 @@ class ReleaseManager:
         self._save(state)
 
         if self.registry and update_registry_status:
-            self.registry.promote(previous.name, previous.version, new_status=registry_status)
+            try:
+                self.registry.promote(previous.name, previous.version, new_status=registry_status)
+            except Exception as exc:
+                self._save(previous_state)
+                raise GovernanceError(
+                    f"Registry promote failed for {previous.name}:{previous.version}; rollback state reverted."
+                ) from exc
 
         if self.audit_logger:
             self.audit_logger.log(
@@ -207,7 +269,7 @@ class ReleaseManager:
         return state
 
     # ---------------------------------------------------------------------
-    # Legacy release API compatibility (tests/governance/test_release.py)
+    # Compatibility API (tests/governance/test_release.py)
     # ---------------------------------------------------------------------
     def create_release(
         self,
@@ -242,15 +304,19 @@ class ReleaseManager:
         return dict(info)
 
     def promote_to_production(self, release_id: str) -> None:
-        payload = self._load_release_manifest()
+        payload_before = self._load_release_manifest()
+        payload = copy.deepcopy(payload_before)
         target = self._set_production_release(payload, release_id=release_id)
         self._save_release_manifest(payload)
 
         if self.registry is not None:
             try:
                 self.registry.promote(str(target["model_name"]), str(target["version"]), new_status="production")
-            except Exception:
-                pass
+            except Exception as exc:
+                self._save_release_manifest(payload_before)
+                raise GovernanceError(
+                    f"Registry promote failed for release '{release_id}'; manifest reverted."
+                ) from exc
         if self.audit_logger is not None:
             self.audit_logger.log(
                 "release_promoted",

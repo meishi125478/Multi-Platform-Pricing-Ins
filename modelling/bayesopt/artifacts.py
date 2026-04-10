@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -36,6 +35,30 @@ def best_params_csv_path(
     return Path(result_dir) / best_params_filename(model_name, trainer_label)
 
 
+def extract_best_params_from_snapshot(payload: Any) -> Optional[Dict[str, Any]]:
+    """Extract best params from a version snapshot payload.
+
+    Supports both direct `best_params` snapshots and `best_params_payload.values`
+    layout.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    direct = payload.get("best_params")
+    if isinstance(direct, dict) and direct:
+        return dict(direct)
+
+    payload_block = payload.get("best_params_payload")
+    if not isinstance(payload_block, dict):
+        return None
+
+    for key in ("values", "best_params", "params", "best_params_values"):
+        nested = payload_block.get(key)
+        if isinstance(nested, dict) and nested:
+            return dict(nested)
+    return None
+
+
 def load_best_params_csv(
     result_dir: str | Path,
     model_name: str,
@@ -57,20 +80,18 @@ def load_best_params(
     model_key: str,
 ) -> Optional[Dict[str, Any]]:
     output_path = Path(output_dir)
-    versions_dir = output_path / "Results" / "versions"
-    if versions_dir.exists():
-        candidates = sorted(versions_dir.glob(f"*_{model_key}_best.json"))
-        if candidates:
-            payload = json.loads(candidates[-1].read_text(encoding="utf-8"))
-            params = payload.get("best_params") if isinstance(payload, dict) else None
-            if isinstance(params, dict) and params:
-                return params
+    trainer_label = trainer_label_from_model_key(model_key)
+    labels = (trainer_label,)
+    for label in labels:
+        params = load_best_params_csv(
+            output_path / "Results",
+            model_name,
+            label,
+        )
+        if params is not None:
+            return params
 
-    return load_best_params_csv(
-        output_path / "Results",
-        model_name,
-        trainer_label_from_model_key(model_key),
-    )
+    return None
 
 
 __all__ = [
@@ -79,7 +100,7 @@ __all__ = [
     "trainer_label_from_model_key",
     "best_params_filename",
     "best_params_csv_path",
+    "extract_best_params_from_snapshot",
     "load_best_params_csv",
     "load_best_params",
 ]
-

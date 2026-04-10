@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, TYPE_CHECKING
@@ -14,10 +15,10 @@ except Exception as exc:  # pragma: no cover - optional dependency
     sm = None  # type: ignore[assignment]
     _SM_IMPORT_ERROR = exc
 
-from ins_pricing.exceptions import ModelLoadError
 from ins_pricing.modelling.bayesopt.artifacts import (
     load_best_params as load_best_params_artifacts,
 )
+from ins_pricing.exceptions import ModelLoadError
 from ins_pricing.modelling.bayesopt.checkpoints import (
     rebuild_ft_model_from_payload,
     rebuild_gnn_model_from_payload,
@@ -41,7 +42,6 @@ from ins_pricing.utils.model_loading import (
 from ins_pricing.utils import get_logger, load_dataset
 
 _logger = get_logger("ins_pricing.production.inference")
-_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 if TYPE_CHECKING:
@@ -65,6 +65,7 @@ MODEL_PREFIX = {
 }
 
 OHT_MODELS = {"resn", "gnn", "glm"}
+_TRUTHY = {"1", "true", "yes", "y", "on"}
 
 
 class Predictor:
@@ -199,24 +200,16 @@ def _load_pickle_with_optional_unsafe_retry(
 ) -> Any:
     try:
         return load_pickle_artifact(model_path)
-    except ModelLoadError as exc:
-        message = str(exc)
-        can_retry = (
-            allow_unsafe_retry
-            and model_key in {"xgb", "glm"}
-            and "Blocked unsafe pickle artifact" in message
-            and "INS_PRICING_ALLOW_UNSAFE_MODEL_LOAD" in message
-        )
-        if not can_retry:
+    except ModelLoadError:
+        if not allow_unsafe_retry or model_key not in {"xgb", "glm"}:
             raise
         _logger.warning(
             "Retrying %s model load with unsafe pickle enabled for trusted artifact: %s",
             model_key,
             model_path,
         )
-        return load_pickle_artifact(model_path, allow_unsafe=True)
-
-
+        with model_path.open("rb") as fh:
+            return pickle.load(fh)
 
 
 def _model_file_path(output_dir: Path, model_name: str, model_key: str) -> Path:
@@ -227,28 +220,75 @@ def _model_file_path(output_dir: Path, model_name: str, model_key: str) -> Path:
     return output_dir / "model" / f"01_{model_name}_{prefix}.{ext}"
 
 
+def _resolve_model_file_path(
+    output_dir: Path,
+    model_name: str,
+    model_key: str,
+) -> Path:
+    return _model_file_path(output_dir, model_name, model_key)
+
+
+def _load_from_path(
+    model_path: Path,
+    *,
+    model_key: str,
+    model_name: str,
+    description: str,
+    loader: Callable[[Path], Any],
+) -> Any:
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model file not found for {model_key}/{model_name}: {model_path}"
+        )
+    try:
+        return loader(model_path)
+    except Exception as exc:
+        _logger.warning(
+            "Failed to load %s for model_key=%s model_name=%s from %s; "
+            "error=%s",
+            description,
+            model_key,
+            model_name,
+            model_path,
+            exc,
+        )
+        raise
+
+
 def _load_preprocess_from_model_file(
     output_dir: Path,
     model_name: str,
     model_key: str,
     *,
-    allow_unsafe_retry: bool = False,
+    cfg: Optional[Dict[str, Any]] = None,
+    allow_unsafe_retry: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
-    model_path = _model_file_path(output_dir, model_name, model_key)
+    allow_unsafe = _allow_unsafe_model_load(cfg, override=allow_unsafe_retry)
+    model_path = _resolve_model_file_path(output_dir, model_name, model_key)
     if not model_path.exists():
         return None
     if model_key in {"xgb", "glm"}:
-        payload = _load_pickle_with_optional_unsafe_retry(
+        loader = lambda model_path: _load_pickle_with_optional_unsafe_retry(
             model_path,
             model_key=model_key,
-            allow_unsafe_retry=allow_unsafe_retry,
+            allow_unsafe_retry=allow_unsafe,
         )
     else:
-        payload = load_torch_payload(
+        loader = lambda model_path: load_torch_payload(
             model_path,
             map_location="cpu",
             weights_only=True,
         )
+    try:
+        payload = _load_from_path(
+            model_path,
+            model_key=model_key,
+            model_name=model_name,
+            description="preprocess artifacts",
+            loader=loader,
+        )
+    except FileNotFoundError:
+        return None
     if isinstance(payload, dict):
         return payload.get("preprocess_artifacts")
     return None
@@ -385,29 +425,42 @@ def load_saved_model(
     device: Optional[Any] = None,
     allow_unsafe_model_load: Optional[bool] = None,
 ) -> Any:
-    model_path = _model_file_path(Path(output_dir), model_name, model_key)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
     allow_unsafe_retry = _allow_unsafe_model_load(
         cfg,
         override=allow_unsafe_model_load,
     )
-
+    model_path = _resolve_model_file_path(
+        Path(output_dir),
+        model_name,
+        model_key,
+    )
     if model_key in {"xgb", "glm"}:
-        payload = _load_pickle_with_optional_unsafe_retry(
+        payload = _load_from_path(
             model_path,
             model_key=model_key,
-            allow_unsafe_retry=allow_unsafe_retry,
+            model_name=model_name,
+            description="model artifact",
+            loader=lambda model_path: _load_pickle_with_optional_unsafe_retry(
+                model_path,
+                model_key=model_key,
+                allow_unsafe_retry=allow_unsafe_retry,
+            ),
         )
         if isinstance(payload, dict) and "model" in payload:
             return payload.get("model")
         return payload
 
     if model_key == "ft":
-        payload = load_torch_payload(
+        payload = _load_from_path(
             model_path,
-            map_location="cpu",
-            weights_only=True,
+            model_key=model_key,
+            model_name=model_name,
+            description="model artifact",
+            loader=lambda model_path: load_torch_payload(
+                model_path,
+                map_location="cpu",
+                weights_only=True,
+            ),
         )
         return _load_ft_model_from_payload(
             payload=payload,
@@ -420,59 +473,80 @@ def load_saved_model(
     if model_key == "resn":
         if input_dim is None:
             raise ValueError("input_dim is required for ResNet loading")
-        payload = load_torch_payload(
-            model_path,
-            map_location="cpu",
-            weights_only=True,
-        )
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
         params_fallback = load_best_params(output_dir, model_name, model_key)
-        model, _resolved_params = rebuild_resn_model_from_payload(
-            payload=payload,
-            model_builder=lambda p: _build_resn_model(
-                model_name=model_name,
-                input_dim=input_dim,
-                task_type=task_type,
-                epochs=int(cfg.get("epochs", 50)),
-                resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
-                loss_name=loss_name,
-                distribution=cfg.get("distribution"),
-                params=p,
-            ),
-            params_fallback=params_fallback,
-        )
-        _move_to_device(model, device=device)
-        return model
 
-    if model_key == "gnn":
-        if input_dim is None:
-            raise ValueError("input_dim is required for GNN loading")
-        payload = load_torch_payload(
-            model_path,
-            map_location="cpu",
-            weights_only=True,
-        )
-        loss_name = _resolve_loss_name(cfg, model_name, task_type)
-        try:
-            model, _params, _warning = rebuild_gnn_model_from_payload(
+        def _load_resn(model_path: Path) -> Any:
+            payload = load_torch_payload(
+                model_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            model, _resolved_params = rebuild_resn_model_from_payload(
                 payload=payload,
-                model_builder=lambda p: _build_gnn_model(
+                model_builder=lambda p: _build_resn_model(
                     model_name=model_name,
                     input_dim=input_dim,
                     task_type=task_type,
                     epochs=int(cfg.get("epochs", 50)),
-                    cfg=cfg,
+                    resn_weight_decay=float(cfg.get("resn_weight_decay", 1e-4)),
                     loss_name=loss_name,
                     distribution=cfg.get("distribution"),
                     params=p,
                 ),
-                strict=False,
-                allow_non_strict_fallback=False,
+                params_fallback=params_fallback,
+                require_params=False,
             )
-        except ValueError as exc:
-            raise ValueError(f"Invalid GNN checkpoint: {model_path}") from exc
-        _move_to_device(model, device=device)
-        return model
+            _move_to_device(model, device=device)
+            return model
+
+        return _load_from_path(
+            model_path,
+            model_key=model_key,
+            model_name=model_name,
+            description="model artifact",
+            loader=_load_resn,
+        )
+
+    if model_key == "gnn":
+        if input_dim is None:
+            raise ValueError("input_dim is required for GNN loading")
+        loss_name = _resolve_loss_name(cfg, model_name, task_type)
+
+        def _load_gnn(model_path: Path) -> Any:
+            payload = load_torch_payload(
+                model_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            try:
+                model, _params, _warning = rebuild_gnn_model_from_payload(
+                    payload=payload,
+                    model_builder=lambda p: _build_gnn_model(
+                        model_name=model_name,
+                        input_dim=input_dim,
+                        task_type=task_type,
+                        epochs=int(cfg.get("epochs", 50)),
+                        cfg=cfg,
+                        loss_name=loss_name,
+                        distribution=cfg.get("distribution"),
+                        params=p,
+                    ),
+                    strict=False,
+                    allow_non_strict_fallback=False,
+                )
+            except ValueError as exc:
+                raise ValueError(f"Invalid GNN checkpoint: {model_path}") from exc
+            _move_to_device(model, device=device)
+            return model
+
+        return _load_from_path(
+            model_path,
+            model_key=model_key,
+            model_name=model_name,
+            description="model artifact",
+            loader=_load_gnn,
+        )
 
     raise ValueError(f"Unsupported model key: {model_key}")
 
@@ -521,7 +595,20 @@ def _predict_with_model(
 ) -> np.ndarray:
     if model_key == "xgb":
         if task_type == "classification" and hasattr(model, "predict_proba"):
-            return model.predict_proba(features)[:, 1]
+            proba = np.asarray(model.predict_proba(features))
+            if proba.ndim == 1:
+                return proba
+            if proba.ndim != 2:
+                raise ValueError(f"Unexpected predict_proba output shape: {proba.shape}")
+            if proba.shape[1] == 1:
+                return proba[:, 0]
+            classes = getattr(model, "classes_", None)
+            if classes is not None:
+                classes_arr = np.asarray(classes)
+                matches = np.where(classes_arr == 1)[0]
+                if matches.size > 0:
+                    return proba[:, int(matches[0])]
+            return proba[:, -1]
         return model.predict(features)
 
     if model_key == "glm":
@@ -710,6 +797,7 @@ def predict_from_config(
     chunksize: Optional[int] = None,
     parallel_load: bool = False,
     n_jobs: int = -1,
+    return_full_result: bool = True,
     device: Optional[Any] = None,
     registry: Optional[PredictorRegistry] = None,
 ) -> pd.DataFrame:
@@ -726,6 +814,8 @@ def predict_from_config(
         chunksize: Optional chunk size for CSV reading
         parallel_load: If True, load models in parallel (faster for multiple models)
         n_jobs: Number of parallel jobs for model loading (-1 = all cores)
+        return_full_result: Keep full prediction DataFrame in memory and return it.
+            Set False to stream chunked CSV output with lower memory usage.
         device: Optional torch device or string override (e.g., "cuda", "mps", "cpu")
         registry: Optional predictor registry override
 
@@ -785,12 +875,41 @@ def predict_from_config(
     if isinstance(data_obj, pd.DataFrame):
         result = _score_frame(data_obj)
     else:
-        chunks: List[pd.DataFrame] = []
-        for chunk in data_obj:
-            chunks.append(_score_frame(chunk))
-        result = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        if not return_full_result and output_path is None:
+            raise ValueError(
+                "output_path is required when return_full_result=False for chunked input."
+            )
+        chunk_results: List[pd.DataFrame] = []
+        stream_written = False
+        stream_header = True
+        stream_path = Path(output_path) if output_path else None
+        if stream_path is not None and not return_full_result:
+            suffix = stream_path.suffix.lower()
+            if suffix not in {"", ".csv"}:
+                raise ValueError(
+                    "Streaming chunked output without full in-memory result only supports CSV output."
+                )
+            stream_path.parent.mkdir(parents=True, exist_ok=True)
+            if stream_path.exists():
+                stream_path.unlink()
 
-    if output_path:
+        for chunk in data_obj:
+            scored_chunk = _score_frame(chunk)
+            if stream_path is not None and not return_full_result:
+                scored_chunk.to_csv(stream_path, mode="a", index=False, header=stream_header)
+                stream_header = False
+                stream_written = True
+            else:
+                chunk_results.append(scored_chunk)
+
+        if return_full_result:
+            result = pd.concat(chunk_results, ignore_index=True) if chunk_results else pd.DataFrame()
+        elif stream_written:
+            result = pd.DataFrame()
+        else:
+            result = pd.DataFrame()
+
+    if output_path and (return_full_result or isinstance(data_obj, pd.DataFrame)):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         suffix = output_path.suffix.lower()

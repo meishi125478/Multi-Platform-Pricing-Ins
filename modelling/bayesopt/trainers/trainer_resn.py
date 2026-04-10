@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
+import pandas as pd
 import torch
 from sklearn.metrics import log_loss
 
@@ -33,6 +34,10 @@ class ResNetTrainer(TrainerBase):
             getattr(dist_cfg, "use_resn_ddp", False) and context.use_gpu
         )
         self._param_probe_model: Optional[ResNetSklearn] = None
+        self._resn_tweedie_space_warned = False
+        self._raw_design_cache: Optional[Dict[str, Any]] = None
+        self._raw_fallback_logged = False
+        self._raw_encoded_cols_logged = False
 
     def _dist_cfg(self):
         return getattr(self.ctx.config, "distributed", self.ctx.config)
@@ -51,6 +56,148 @@ class ResNetTrainer(TrainerBase):
         if data is not None and getattr(self.ctx, "var_nmes", None):
             return int(data[self.ctx.var_nmes].shape[1])
         return int(len(self.ctx.var_nmes or []))
+
+    def _coerce_raw_feature_frames(
+        self,
+        X_train_raw: pd.DataFrame,
+        X_test_raw: Optional[pd.DataFrame] = None,
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[str]]:
+        """Coerce raw feature frames into float32 matrices for ResNet fallback.
+
+        When build_oht=false, ResNet can still consume raw features as long as
+        all columns are numeric. Non-numeric columns are ordinal-encoded with a
+        train-derived mapping and unknown test categories mapped to -1.
+        """
+        train_cols: List[pd.Series] = []
+        test_cols: Optional[List[pd.Series]] = [] if X_test_raw is not None else None
+        encoded_cols: List[str] = []
+
+        for col in X_train_raw.columns:
+            tr_col = X_train_raw[col]
+            te_col = X_test_raw[col] if X_test_raw is not None else None
+
+            if pd.api.types.is_numeric_dtype(tr_col) or pd.api.types.is_bool_dtype(tr_col):
+                train_cols.append(
+                    pd.to_numeric(tr_col, errors="coerce").astype(np.float32, copy=False).rename(col)
+                )
+                if test_cols is not None:
+                    test_cols.append(
+                        pd.to_numeric(te_col, errors="coerce").astype(np.float32, copy=False).rename(col)
+                    )
+                continue
+
+            encoded_cols.append(str(col))
+            train_norm = tr_col.astype("object").where(tr_col.notna(), "<NA>")
+            categories = pd.Index(pd.unique(train_norm))
+            mapping = {val: float(i) for i, val in enumerate(categories)}
+            train_cols.append(train_norm.map(mapping).astype(np.float32, copy=False).rename(col))
+            if test_cols is not None:
+                test_norm = te_col.astype("object").where(te_col.notna(), "<NA>")
+                test_cols.append(
+                    test_norm.map(mapping).fillna(-1.0).astype(np.float32, copy=False).rename(col)
+                )
+
+        train_out = (
+            pd.concat(train_cols, axis=1)
+            if train_cols
+            else pd.DataFrame(index=X_train_raw.index)
+        )
+        test_out = (
+            pd.concat(test_cols, axis=1)
+            if test_cols is not None and test_cols
+            else (pd.DataFrame(index=X_test_raw.index) if X_test_raw is not None else None)
+        )
+
+        return train_out, test_out, encoded_cols
+
+    def _resolve_raw_design_matrices(
+        self,
+        *,
+        require_test: bool,
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        feature_cols = list(getattr(self.ctx, "factor_nmes", []) or [])
+        if not feature_cols:
+            raise RuntimeError(
+                "ResNet raw fallback requires non-empty factor_nmes when build_oht=false."
+            )
+        signature = (tuple(feature_cols), bool(require_test))
+        cached = self._raw_design_cache or {}
+        if (
+            cached.get("signature") == signature
+            and cached.get("X_train") is not None
+            and (not require_test or cached.get("X_test") is not None)
+        ):
+            return cached["X_train"], cached.get("X_test")
+
+        train_raw = self.ctx.train_data[feature_cols]
+        test_raw = self.ctx.test_data[feature_cols] if require_test else None
+        if require_test and test_raw is None:
+            raise RuntimeError("ResNet raw fallback requires test_data for prediction.")
+
+        X_train, X_test, encoded_cols = self._coerce_raw_feature_frames(train_raw, test_raw)
+        self._raw_design_cache = {
+            "signature": signature,
+            "X_train": X_train,
+            "X_test": X_test,
+        }
+
+        if not self._raw_fallback_logged:
+            _log(
+                "[ResNet] build_oht=false fallback: using raw feature matrix (float32) "
+                "instead of one-hot inputs.",
+                flush=True,
+            )
+            self._raw_fallback_logged = True
+        if encoded_cols and not self._raw_encoded_cols_logged:
+            preview = ", ".join(encoded_cols[:8])
+            suffix = "..." if len(encoded_cols) > 8 else ""
+            _log(
+                "[ResNet] Encoded non-numeric raw columns for fallback: "
+                f"{preview}{suffix}",
+                flush=True,
+            )
+            self._raw_encoded_cols_logged = True
+
+        return X_train, X_test
+
+    def _uses_tweedie_power(self) -> bool:
+        loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+        task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+        return task_type == "regression" and loss_name == "tweedie"
+
+    def _drop_tw_power_if_unused(
+        self,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out = dict(params or {})
+        if "tw_power" not in out:
+            return out
+        if self._uses_tweedie_power():
+            return out
+        out.pop("tw_power", None)
+        return out
+
+    def _filter_search_space_for_distribution(
+        self,
+        search_space: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        filtered = dict(search_space or {})
+        if "tw_power" not in filtered:
+            return filtered
+        if self._uses_tweedie_power():
+            return filtered
+
+        filtered.pop("tw_power", None)
+        if not self._resn_tweedie_space_warned:
+            loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+            task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+            _log(
+                "[ResNet] Ignoring resn_search_space.tw_power "
+                f"because resolved loss_name='{loss_name}' (task_type='{task_type}').",
+                flush=True,
+            )
+            self._resn_tweedie_space_warned = True
+        return filtered
 
     def _build_model(self, params: Optional[Dict[str, Any]] = None) -> ResNetSklearn:
         params = params or {}
@@ -123,6 +270,7 @@ class ResNetTrainer(TrainerBase):
         *,
         context: str = "best_params",
     ) -> Dict[str, Any]:
+        params = self._drop_tw_power_if_unused(params)
         probe = self._param_probe_model
         if probe is None:
             probe = self._build_model({})
@@ -223,8 +371,14 @@ class ResNetTrainer(TrainerBase):
 
         def data_provider():
             data = self.ctx.train_oht_data if self.ctx.train_oht_data is not None else self.ctx.train_oht_scl_data
-            assert data is not None, "Preprocessed training data is missing."
-            return data[self.ctx.var_nmes], data[self.ctx.resp_nme], data[self.ctx.weight_nme]
+            if data is not None:
+                return data[self.ctx.var_nmes], data[self.ctx.resp_nme], data[self.ctx.weight_nme]
+            X_train_raw, _ = self._resolve_raw_design_matrices(require_test=False)
+            return (
+                X_train_raw,
+                self.ctx.train_data[self.ctx.resp_nme],
+                self.ctx.train_data[self.ctx.weight_nme],
+            )
 
         metric_ctx: Dict[str, Any] = {}
 
@@ -270,7 +424,9 @@ class ResNetTrainer(TrainerBase):
 
         sample_cap = data_provider()[0]
         max_rows_for_resnet_bo = min(100000, int(len(sample_cap)/5))
-        search_space = self._get_search_space_config("resn_search_space")
+        search_space = self._filter_search_space_for_distribution(
+            self._get_search_space_config("resn_search_space")
+        )
         param_space: Dict[str, Any] = {}
 
         param_space = self._augment_param_space_with_search_space(
@@ -298,14 +454,26 @@ class ResNetTrainer(TrainerBase):
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best ResNet parameters.")
 
-        params = dict(self.best_params)
+        params = self._sanitize_best_params(
+            dict(self.best_params),
+            context="ResNet final train params",
+        )
         use_refit = bool(getattr(self.ctx.config, "final_refit", True))
         data = self.ctx.train_oht_scl_data
-        if data is None:
-            raise RuntimeError("Missing standardized data for ResNet training.")
-        X_all = data[self.ctx.var_nmes]
-        y_all = data[self.ctx.resp_nme]
-        w_all = data[self.ctx.weight_nme]
+        use_oht = data is not None
+        design_fn = None
+        if use_oht:
+            X_all = data[self.ctx.var_nmes]
+            y_all = data[self.ctx.resp_nme]
+            w_all = data[self.ctx.weight_nme]
+        else:
+            X_all, X_test = self._resolve_raw_design_matrices(require_test=True)
+            y_all = self.ctx.train_data[self.ctx.resp_nme]
+            w_all = self.ctx.train_data[self.ctx.weight_nme]
+            design_fn = (
+                lambda train=False, _X_train=X_all, _X_test=X_test:
+                _X_train if train else _X_test
+            )
 
         refit_epochs = None
         split = self._resolve_train_val_indices(X_all)
@@ -341,7 +509,8 @@ class ResNetTrainer(TrainerBase):
             y_all,
             sample_weight=w_all,
             pred_prefix='resn',
-            use_oht=True,
+            use_oht=use_oht,
+            design_fn=design_fn,
             sample_weight_arg='w_train'
         )
 
@@ -351,14 +520,21 @@ class ResNetTrainer(TrainerBase):
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
             raise RuntimeError("Run tune() first to obtain best ResNet parameters.")
+        best_params = self._sanitize_best_params(
+            dict(self.best_params),
+            context="ResNet ensemble params",
+        )
         data = self.ctx.train_oht_scl_data
         test_data = self.ctx.test_oht_scl_data
-        if data is None or test_data is None:
-            raise RuntimeError("Missing standardized data for ResNet ensemble.")
-        X_all = data[self.ctx.var_nmes]
-        y_all = data[self.ctx.resp_nme]
-        w_all = data[self.ctx.weight_nme]
-        X_test = test_data[self.ctx.var_nmes]
+        if data is not None and test_data is not None:
+            X_all = data[self.ctx.var_nmes]
+            y_all = data[self.ctx.resp_nme]
+            w_all = data[self.ctx.weight_nme]
+            X_test = test_data[self.ctx.var_nmes]
+        else:
+            X_all, X_test = self._resolve_raw_design_matrices(require_test=True)
+            y_all = self.ctx.train_data[self.ctx.resp_nme]
+            w_all = self.ctx.train_data[self.ctx.weight_nme]
 
         k = max(2, int(k))
         n_samples = len(X_all)
@@ -374,7 +550,7 @@ class ResNetTrainer(TrainerBase):
 
         split_count = 0
         for train_idx, val_idx in split_iter:
-            model = self._build_model(self.best_params)
+            model = self._build_model(best_params)
             model.fit(
                 X_all.iloc[train_idx],
                 y_all.iloc[train_idx],

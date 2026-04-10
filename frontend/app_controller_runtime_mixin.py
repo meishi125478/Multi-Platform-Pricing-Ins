@@ -160,9 +160,19 @@ class AppControllerRuntimeMixin:
         if buffer.version != last_sent_version:
             yield buffer.text()
 
-    def run_workflow_config_ui(self, workflow_config_json: str) -> Generator[tuple[str, str], None, None]:
+    def _ensure_task_run_permission(self, actor: Optional[str]) -> None:
+        require_permission = getattr(self, "require_permission", None)
+        if callable(require_permission):
+            require_permission(actor, "task:run", allow_anonymous=actor is None)
+
+    def run_workflow_config_ui(
+        self,
+        workflow_config_json: str,
+        actor: Optional[str] = None,
+    ) -> Generator[tuple[str, str], None, None]:
         """Run plotting/prediction/compare/pre-oneway from workflow JSON config."""
         try:
+            self._ensure_task_run_permission(actor)
             if workflow_config_json:
                 workflow_config = json.loads(workflow_config_json)
                 base_dir = self._default_base_dir(self.current_workflow_config_dir)
@@ -192,7 +202,11 @@ class AppControllerRuntimeMixin:
             error_msg = f"Workflow config execution error: {str(e)}"
             yield error_msg, error_msg
 
-    def run_training(self, config_json: str) -> Generator[tuple[str, str], None, None]:
+    def run_training(
+        self,
+        config_json: str,
+        actor: Optional[str] = None,
+    ) -> Generator[tuple[str, str], None, None]:
         """
         Run task (training, explain, plotting, etc.) with the current configuration.
 
@@ -201,6 +215,7 @@ class AppControllerRuntimeMixin:
         """
         temp_config_path: Optional[Path] = None
         try:
+            self._ensure_task_run_permission(actor)
             _, task_mode, config_path, temp_config_path = self._resolve_training_config(
                 config_json
             )
@@ -274,57 +289,159 @@ class AppControllerRuntimeMixin:
                     Path.cwd(),
                 ),
             )
-
-            models = [m.strip() for m in target_models.split(',') if m.strip()]
-            data_dir_value = str(augmented_data_dir or "").strip() or "./DataFTUnsupervised"
-            xgb_overrides = self._parse_json_dict(
+            step1_cfg = json.loads(step1_path.read_text(encoding="utf-8"))
+            models = [m.strip().lower() for m in target_models.split(',') if m.strip()]
+            data_dir_value = str(augmented_data_dir or "").strip() or "./DataFTEmbed"
+            xgb_overrides_user = self._parse_json_dict(
                 xgb_overrides_json,
                 "xgb_overrides_json",
             )
-            resn_overrides = self._parse_json_dict(
+            resn_overrides_user = self._parse_json_dict(
                 resn_overrides_json,
                 "resn_overrides_json",
             )
-            xgb_cfg, resn_cfg = self.ft_workflow.generate_step2_configs(
-                step1_config_path=str(step1_path),
-                target_models=models,
-                augmented_data_dir=data_dir_value,
-                xgb_overrides=xgb_overrides,
-                resn_overrides=resn_overrides,
-            )
             save_dir = step1_path.parent
+            step2_cache_dir = (save_dir / "step2_cache").resolve()
+            step2_cache_dir.mkdir(parents=True, exist_ok=True)
+            step2_base_xgb_path = step2_cache_dir / "config_xgb_from_ft_embed.base.json"
+            step2_base_resn_path = step2_cache_dir / "config_resn_from_ft_embed.base.json"
+
+            need_xgb = "xgb" in models
+            need_resn = "resn" in models
+            missing_base = (
+                (need_xgb and not step2_base_xgb_path.exists())
+                or (need_resn and not step2_base_resn_path.exists())
+            )
+
+            status_lines = []
+            if missing_base:
+                xgb_base_cfg, resn_base_cfg = self.ft_workflow.generate_step2_configs(
+                    step1_config_path=str(step1_path),
+                    target_models=models,
+                    augmented_data_dir=data_dir_value,
+                    xgb_overrides=None,
+                    resn_overrides=None,
+                )
+                ft_prefix = str(step1_cfg.get("ft_feature_prefix", "ft_emb")).strip()
+                embed_prefixes = [f"pred_{ft_prefix}_", f"{ft_prefix}_", ft_prefix]
+                base_features = set(step1_cfg.get("feature_list") or [])
+                for model_key, model_cfg in (("xgb", xgb_base_cfg), ("resn", resn_base_cfg)):
+                    if model_cfg is None:
+                        continue
+                    features = [str(col) for col in (model_cfg.get("feature_list") or [])]
+                    embed_only = [
+                        col
+                        for col in features
+                        if any(col.startswith(prefix) for prefix in embed_prefixes if prefix)
+                    ]
+                    if not embed_only:
+                        embed_only = [col for col in features if col not in base_features]
+                    if not embed_only:
+                        raise ValueError(
+                            f"{model_key} base step-2 config has no detectable embedding features. "
+                            f"Checked prefixes={embed_prefixes}."
+                        )
+                    model_cfg["feature_list"] = embed_only
+                    model_cfg["categorical_features"] = []
+
+                if xgb_base_cfg is not None:
+                    step2_base_xgb_path.write_text(self._dump_json(xgb_base_cfg), encoding="utf-8")
+                if resn_base_cfg is not None:
+                    step2_base_resn_path.write_text(self._dump_json(resn_base_cfg), encoding="utf-8")
+                status_lines.append(
+                    f"Rebuilt Step2 base configs in: {step2_cache_dir}"
+                )
+            else:
+                status_lines.append(
+                    f"Using cached Step2 base configs in: {step2_cache_dir}"
+                )
+
+            def _xgb_direct_defaults() -> Dict[str, Any]:
+                return {
+                    "xgb_max_depth_max": 6,
+                    "xgb_n_estimators_max": 500,
+                    "xgb_search_space": {
+                        "learning_rate": {"type": "float", "low": 0.003, "high": 0.05, "log": True},
+                        "gamma": {"type": "float", "low": 0.5, "high": 20},
+                        "max_depth": {"type": "int", "low": 3, "high": 6, "step": 1},
+                        "n_estimators": {"type": "int", "low": 150, "high": 500, "step": 25},
+                        "min_child_weight": {"type": "int", "low": 5, "high": 200, "step": 5},
+                        "reg_alpha": {"type": "float", "low": 0.0001, "high": 5, "log": True},
+                        "reg_lambda": {"type": "float", "low": 1, "high": 50, "log": True},
+                        "tweedie_variance_power": {"type": "float", "low": 1.0, "high": 2.0},
+                        "subsample": {"type": "float", "low": 0.6, "high": 0.9},
+                        "colsample_bytree": {"type": "float", "low": 0.5, "high": 0.9},
+                    },
+                }
+
+            def _load_xgb_direct_sync(work_dir: Path, cfg_name: str) -> Dict[str, Any]:
+                defaults = _xgb_direct_defaults()
+                cfg_path = (work_dir / cfg_name).resolve()
+                if cfg_path.exists():
+                    cfg_obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    return {
+                        "xgb_max_depth_max": int(
+                            cfg_obj.get("xgb_max_depth_max", defaults["xgb_max_depth_max"])
+                        ),
+                        "xgb_n_estimators_max": int(
+                            cfg_obj.get("xgb_n_estimators_max", defaults["xgb_n_estimators_max"])
+                        ),
+                        "xgb_search_space": dict(
+                            cfg_obj.get("xgb_search_space") or defaults["xgb_search_space"]
+                        ),
+                    }
+                return {
+                    "xgb_max_depth_max": int(defaults["xgb_max_depth_max"]),
+                    "xgb_n_estimators_max": int(defaults["xgb_n_estimators_max"]),
+                    "xgb_search_space": dict(defaults["xgb_search_space"]),
+                }
+
+            xgb_direct_cfg_name = str(getattr(self, "xgb_direct_cfg_name", "config_xgb_direct.json"))
+            xgb_sync = _load_xgb_direct_sync(save_dir, xgb_direct_cfg_name)
+
+            xgb_cfg: Optional[Dict[str, Any]] = None
+            resn_cfg: Optional[Dict[str, Any]] = None
+            if need_xgb:
+                xgb_cfg = json.loads(step2_base_xgb_path.read_text(encoding="utf-8"))
+                xgb_sync_overrides: Dict[str, Any] = {
+                    "xgb_max_depth_max": xgb_sync["xgb_max_depth_max"],
+                    "xgb_n_estimators_max": xgb_sync["xgb_n_estimators_max"],
+                    "xgb_search_space": xgb_sync["xgb_search_space"],
+                }
+                self._deep_merge_dict(xgb_sync_overrides, xgb_overrides_user)
+                self._deep_merge_dict(xgb_cfg, xgb_sync_overrides)
+            if need_resn:
+                resn_cfg = json.loads(step2_base_resn_path.read_text(encoding="utf-8"))
+                self._deep_merge_dict(resn_cfg, resn_overrides_user)
+
             saved_paths: Dict[str, str] = {}
-
-            if xgb_cfg:
-                xgb_cfg_path = save_dir / "config_xgb_from_ft_unsupervised.json"
-                xgb_cfg_path.write_text(
-                    self._dump_json(xgb_cfg),
-                    encoding="utf-8",
-                )
+            if xgb_cfg is not None:
+                xgb_cfg_path = save_dir / "config_xgb_from_ft_embed.json"
+                xgb_cfg_path.write_text(self._dump_json(xgb_cfg), encoding="utf-8")
+                legacy_xgb_path = save_dir / "config_xgb_from_ft_unsupervised.json"
+                legacy_xgb_path.write_text(self._dump_json(xgb_cfg), encoding="utf-8")
                 saved_paths["xgb"] = str(xgb_cfg_path)
-
-            if resn_cfg:
-                resn_cfg_path = save_dir / "config_resn_from_ft_unsupervised.json"
-                resn_cfg_path.write_text(
-                    self._dump_json(resn_cfg),
-                    encoding="utf-8",
-                )
+            if resn_cfg is not None:
+                resn_cfg_path = save_dir / "config_resn_from_ft_embed.json"
+                resn_cfg_path.write_text(self._dump_json(resn_cfg), encoding="utf-8")
+                legacy_resn_path = save_dir / "config_resn_from_ft_unsupervised.json"
+                legacy_resn_path.write_text(self._dump_json(resn_cfg), encoding="utf-8")
                 saved_paths["resn"] = str(resn_cfg_path)
 
             self.current_step2_config_paths = saved_paths
-
-            status_lines = [
-                f"Step 2 configs prepared for: {', '.join(models)}",
-                f"Augmented data dir: {data_dir_value}",
-            ]
+            status_lines.extend(
+                [
+                    f"Step 2 configs prepared for: {', '.join(models)}",
+                    f"Augmented data dir: {data_dir_value}",
+                ]
+            )
             if "xgb" in saved_paths:
                 status_lines.append(f"Saved XGB config: {saved_paths['xgb']}")
             if "resn" in saved_paths:
                 status_lines.append(f"Saved ResN config: {saved_paths['resn']}")
             status_msg = "\n".join(status_lines)
-            xgb_json = self._dump_json(xgb_cfg) if xgb_cfg else ""
-            resn_json = self._dump_json(resn_cfg) if resn_cfg else ""
-
+            xgb_json = self._dump_json(xgb_cfg) if xgb_cfg is not None else ""
+            resn_json = self._dump_json(resn_cfg) if resn_cfg is not None else ""
             return status_msg, xgb_json, resn_json
 
         except FileNotFoundError as e:
@@ -376,9 +493,17 @@ class AppControllerRuntimeMixin:
         except Exception as e:
             return f"Error opening folder: {str(e)}"
 
-    def _run_workflow(self, label: str, func: Callable, *args, **kwargs):
+    def _run_workflow(
+        self,
+        label: str,
+        func: Callable,
+        *args,
+        actor: Optional[str] = None,
+        **kwargs,
+    ):
         """Run a workflow function and stream logs."""
         try:
+            self._ensure_task_run_permission(actor)
             runner = self._get_runner()
             log_generator = runner.run_callable(func, *args, **kwargs)
             full_log = ""
@@ -395,10 +520,12 @@ class AppControllerRuntimeMixin:
         func: Callable,
         preview_collector: Callable[[float], list[str]],
         *args,
+        actor: Optional[str] = None,
         **kwargs,
     ):
         """Run a workflow and return status/logs plus generated image previews."""
         try:
+            self._ensure_task_run_permission(actor)
             runner = self._get_runner()
             started_at = time.time()
             log_generator = runner.run_callable(func, *args, **kwargs)
@@ -502,6 +629,10 @@ class AppControllerRuntimeMixin:
             candidate_roots.append(plot_root)
             if model_name:
                 candidate_roots.append(plot_root / model_name)
+        if model_name:
+            candidate_roots.append(
+                (Path.cwd() / "Results" / "plot" / model_name / "double_lift").resolve()
+            )
 
         return self._collect_png_paths(
             candidate_roots,
@@ -521,15 +652,7 @@ class AppControllerRuntimeMixin:
         if str(output_dir or "").strip():
             out_dir = self._resolve_user_path(output_dir, base_dir=self.working_dir)
         else:
-            base_path: Optional[Path] = None
-            if str(train_data_path or "").strip():
-                base_path = self._resolve_user_path(train_data_path, base_dir=self.working_dir)
-            elif str(test_data_path or "").strip():
-                base_path = self._resolve_user_path(test_data_path, base_dir=self.working_dir)
-            elif str(data_path or "").strip():
-                base_path = self._resolve_user_path(data_path, base_dir=self.working_dir)
-            root_dir = base_path.parent if base_path is not None else self.working_dir
-            out_dir = (root_dir / "Results" / "plot" / model_name / "oneway" / "pre").resolve()
+            out_dir = (Path.cwd() / "Results" / "plot" / model_name / "oneway" / "pre").resolve()
         return self._collect_png_paths([out_dir], min_mtime=started_at - 1.0)
 
     def _collect_compare_images(
@@ -548,6 +671,9 @@ class AppControllerRuntimeMixin:
         if model_list and model_categories:
             model_name = f"{model_list[0]}_{model_categories[0]}"
             candidates.append(plot_root / model_name / "double_lift")
+            candidates.append(
+                (Path.cwd() / "Results" / "plot" / model_name / "double_lift").resolve()
+            )
 
         return self._collect_png_paths(candidates, min_mtime=started_at - 1.0)
 
@@ -555,6 +681,8 @@ class AppControllerRuntimeMixin:
         self,
         *,
         data_path: str,
+        train_data_path: str,
+        test_data_path: str,
         output_path: str,
         started_at: float,
     ) -> list[str]:
@@ -563,8 +691,32 @@ class AppControllerRuntimeMixin:
             target_path = self._resolve_user_path(raw_output_path, base_dir=self.working_dir)
             candidates = [target_path]
         else:
-            data_obj = self._resolve_user_path(data_path, base_dir=self.working_dir)
-            candidates = [(data_obj.parent / "Results" / "plot").resolve()]
+            explicit_train = str(train_data_path or "").strip()
+            explicit_test = str(test_data_path or "").strip()
+            if explicit_train or explicit_test:
+                if explicit_train and explicit_test:
+                    source_tag = (
+                        f"{Path(explicit_train).stem}_and_{Path(explicit_test).stem}"
+                    )
+                elif explicit_train:
+                    source_tag = Path(explicit_train).stem
+                else:
+                    source_tag = Path(explicit_test).stem
+            else:
+                data_obj = self._resolve_user_path(data_path, base_dir=self.working_dir)
+                source_tag = data_obj.stem
+            tag = (
+                str(source_tag)
+                .strip()
+                .replace(" ", "_")
+                .replace("/", "_")
+                .replace("\\", "_")
+                .replace(":", "_")
+            ) or "raw"
+            candidates = [
+                (Path.cwd() / "Results" / "plot" / tag / "double_lift").resolve(),
+                (Path.cwd() / "Results" / "plot").resolve(),
+            ]
         return self._collect_png_paths(candidates, min_mtime=started_at - 1.0)
 
     def run_pre_oneway_ui(
@@ -582,6 +734,7 @@ class AppControllerRuntimeMixin:
         output_dir: str,
         train_data_path: str,
         test_data_path: str,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         selected_factors = self._normalize_feature_values(oneway_factors)
@@ -609,6 +762,7 @@ class AppControllerRuntimeMixin:
             output_dir=output_dir or None,
             train_data_path=train_data_path or None,
             test_data_path=test_data_path or None,
+            actor=actor,
         )
 
     def run_plot_direct_ui(
@@ -623,6 +777,7 @@ class AppControllerRuntimeMixin:
         resn_model_file: Optional[Any] = None,
         xgb_model_path: Optional[str] = None,
         resn_model_path: Optional[str] = None,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         selected_factors = self._normalize_feature_values(oneway_factors)
@@ -648,6 +803,7 @@ class AppControllerRuntimeMixin:
             xgb_model_path=resolved_paths["xgb"],
             resn_model_path=resolved_paths["resn"],
             model_search_dir=str(self.working_dir),
+            actor=actor,
         )
 
     def run_plot_embed_ui(
@@ -666,6 +822,7 @@ class AppControllerRuntimeMixin:
         xgb_model_path: Optional[str] = None,
         resn_model_path: Optional[str] = None,
         ft_model_path: Optional[str] = None,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         selected_factors = self._normalize_feature_values(oneway_factors)
@@ -695,6 +852,7 @@ class AppControllerRuntimeMixin:
             resn_model_path=resolved_paths["resn"],
             ft_model_path=resolved_paths["ft"],
             model_search_dir=str(self.working_dir),
+            actor=actor,
         )
 
     def run_predict_ui(
@@ -712,6 +870,7 @@ class AppControllerRuntimeMixin:
         ft_model_path: Optional[str] = None,
         xgb_model_path: Optional[str] = None,
         resn_model_path: Optional[str] = None,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         resolved_paths = self._resolve_model_override_paths(
@@ -733,6 +892,7 @@ class AppControllerRuntimeMixin:
             xgb_model_path=resolved_paths["xgb"],
             resn_model_path=resolved_paths["resn"],
             model_search_dir=str(self.working_dir),
+            actor=actor,
         )
 
     def run_compare_ui(
@@ -753,6 +913,7 @@ class AppControllerRuntimeMixin:
         direct_model_path: Optional[str] = None,
         ft_embed_model_path: Optional[str] = None,
         ft_model_path: Optional[str] = None,
+        actor: Optional[str] = None,
     ):
         model_key_norm = str(model_key or "").strip().lower()
         if model_key_norm not in {"xgb", "resn"}:
@@ -778,6 +939,7 @@ class AppControllerRuntimeMixin:
             direct_model_path=resolved_paths["direct"] or "",
             ft_embed_model_path=resolved_paths["ft_embed"] or "",
             ft_model_path=resolved_paths["ft"] or "",
+            actor=actor,
         )
 
     def _run_compare_ui(
@@ -797,6 +959,7 @@ class AppControllerRuntimeMixin:
         direct_model_path: str,
         ft_embed_model_path: str,
         ft_model_path: str,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         yield from self._run_workflow_with_preview(
@@ -820,11 +983,14 @@ class AppControllerRuntimeMixin:
             ft_embed_model_path=ft_embed_model_path or None,
             ft_model_path=ft_model_path or None,
             model_search_dir=str(self.working_dir),
+            actor=actor,
         )
 
     def run_double_lift_ui(
         self,
         data_path: str,
+        train_data_path: str,
+        test_data_path: str,
         pred_col_1: str,
         pred_col_2: str,
         target_col: str,
@@ -841,7 +1007,10 @@ class AppControllerRuntimeMixin:
         split_time_col: str,
         split_time_ascending: bool,
         rand_seed: int,
+        split_cache_path: str,
+        split_cache_force_rebuild: bool,
         output_path: str,
+        actor: Optional[str] = None,
     ):
         workflows_module = self._load_workflows_module()
         yield from self._run_workflow_with_preview(
@@ -849,10 +1018,14 @@ class AppControllerRuntimeMixin:
             workflows_module.run_double_lift_from_file,
             lambda started_at: self._collect_double_lift_images(
                 data_path=data_path,
+                train_data_path=train_data_path,
+                test_data_path=test_data_path,
                 output_path=output_path,
                 started_at=started_at,
             ),
             data_path=data_path,
+            train_data_path=train_data_path or None,
+            test_data_path=test_data_path or None,
             pred_col_1=pred_col_1,
             pred_col_2=pred_col_2,
             target_col=target_col,
@@ -869,5 +1042,8 @@ class AppControllerRuntimeMixin:
             split_time_col=split_time_col or None,
             split_time_ascending=split_time_ascending,
             rand_seed=rand_seed,
+            split_cache_path=split_cache_path or None,
+            split_cache_force_rebuild=bool(split_cache_force_rebuild),
             output_path=output_path or None,
+            actor=actor,
         )

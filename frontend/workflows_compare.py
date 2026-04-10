@@ -12,6 +12,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
+from ins_pricing.split_cache import (
+    load_split_cache,
+    resolve_model_scoped_path,
+    validate_split_cache_metadata,
+    validate_split_indices,
+    write_split_cache,
+)
 
 from ins_pricing.modelling.plotting import PlotStyle, plot_double_lift_curve
 from ins_pricing.modelling.plotting.common import finalize_figure, plt
@@ -20,9 +27,8 @@ from .workflows_common import (
     _build_search_roots,
     _drop_duplicate_columns,
     _resolve_data_path,
+    _resolve_double_lift_dir,
     _resolve_output_dir,
-    _resolve_plot_path,
-    _resolve_plot_style,
     _safe_tag,
 )
 from .workflows_prediction_utils import (
@@ -195,7 +201,7 @@ def run_compare_ft_embed(
     if train_ready:
         datasets.append(("Train Data", plot_train))
     if test_ready:
-        datasets.append(("Test Data", plot_test))
+        datasets.append(("Validation Data", plot_test))
 
     style = PlotStyle()
     fig, axes = plt.subplots(1, len(datasets), figsize=DOUBLE_LIFT_FIGSIZE)
@@ -220,19 +226,13 @@ def run_compare_ft_embed(
         )
     plt.subplots_adjust(wspace=0.3)
 
-    output_root = _resolve_output_dir(direct_cfg, direct_cfg_path)
-    plot_style = _resolve_plot_style(direct_cfg)
+    save_root = _resolve_double_lift_dir(model_name=model_name)
     filename = (
-        f"01_{model_name}_dlift_"
+        f"double_lift_compare_{_safe_tag(model_key)}_{model_name}_"
         f"{_safe_tag(label_direct)}_vs_{_safe_tag(label_ft)}.png"
     )
-    save_path = _resolve_plot_path(
-        output_root,
-        plot_style,
-        f"{model_name}/double_lift",
-        filename,
-    )
-    finalize_figure(fig, save_path=save_path, show=False, style=style)
+    save_path = (save_root / filename).resolve()
+    finalize_figure(fig, save_path=str(save_path), show=False, style=style)
     _log(f"Double lift saved to: {save_path}")
     return str(save_path)
 
@@ -258,6 +258,8 @@ def run_double_lift_from_file(
     split_time_col: Optional[str] = None,
     split_time_ascending: bool = True,
     rand_seed: int = 13,
+    split_cache_path: Optional[str] = None,
+    split_cache_force_rebuild: bool = False,
     output_path: Optional[str] = None,
 ) -> str:
     explicit_train_path = str(train_data_path or "").strip()
@@ -295,13 +297,22 @@ def run_double_lift_from_file(
         missing_cols = [c for c in required_cols if c not in frame.columns]
         if missing_cols:
             raise KeyError(f"{label} missing required columns: {missing_cols}")
-        before_rows = len(frame)
-        frame = frame.dropna(subset=required_cols).reset_index(drop=True)
-        after_rows = len(frame)
-        if after_rows == 0:
-            raise ValueError(f"No valid rows remain in {label} after dropping NA in required columns.")
-        if after_rows < before_rows:
-            _log(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
+        target_na_before = int(frame[target_col].isna().sum())
+        frame[target_col] = pd.to_numeric(frame[target_col], errors="coerce").fillna(0.0)
+        if target_na_before > 0:
+            _log(f"[Data] {label}: filled {target_na_before} NA in {target_col} with 0.")
+        frame[weight_col] = pd.to_numeric(frame[weight_col], errors="coerce").fillna(1.0)
+        for pred_col in (pred_col_1, pred_col_2):
+            pred_numeric = pd.to_numeric(frame[pred_col], errors="coerce")
+            pred_na = int(pred_numeric.isna().sum())
+            if pred_na > 0:
+                raise ValueError(
+                    f"{label}: {pred_col} contains {pred_na} non-numeric/NA rows; "
+                    "please clean prediction columns before plotting."
+                )
+            frame[pred_col] = pred_numeric
+        if frame.empty:
+            raise ValueError(f"{label} is empty.")
         return frame
 
     split_group_col = str(split_group_col or "").strip() or None
@@ -320,28 +331,94 @@ def run_double_lift_from_file(
             test_obj = Path(explicit_test_path).resolve()
             if not test_obj.exists():
                 raise FileNotFoundError(f"test_data_path not found: {test_obj}")
-            datasets.append(("Test Data", _load_and_validate(test_obj, "double_lift_test")))
+            datasets.append(("Validation Data", _load_and_validate(test_obj, "double_lift_test")))
     else:
         assert data_path_obj is not None
         raw = _load_and_validate(data_path_obj, "double_lift_raw")
         if holdout_ratio_val > 0:
-            train_df, test_df = _split_train_test(
-                raw,
-                holdout_ratio=holdout_ratio_val,
-                strategy=split_strategy,
-                group_col=split_group_col,
-                time_col=split_time_col,
-                time_ascending=bool(split_time_ascending),
-                rand_seed=int(rand_seed),
-                reset_index_mode="none",
-                ratio_label="holdout_ratio",
+            split_cache_obj = resolve_model_scoped_path(
+                split_cache_path,
+                model_name=_safe_tag(data_path_obj.stem),
+                base_dir=data_path_obj.parent,
             )
+            strategy_norm = split_strategy.strip().lower() or "random"
+
+            def _split_and_optionally_write_cache() -> tuple[pd.DataFrame, pd.DataFrame]:
+                train_local, test_local = _split_train_test(
+                    raw,
+                    holdout_ratio=holdout_ratio_val,
+                    strategy=split_strategy,
+                    group_col=split_group_col,
+                    time_col=split_time_col,
+                    time_ascending=bool(split_time_ascending),
+                    rand_seed=int(rand_seed),
+                    reset_index_mode="none",
+                    ratio_label="holdout_ratio",
+                )
+                if split_cache_obj is not None:
+                    train_idx_local = np.asarray(
+                        train_local.index.to_numpy(), dtype=np.int64
+                    ).reshape(-1)
+                    test_idx_local = np.asarray(
+                        test_local.index.to_numpy(), dtype=np.int64
+                    ).reshape(-1)
+                    validate_split_indices(
+                        train_idx=train_idx_local,
+                        test_idx=test_idx_local,
+                        row_count=len(raw),
+                        cache_path=split_cache_obj,
+                    )
+                    write_split_cache(
+                        split_cache_obj,
+                        train_idx=train_idx_local,
+                        test_idx=test_idx_local,
+                        row_count=len(raw),
+                        meta={
+                            "split_strategy": strategy_norm,
+                            "holdout_ratio": holdout_ratio_val,
+                            "rand_seed": rand_seed,
+                            "data_path": str(data_path_obj),
+                        },
+                    )
+                    _log(f"[Split] Created split cache: {split_cache_obj}")
+                return train_local, test_local
+
+            if (
+                split_cache_obj is not None
+                and split_cache_obj.exists()
+                and not bool(split_cache_force_rebuild)
+            ):
+                train_idx, test_idx, cached_row_count, cache_meta = load_split_cache(
+                    split_cache_obj
+                )
+                validate_split_cache_metadata(
+                    cache_path=split_cache_obj,
+                    cached_row_count=cached_row_count,
+                    current_row_count=len(raw),
+                    cache_meta=cache_meta,
+                    split_strategy=strategy_norm,
+                    holdout_ratio=holdout_ratio_val,
+                    rand_seed=rand_seed,
+                    rebuild_hint=True,
+                )
+                validate_split_indices(
+                    train_idx=train_idx,
+                    test_idx=test_idx,
+                    row_count=len(raw),
+                    cache_path=split_cache_obj,
+                )
+                train_df = raw.iloc[train_idx].copy()
+                test_df = raw.iloc[test_idx].copy()
+                _log(f"[Split] Reused split cache: {split_cache_obj}")
+            else:
+                train_df, test_df = _split_and_optionally_write_cache()
+
             train_df = _drop_duplicate_columns(train_df, "double_lift_train")
             test_df = _drop_duplicate_columns(test_df, "double_lift_test")
             if len(train_df) > 0:
                 datasets.append(("Train Data", train_df))
             if len(test_df) > 0:
-                datasets.append(("Test Data", test_df))
+                datasets.append(("Validation Data", test_df))
         else:
             datasets.append(("All Data", raw))
 
@@ -375,9 +452,29 @@ def run_double_lift_from_file(
     if output_path:
         save_path = Path(output_path).resolve()
     else:
-        filename = f"double_lift_{_safe_tag(label1)}_vs_{_safe_tag(label2)}.png"
-        base_dir = data_path_obj.parent if data_path_obj is not None else Path.cwd()
-        save_path = (base_dir / "Results" / "plot" / filename).resolve()
+        if use_explicit_split:
+            if explicit_train_path and explicit_test_path:
+                source_tag = (
+                    f"{_safe_tag(Path(explicit_train_path).stem)}_and_"
+                    f"{_safe_tag(Path(explicit_test_path).stem)}"
+                )
+            elif explicit_train_path:
+                source_tag = _safe_tag(Path(explicit_train_path).stem)
+            elif explicit_test_path:
+                source_tag = _safe_tag(Path(explicit_test_path).stem)
+            else:
+                source_tag = "explicit_split"
+            split_tag = "explicit_split"
+            model_dir_tag = source_tag
+        else:
+            source_tag = _safe_tag(data_path_obj.stem) if data_path_obj is not None else "raw"
+            split_tag = "train_valid" if holdout_ratio_val > 0 else "all"
+            model_dir_tag = source_tag
+        filename = (
+            f"double_lift_file_{source_tag}_"
+            f"{_safe_tag(label1)}_vs_{_safe_tag(label2)}_{split_tag}.png"
+        )
+        save_path = (_resolve_double_lift_dir(model_name=model_dir_tag) / filename).resolve()
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     finalize_figure(fig, save_path=str(save_path), show=False, style=style)
@@ -433,13 +530,13 @@ def run_double_lift_multi_models(
         missing_cols = [c for c in required_cols if c not in frame.columns]
         if missing_cols:
             raise KeyError(f"{label} missing required columns: {missing_cols}")
-        before_rows = len(frame)
-        frame = frame.dropna(subset=required_cols).reset_index(drop=True)
-        after_rows = len(frame)
-        if after_rows == 0:
-            raise ValueError(f"No valid rows remain in {label} after dropping NA in required columns.")
-        if after_rows < before_rows:
-            _log(f"[Info] {label}: dropped {before_rows - after_rows} rows with NA in required columns.")
+        target_na_before = int(frame[target_col].isna().sum())
+        frame[target_col] = pd.to_numeric(frame[target_col], errors="coerce").fillna(0.0)
+        if target_na_before > 0:
+            _log(f"[Data] {label}: filled {target_na_before} NA in {target_col} with 0.")
+        frame[weight_col] = pd.to_numeric(frame[weight_col], errors="coerce").fillna(1.0)
+        if frame.empty:
+            raise ValueError(f"{label} is empty.")
         return frame
 
     def _build_predict_fn(spec: Dict[str, Any]) -> Callable[[pd.DataFrame], np.ndarray]:
@@ -591,8 +688,12 @@ def run_double_lift_multi_models(
     if output_dir:
         save_root = _resolve_path(output_dir)
     else:
-        base_dir = data_path_obj.parent if data_path_obj is not None else Path.cwd()
-        save_root = (base_dir / "Results" / "plot" / "multi_model_compare").resolve()
+        default_model_tag = (
+            _safe_tag(data_path_obj.stem)
+            if data_path_obj is not None
+            else "multi_model_compare"
+        )
+        save_root = _resolve_double_lift_dir(model_name=default_model_tag)
     save_root.mkdir(parents=True, exist_ok=True)
 
     n_pairs = len(pairs)
@@ -638,7 +739,8 @@ def run_double_lift_multi_models(
         for j in range(n_pairs, len(axes_flat)):
             axes_flat[j].axis("off")
 
-        save_path = save_root / f"double_lift_all_pairs_{split_tag}.png"
+        model_tag = "_vs_".join(_safe_tag(name) for name in model_names)
+        save_path = save_root / f"double_lift_multi_{model_tag}_{split_tag}.png"
         finalize_figure(fig, save_path=str(save_path), show=False, style=style)
         _log(f"Saved: {save_path}")
 

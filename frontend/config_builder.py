@@ -427,7 +427,6 @@ class ConfigBuilder:
             "gnn_max_predict_rows": gnn_max_predict_rows,
             "gnn_predict_chunk_rows": gnn_predict_chunk_rows,
             "optuna_cleanup_synchronize": optuna_cleanup_synchronize,
-            "optuna_storage": f"{output_dir}/optuna/bayesopt.sqlite3",
             "stack_model_keys": model_keys,
         })
 

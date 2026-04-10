@@ -103,6 +103,13 @@ def _looks_like_url(value: str) -> bool:
     return "://" in value
 
 
+def default_optuna_storage_for_output_dir(output_dir: Any) -> Optional[str]:
+    raw = str(output_dir or "").strip()
+    if not raw:
+        return None
+    return str(Path(raw) / "optuna" / "bayesopt.sqlite3")
+
+
 def normalize_config_paths(cfg: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
     """Resolve relative paths against the config.json directory.
 
@@ -126,6 +133,11 @@ def normalize_config_paths(cfg: Dict[str, Any], config_path: Path) -> Dict[str, 
             resolved = resolve_path(storage, base_dir)
             if resolved is not None:
                 out["optuna_storage"] = str(resolved)
+    elif out.get("output_dir"):
+        derived = default_optuna_storage_for_output_dir(out.get("output_dir"))
+        if derived is not None:
+            resolved = resolve_path(derived, base_dir)
+            out["optuna_storage"] = str(resolved) if resolved is not None else derived
 
     best_files = out.get("best_params_files")
     if isinstance(best_files, dict):
@@ -422,6 +434,9 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         stream_split_chunksize = 200000
     if stream_split_chunksize < 1:
         stream_split_chunksize = 200000
+    optuna_storage = cfg.get("optuna_storage")
+    if not optuna_storage:
+        optuna_storage = default_optuna_storage_for_output_dir(cfg.get("output_dir"))
     return {
         "save_preprocess": bool(cfg.get("save_preprocess", False)),
         "preprocess_artifact_path": cfg.get("preprocess_artifact_path"),
@@ -442,7 +457,7 @@ def resolve_runtime_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "gnn_cleanup_per_fold": bool(cfg.get("gnn_cleanup_per_fold", False)),
         "gnn_cleanup_synchronize": bool(cfg.get("gnn_cleanup_synchronize", False)),
         "optuna_cleanup_synchronize": bool(cfg.get("optuna_cleanup_synchronize", False)),
-        "optuna_storage": cfg.get("optuna_storage"),
+        "optuna_storage": optuna_storage,
         "optuna_study_prefix": cfg.get("optuna_study_prefix"),
         "best_params_files": cfg.get("best_params_files"),
         "xgb_search_space": cfg.get("xgb_search_space"),

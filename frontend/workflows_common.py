@@ -66,6 +66,16 @@ def _resolve_plot_path(output_root: str, plot_style: str, subdir: str, filename:
     return str((plot_root / filename).resolve())
 
 
+def _resolve_double_lift_dir(model_name: Optional[str] = None) -> Path:
+    """Unified output directory for double-lift charts.
+
+    Path format:
+      work_dir/Results/plot/{model_name}/double_lift
+    """
+    model_tag = _safe_tag(str(model_name or "").strip()) or "unknown_model"
+    return (Path.cwd() / "Results" / "plot" / model_tag / "double_lift").resolve()
+
+
 def _safe_tag(value: str) -> str:
     return (
         value.strip()
@@ -129,10 +139,11 @@ def _discover_model_file(
     output_roots: Optional[Sequence[Path]] = None,
 ) -> Optional[Path]:
     filename = _model_artifact_filename(model_name, model_key)
-    candidates: List[Path] = []
+    output_candidates: List[Path] = []
+    search_candidates: List[Path] = []
     seen: set[str] = set()
 
-    def _add_candidate(path_obj: Path) -> None:
+    def _add_candidate(path_obj: Path, *, from_output_root: bool = False) -> None:
         try:
             resolved = path_obj.resolve()
         except OSError:
@@ -143,14 +154,17 @@ def _discover_model_file(
         if not resolved.exists() or not resolved.is_file():
             return
         seen.add(key)
-        candidates.append(resolved)
+        if from_output_root:
+            output_candidates.append(resolved)
+        else:
+            search_candidates.append(resolved)
 
     for output_root in output_roots or []:
         try:
             root_obj = Path(output_root).resolve()
         except OSError:
             continue
-        _add_candidate(root_obj / "model" / filename)
+        _add_candidate(root_obj / "model" / filename, from_output_root=True)
 
     for root in search_roots:
         try:
@@ -161,23 +175,20 @@ def _discover_model_file(
             continue
         if root_obj.is_file():
             if root_obj.name == filename:
-                _add_candidate(root_obj)
+                _add_candidate(root_obj, from_output_root=False)
             continue
-        _add_candidate(root_obj / filename)
-        _add_candidate(root_obj / "model" / filename)
+        _add_candidate(root_obj / filename, from_output_root=False)
+        _add_candidate(root_obj / "model" / filename, from_output_root=False)
         try:
             for match in root_obj.glob(f"**/model/{filename}"):
-                _add_candidate(match)
+                _add_candidate(match, from_output_root=False)
         except OSError:
             pass
         try:
             for match in root_obj.glob(f"**/{filename}"):
-                _add_candidate(match)
+                _add_candidate(match, from_output_root=False)
         except OSError:
             pass
-
-    if not candidates:
-        return None
 
     def _mtime_key(path_obj: Path) -> float:
         try:
@@ -185,8 +196,15 @@ def _discover_model_file(
         except OSError:
             return 0.0
 
-    candidates.sort(key=_mtime_key, reverse=True)
-    return candidates[0]
+    # Prefer model artifacts directly under configured output roots.
+    if output_candidates:
+        output_candidates.sort(key=_mtime_key, reverse=True)
+        return output_candidates[0]
+
+    if not search_candidates:
+        return None
+    search_candidates.sort(key=_mtime_key, reverse=True)
+    return search_candidates[0]
 
 
 def _load_ft_embedding_model(model_path: Path) -> Any:

@@ -72,3 +72,43 @@ class TestModelRelease:
 
         current = manager.get_production_release("test_model")
         assert current["version"] == "1.0.0"
+
+    def test_deploy_rejects_invalid_env_name(self, tmp_path):
+        from ins_pricing.governance.release import ReleaseManager
+
+        manager = ReleaseManager(release_dir=tmp_path)
+        with pytest.raises(GovernanceError):
+            manager.deploy(env="../prod", name="pricing_model", version="1.0.0")
+
+    def test_deploy_reverts_state_when_registry_promote_fails(self, tmp_path):
+        from ins_pricing.governance.release import ReleaseManager
+
+        class _FailingRegistry:
+            @staticmethod
+            def promote(name, version, new_status="production"):
+                _ = name, version, new_status
+                raise RuntimeError("registry unavailable")
+
+        manager = ReleaseManager(release_dir=tmp_path, registry=_FailingRegistry())
+        with pytest.raises(GovernanceError, match="deployment state reverted"):
+            manager.deploy(env="staging", name="pricing_model", version="1.0.0")
+
+        assert manager.get_active("staging") is None
+
+    def test_promote_release_reverts_manifest_when_registry_promote_fails(self, tmp_path):
+        from ins_pricing.governance.release import ReleaseManager
+
+        class _FailingRegistry:
+            @staticmethod
+            def promote(name, version, new_status="production"):
+                _ = name, version, new_status
+                raise RuntimeError("registry unavailable")
+
+        manager = ReleaseManager(release_dir=tmp_path, registry=_FailingRegistry())
+        release_id = manager.create_release(model_name="pricing_model", version="1.0.0")
+
+        with pytest.raises(GovernanceError, match="manifest reverted"):
+            manager.promote_to_production(release_id)
+
+        info = manager.get_release_info(release_id)
+        assert info["status"] == "candidate"

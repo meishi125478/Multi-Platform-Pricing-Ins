@@ -597,6 +597,136 @@ def test_excel_calculator_schema_rebuilds_graph_when_missing(tmp_path: Path, mon
     assert len(graph.get("edges", [])) >= 1
 
 
+def test_excel_single_calculation_supports_ranges_lookups_and_named_formulas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openpyxl = pytest.importorskip("openpyxl")
+
+    service = ModelManagerService(tmp_path / "model_manager")
+    workbook = openpyxl.Workbook()
+    input_sheet = workbook.active
+    input_sheet.title = "Input"
+    input_sheet["A1"] = "Primary key"
+    input_sheet["B1"] = "B"
+    input_sheet["A2"] = "Fallback key"
+    input_sheet["B2"] = "Z"
+
+    lookup_sheet = workbook.create_sheet("Lookup")
+    lookup_sheet["A1"] = "A"
+    lookup_sheet["B1"] = 1.1
+    lookup_sheet["A2"] = "B"
+    lookup_sheet["B2"] = 1.5
+    lookup_sheet["A3"] = "C"
+    lookup_sheet["B3"] = 1.8
+
+    calc_sheet = workbook.create_sheet("Calc")
+    calc_sheet["A1"] = 0
+    calc_sheet["A2"] = 0
+    calc_sheet["A3"] = ""
+    calc_sheet["A4"] = 0
+    calc_sheet["A5"] = 0
+    calc_sheet["A6"] = 0
+
+    excel_path = tmp_path / "tmp_artifacts" / "lookup_calc.xlsx"
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(excel_path)
+
+    fake_profile = {
+        "sheet_count": 3,
+        "sheets": [
+            {"sheet": "Input", "rows_sampled": 2, "columns": ["Primary key", "Fallback key"]},
+            {"sheet": "Lookup", "rows_sampled": 3, "columns": ["key", "factor"]},
+            {"sheet": "Calc", "rows_sampled": 6, "columns": ["outputs"]},
+        ],
+        "config_auto_import": {
+            "parser_version": "excel_config_v1",
+            "has_structured_config": True,
+            "sheet_names": ["Input", "Lookup", "Calc"],
+            "named_references": [
+                {"name": "lookup_table", "sheet": "Lookup", "anchor_cell": "A1", "reference": "A1:B3"},
+                {"name": "selected_row", "formula": "=MATCH(Input!B1,Lookup!A1:A3,0)"},
+            ],
+            "input_cells": [
+                {
+                    "sheet": "Input",
+                    "cell": "B1",
+                    "value": "B",
+                    "neighbor_labels": {"left": "Primary key"},
+                    "defined_names": [],
+                },
+                {
+                    "sheet": "Input",
+                    "cell": "B2",
+                    "value": "Z",
+                    "neighbor_labels": {"left": "Fallback key"},
+                    "defined_names": [],
+                },
+            ],
+            "formula_cells": [
+                {"sheet": "Calc", "cell": "A1", "formula": '=VLOOKUP(Input!B1,lookup_table,2,FALSE)'},
+                {"sheet": "Calc", "cell": "A2", "formula": '=INDEX(Lookup!B1:B3,MATCH(Input!B1,Lookup!A1:A3,0))'},
+                {
+                    "sheet": "Calc",
+                    "cell": "A3",
+                    "formula": '=IF(ISERROR(MATCH(Input!B2,Lookup!A1:A3,0)),"",INDEX(Lookup!B1:B3,MATCH(Input!B2,Lookup!A1:A3,0)))',
+                },
+                {"sheet": "Calc", "cell": "A4", "formula": '=INDIRECT("Lookup!B"&MATCH(Input!B1,Lookup!A1:A3,0))'},
+                {"sheet": "Calc", "cell": "A5", "formula": '=PRODUCT(Lookup!B1:B2)'},
+                {"sheet": "Calc", "cell": "A6", "formula": '=INDEX(Lookup!B1:B3,selected_row)'},
+            ],
+            "calculation_graph": {
+                "output_cells": [
+                    {"id": "Calc::A1", "sheet": "Calc", "cell": "A1", "formula": '=VLOOKUP(Input!B1,lookup_table,2,FALSE)'},
+                    {"id": "Calc::A2", "sheet": "Calc", "cell": "A2", "formula": '=INDEX(Lookup!B1:B3,MATCH(Input!B1,Lookup!A1:A3,0))'},
+                    {"id": "Calc::A3", "sheet": "Calc", "cell": "A3", "formula": '=IF(ISERROR(MATCH(Input!B2,Lookup!A1:A3,0)),"",INDEX(Lookup!B1:B3,MATCH(Input!B2,Lookup!A1:A3,0)))'},
+                    {"id": "Calc::A4", "sheet": "Calc", "cell": "A4", "formula": '=INDIRECT("Lookup!B"&MATCH(Input!B1,Lookup!A1:A3,0))'},
+                    {"id": "Calc::A5", "sheet": "Calc", "cell": "A5", "formula": '=PRODUCT(Lookup!B1:B2)'},
+                    {"id": "Calc::A6", "sheet": "Calc", "cell": "A6", "formula": '=INDEX(Lookup!B1:B3,selected_row)'},
+                ],
+                "nodes": [],
+                "edges": [],
+            },
+            "dropdown_validations": [],
+            "warnings": [],
+        },
+    }
+
+    def _fake_inspect_excel(cls: type[ModelManagerService], path: Path) -> Dict[str, Any]:
+        assert path.suffix.lower() == ".xlsx"
+        return fake_profile
+
+    monkeypatch.setattr(ModelManagerService, "_inspect_excel", classmethod(_fake_inspect_excel))
+
+    service.import_model(
+        model_name="lookup_model",
+        version="1.0.0",
+        actor="admin",
+        artifact_paths=[excel_path],
+        model_type="excel",
+    )
+
+    artifact_path = str(service.list_excel_calculator_artifacts("lookup_model", "1.0.0")[0]["artifact_path"])
+    result = service.run_excel_single_calculation(
+        model_name="lookup_model",
+        version="1.0.0",
+        artifact_path=artifact_path,
+        inputs={"Input::B1": "B", "Input::B2": "Z"},
+    )
+
+    assert result["errors"] == []
+    output_map = {
+        f"{item.get('sheet')}::{item.get('cell')}": item.get("value")
+        for item in result.get("output_values", [])
+    }
+    assert output_map["Calc::A1"] == 1.5
+    assert output_map["Calc::A2"] == 1.5
+    assert output_map["Calc::A3"] == ""
+    assert output_map["Calc::A4"] == 1.5
+    assert output_map["Calc::A5"] == pytest.approx(1.65)
+    assert output_map["Calc::A6"] == 1.5
+
+
 def test_input_label_prefers_meaningful_neighbor_context() -> None:
     item = {
         "sheet": "Input",

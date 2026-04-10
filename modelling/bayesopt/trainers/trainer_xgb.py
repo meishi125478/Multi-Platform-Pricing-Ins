@@ -451,6 +451,7 @@ class XGBTrainer(TrainerBase):
         self._xgb_gpu_warned = False
         self._xgb_chunk_warned = False
         self._xgb_param_allowlist: Optional[set[str]] = None
+        self._xgb_tweedie_space_warned = False
 
     def _build_sklearn_estimator(self, params: Dict[str, Any]) -> xgb.XGBModel:
         if self.ctx.task_type == 'classification':
@@ -617,11 +618,12 @@ class XGBTrainer(TrainerBase):
         return set(allow)
 
     def _sanitize_tuned_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        return self._sanitize_with_allowlist(
+        sanitized = self._sanitize_with_allowlist(
             params,
             allowed_keys=self._resolve_xgb_param_allowlist(),
             context="XGBoost tuned params",
         )
+        return self._drop_tweedie_variance_power_if_unused(sanitized)
 
     def _sanitize_best_params(
         self,
@@ -629,11 +631,52 @@ class XGBTrainer(TrainerBase):
         *,
         context: str = "best_params",
     ) -> Dict[str, Any]:
-        return self._sanitize_with_allowlist(
+        sanitized = self._sanitize_with_allowlist(
             params,
             allowed_keys=self._resolve_xgb_param_allowlist(),
             context=f"{context} (XGBoost params)",
         )
+        return self._drop_tweedie_variance_power_if_unused(sanitized)
+
+    def _uses_tweedie_variance_power(self) -> bool:
+        loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+        task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+        return task_type == "regression" and loss_name == "tweedie"
+
+    def _drop_tweedie_variance_power_if_unused(
+        self,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out = dict(params or {})
+        if "tweedie_variance_power" not in out:
+            return out
+        if self._uses_tweedie_variance_power():
+            return out
+        out.pop("tweedie_variance_power", None)
+        return out
+
+    def _filter_search_space_for_distribution(
+        self,
+        search_space: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        filtered = dict(search_space or {})
+        if "tweedie_variance_power" not in filtered:
+            return filtered
+
+        if self._uses_tweedie_variance_power():
+            return filtered
+
+        loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+        task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+        filtered.pop("tweedie_variance_power", None)
+        if not self._xgb_tweedie_space_warned:
+            _log(
+                "[XGBoost] Ignoring xgb_search_space.tweedie_variance_power "
+                f"because resolved loss_name='{loss_name}' (task_type='{task_type}').",
+                flush=True,
+            )
+            self._xgb_tweedie_space_warned = True
+        return filtered
 
     def ensemble_predict(self, k: int) -> None:
         if not self.best_params:
@@ -697,7 +740,9 @@ class XGBTrainer(TrainerBase):
         self._cache_predictions("xgb", preds_train, preds_test)
 
     def cross_val(self, trial: optuna.trial.Trial) -> float:
-        search_space = self._get_search_space_config("xgb_search_space")
+        search_space = self._filter_search_space_for_distribution(
+            self._get_search_space_config("xgb_search_space")
+        )
         params: Dict[str, Any] = {}
         for param_name, spec in (search_space or {}).items():
             params[param_name] = self._sample_from_spec(

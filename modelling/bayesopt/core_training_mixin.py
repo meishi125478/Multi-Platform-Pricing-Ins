@@ -11,6 +11,11 @@ from ins_pricing.modelling.bayesopt.artifacts import (
     best_params_csv_path,
     load_best_params_csv,
 )
+from ins_pricing.modelling.bayesopt.runtime.dispatcher import (
+    EngineDecision,
+    resolve_engine_decision,
+)
+from ins_pricing.modelling.bayesopt.runtime.objective_service import ObjectiveService
 from ins_pricing.utils import get_logger, log_print
 from ins_pricing.utils.io import IOUtils
 
@@ -22,11 +27,26 @@ def _log(*args, **kwargs) -> None:
 
 
 class BayesOptTrainingMixin:
+    def _ensure_objective_service(self) -> ObjectiveService:
+        service = getattr(self, "_objective_service", None)
+        if isinstance(service, ObjectiveService):
+            return service
+        service = ObjectiveService(self)
+        setattr(self, "_objective_service", service)
+        return service
+
     def _require_trainer(self, model_key: str) -> "TrainerBase":
         trainer = self.trainers.get(model_key)
         if trainer is None:
             raise KeyError(f"Unknown model key: {model_key}")
         return trainer
+
+    def _snapshot_tags(self, model_key: str) -> List[str]:
+        normalized_model_key = str(model_key).strip().lower()
+        return [f"{normalized_model_key}_best"]
+
+    def _best_params_labels(self, model_key: str, trainer_label: str) -> List[str]:
+        return [trainer_label]
 
     def _pred_vector_columns(self, pred_prefix: str) -> List[str]:
         """Return vector feature columns like pred_<prefix>_0.. sorted by suffix."""
@@ -90,49 +110,36 @@ class BayesOptTrainingMixin:
                 ),
             )
 
-        # 2) If reuse_best_params is enabled, prefer version snapshots; else load legacy CSV.
+        # 2) If reuse_best_params is enabled, load saved best params from snapshots/CSV.
         reuse_params = bool(getattr(self.config, "reuse_best_params", False))
         if reuse_params and not trainer.best_params:
-            payload = self.version_manager.load_latest(f"{model_key}_best")
-            best_params = None if payload is None else payload.get("best_params")
-            if best_params:
-                _apply_loaded(
-                    best_params,
-                    source="version_snapshot",
-                    message=(
-                        f"[Optuna][{trainer.label}] Reusing best_params "
-                        "from versions snapshot."
-                    ),
-                    study_name=(
-                        payload.get("study_name")
-                        if isinstance(payload, dict)
-                        else None
-                    ),
+            for label in self._best_params_labels(model_key, trainer.label):
+                params_path = best_params_csv_path(
+                    self.output_manager.result_dir,
+                    self.model_nme,
+                    label,
                 )
-                return
-
-            params_path = best_params_csv_path(
-                self.output_manager.result_dir,
-                self.model_nme,
-                trainer.label,
-            )
-            params = load_best_params_csv(
-                self.output_manager.result_dir,
-                self.model_nme,
-                trainer.label,
-            )
-            if params is not None:
-                _apply_loaded(
-                    params,
-                    source="best_params_csv",
-                    message=(
-                        f"[Optuna][{trainer.label}] Reusing best_params from "
-                        f"{params_path}."
-                    ),
+                params = load_best_params_csv(
+                    self.output_manager.result_dir,
+                    self.model_nme,
+                    label,
                 )
+                if params is not None:
+                    _apply_loaded(
+                        params,
+                        source="best_params_csv",
+                        message=(
+                            f"[Optuna][{trainer.label}] Reusing best_params from "
+                            f"{params_path}."
+                        ),
+                    )
+                    return
 
-    # Generic optimization entry point.
-    def optimize_model(self, model_key: str, max_evals: int = 100):
+    def _optimize_model_impl(
+        self,
+        model_key: str,
+        max_evals: int = 100,
+    ):
         if model_key not in self.trainers:
             _log(f"Warning: Unknown model key: {model_key}")
             return
@@ -215,7 +222,44 @@ class BayesOptTrainingMixin:
             "study_name": study_name,
             "config": config_snapshot,
         }
-        self.version_manager.save(f"{model_key}_best", snapshot)
+        tags = self._snapshot_tags(model_key)
+        self.version_manager.save(tags[0], snapshot)
+
+    def _optimize_model_with_runtime(
+        self,
+        model_key: str,
+        max_evals: int,
+        *,
+        decision: EngineDecision,
+    ):
+        _log(
+            "[EngineDispatch] "
+            f"model_key={model_key} supported={decision.supported} "
+            f"reason={decision.reason}",
+            flush=True,
+        )
+        return self._optimize_model_impl(
+            model_key,
+            max_evals=max_evals,
+        )
+
+    # Generic optimization entry point.
+    def optimize_model(self, model_key: str, max_evals: int = 100):
+        if model_key not in self.trainers:
+            _log(f"Warning: Unknown model key: {model_key}")
+            return
+
+        ft_role = str(getattr(self.config, "ft_role", "model") or "model")
+        decision = resolve_engine_decision(
+            self.config,
+            model_key=model_key,
+            ft_role=ft_role,
+        )
+        return self._optimize_model_with_runtime(
+            model_key,
+            max_evals=max_evals,
+            decision=decision,
+        )
 
     def add_numeric_feature_from_column(self, col_name: str) -> None:
         """Add an existing column as a feature and sync one-hot/scaled tables."""

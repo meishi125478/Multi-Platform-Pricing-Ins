@@ -18,6 +18,8 @@ from ins_pricing.modelling.bayesopt.config_components import (
 )
 from ins_pricing.utils.losses import normalize_distribution_name, normalize_loss_name
 from ins_pricing.exceptions import ConfigurationError
+
+
 @dataclass
 class BayesOptConfig:
     """Configuration for Bayesian optimization-based model training.
@@ -73,6 +75,14 @@ class BayesOptConfig:
         build_oht: Whether to build one-hot encoded features (default True)
         oht_sparse_csr: Use OneHotEncoder CSR backend for categorical OHE (default True)
         keep_unscaled_oht: Keep unscaled one-hot copy in memory (default False)
+        preprocess_bundle_include_raw: Persist full raw train/test frames in preprocess bundle
+            (default True). When False, only minimal raw columns needed by runtime are kept.
+        plot_max_rows: Optional global max rows used by plotting paths (default None = no sampling)
+        plot_oneway_max_rows: Optional max rows for oneway plotting
+            (default None -> use full rows unless explicitly configured)
+        plot_curve_max_rows: Optional max rows for lift/dlift/conversion plotting
+            (default None -> use full rows unless explicitly configured)
+        plot_sampling_seed: Random seed used by plotting downsampling (default 13)
         target_clip_enabled: Whether to clip extreme target values before training (default True)
         target_clip_quantile: Upper quantile used for target clipping (default 0.999)
         dataloader_multiprocessing_context: Optional DataLoader multiprocessing start method
@@ -196,6 +206,11 @@ class BayesOptConfig:
     save_preprocess_bundle: bool = False
     load_preprocess_bundle: bool = False
     preprocess_bundle_path: Optional[str] = None
+    preprocess_bundle_include_raw: bool = True
+    plot_max_rows: Optional[int] = None
+    plot_oneway_max_rows: Optional[int] = None
+    plot_curve_max_rows: Optional[int] = None
+    plot_sampling_seed: Optional[int] = 13
     plot_path_style: str = "nested"
     bo_sample_limit: Optional[int] = None
     invalid_param_policy: str = "warn"
@@ -379,6 +394,26 @@ class BayesOptConfig:
             errors.append("save_preprocess_bundle must be a boolean.")
         if not isinstance(self.load_preprocess_bundle, bool):
             errors.append("load_preprocess_bundle must be a boolean.")
+        if not isinstance(self.preprocess_bundle_include_raw, bool):
+            errors.append("preprocess_bundle_include_raw must be a boolean.")
+        for field_name in ("plot_max_rows", "plot_oneway_max_rows", "plot_curve_max_rows"):
+            raw_limit = getattr(self, field_name, None)
+            if raw_limit is None:
+                continue
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                errors.append(f"{field_name} must be an integer or null.")
+                continue
+            if limit <= 0:
+                errors.append(f"{field_name} must be > 0 when provided.")
+                continue
+            setattr(self, field_name, limit)
+        if self.plot_sampling_seed is not None:
+            try:
+                self.plot_sampling_seed = int(self.plot_sampling_seed)
+            except (TypeError, ValueError):
+                errors.append("plot_sampling_seed must be an integer or null.")
         if (
             self.load_preprocess_bundle
             and isinstance(self.preprocess_bundle_path, str)

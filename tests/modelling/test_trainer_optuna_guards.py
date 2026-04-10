@@ -261,13 +261,20 @@ def test_checkpoint_callback_falls_back_when_global_best_params_are_empty(tmp_pa
     assert "learning_rate" in saved.columns
 
 
-def _make_minimal_xgb_trainer(invalid_param_policy: str = "warn") -> XGBTrainer:
+def _make_minimal_xgb_trainer(
+    invalid_param_policy: str = "warn",
+    *,
+    task_type: str = "regression",
+    loss_name: str = "tweedie",
+) -> XGBTrainer:
     trainer = object.__new__(XGBTrainer)
     trainer.label = "Xgboost"
     trainer.model_name_prefix = "Xgboost"
     trainer._invalid_param_warnings_emitted = set()
+    trainer._xgb_tweedie_space_warned = False
     trainer.ctx = types.SimpleNamespace(
-        task_type="regression",
+        task_type=task_type,
+        loss_name=loss_name,
         config=types.SimpleNamespace(
             invalid_param_policy=invalid_param_policy,
             xgb_search_space={"learning_rate": {"type": "float", "low": 1e-5, "high": 1e-2}},
@@ -291,3 +298,49 @@ def test_xgb_sanitize_tuned_params_raises_under_error_policy() -> None:
             {"learning_rate": 1e-3, "geo_token_hidden_dim": 32}
         )
 
+
+def test_xgb_filter_search_space_drops_tweedie_power_for_gamma_loss() -> None:
+    trainer = _make_minimal_xgb_trainer(loss_name="gamma")
+    filtered = trainer._filter_search_space_for_distribution(
+        {
+            "learning_rate": {"type": "float", "low": 1e-4, "high": 1e-2},
+            "tweedie_variance_power": {"type": "float", "low": 1.0, "high": 2.0},
+        }
+    )
+    assert "learning_rate" in filtered
+    assert "tweedie_variance_power" not in filtered
+
+
+def test_xgb_drop_tweedie_variance_power_if_unused_for_gamma() -> None:
+    trainer = _make_minimal_xgb_trainer(loss_name="gamma")
+    filtered = trainer._drop_tweedie_variance_power_if_unused(
+        {"learning_rate": 1e-3, "tweedie_variance_power": 1.2}
+    )
+    assert filtered == {"learning_rate": 1e-3}
+
+
+def test_xgb_filter_search_space_keeps_tweedie_power_for_tweedie_loss() -> None:
+    trainer = _make_minimal_xgb_trainer(loss_name="tweedie")
+    filtered = trainer._filter_search_space_for_distribution(
+        {
+            "learning_rate": {"type": "float", "low": 1e-4, "high": 1e-2},
+            "tweedie_variance_power": {"type": "float", "low": 1.0, "high": 2.0},
+        }
+    )
+    assert "learning_rate" in filtered
+    assert "tweedie_variance_power" in filtered
+
+
+def test_xgb_filter_search_space_drops_tweedie_power_for_classification() -> None:
+    trainer = _make_minimal_xgb_trainer(
+        task_type="classification",
+        loss_name="logloss",
+    )
+    filtered = trainer._filter_search_space_for_distribution(
+        {
+            "max_depth": {"type": "int", "low": 4, "high": 8},
+            "tweedie_variance_power": {"type": "float", "low": 1.0, "high": 2.0},
+        }
+    )
+    assert "max_depth" in filtered
+    assert "tweedie_variance_power" not in filtered

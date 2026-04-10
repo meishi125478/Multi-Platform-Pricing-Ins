@@ -217,6 +217,8 @@ class BayesOptModel(
         }
         self._prepare_geo_tokens()
         self.version_manager = VersionManager(self.output_manager)
+        self._objective_service = None
+        self._data_registry = None
 
     def _build_cv_splitter(self) -> _ResolvedCVSplitter:
         val_ratio = float(self.prop_test) if self.prop_test is not None else 0.25

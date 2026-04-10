@@ -12,7 +12,7 @@ from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import GraphNeuralNetSklearn
 from ins_pricing.utils import EPS, get_logger, log_print
 from ins_pricing.utils.losses import regression_loss
-from ins_pricing.utils.torch_compat import torch_load
+from ins_pricing.utils.model_loading import load_torch_payload
 
 _logger = get_logger("ins_pricing.trainer.gnn")
 
@@ -421,7 +421,7 @@ class GNNTrainer(TrainerBase):
         if not os.path.exists(path):
             _log(f"[load] Warning: Model file not found: {path}")
             return
-        payload = torch_load(path, map_location='cpu', weights_only=False)
+        payload = load_torch_payload(path, map_location='cpu', weights_only=True)
         if isinstance(payload, dict) and isinstance(payload.get("best_params"), dict):
             payload["best_params"] = self._sanitize_best_params(
                 dict(payload["best_params"]),

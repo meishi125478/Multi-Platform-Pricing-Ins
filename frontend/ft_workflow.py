@@ -10,6 +10,14 @@ from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 
+from ins_pricing.frontend.config_builder import ConfigBuilder
+from ins_pricing.split_cache import (
+    load_split_cache,
+    resolve_model_scoped_path,
+    validate_split_cache_metadata,
+    validate_split_indices,
+)
+
 
 class FTWorkflowHelper:
     """
@@ -64,8 +72,6 @@ class FTWorkflowHelper:
         config['use_resn_data_parallel'] = False
         config['use_gnn_data_parallel'] = False
 
-        # Optuna storage
-        config['optuna_storage'] = f"{output_dir}/optuna/bayesopt.sqlite3"
         config['optuna_study_prefix'] = 'pricing_ft_unsup'
 
         # Runner config
@@ -149,11 +155,239 @@ class FTWorkflowHelper:
             "memory_saving auto-stream split)."
         )
 
+    def _resolve_prediction_alignment_indices_from_split_cache(
+        self,
+        raw: pd.DataFrame,
+        cfg: Dict[str, Any],
+        *,
+        cfg_path: Path,
+        model_name: str,
+        pred_train_rows: int,
+        pred_test_rows: int,
+    ) -> Optional[Tuple[pd.Index, pd.Index]]:
+        prop_test = cfg.get("prop_test", 0.25)
+        holdout_ratio = cfg.get("holdout_ratio", prop_test)
+        if holdout_ratio is None:
+            holdout_ratio = prop_test
+        split_strategy = str(cfg.get("split_strategy", "random")).strip().lower()
+        split_cache_path = resolve_model_scoped_path(
+            cfg.get("split_cache_path"),
+            model_name=model_name,
+            base_dir=cfg_path.parent,
+        )
+        if split_cache_path is None:
+            return None
+        if not split_cache_path.exists():
+            # Fall back to split reconstruction when cache path is configured but absent.
+            return None
+
+        train_idx, test_idx, cached_row_count, cache_meta = load_split_cache(split_cache_path)
+        validate_split_cache_metadata(
+            cache_path=split_cache_path,
+            cached_row_count=cached_row_count,
+            current_row_count=int(len(raw)),
+            cache_meta=cache_meta,
+            split_strategy=split_strategy,
+            holdout_ratio=float(holdout_ratio),
+            rand_seed=cfg.get("rand_seed", 13),
+        )
+
+        validate_split_indices(
+            train_idx=train_idx,
+            test_idx=test_idx,
+            row_count=int(len(raw)),
+            cache_path=split_cache_path,
+        )
+        if train_idx.size != int(pred_train_rows) or test_idx.size != int(pred_test_rows):
+            raise ValueError(
+                "Prediction rows do not match split cache sizes. "
+                f"cached train/test indices=({train_idx.size}, {test_idx.size}), "
+                f"prediction train/test rows=({pred_train_rows}, {pred_test_rows})."
+            )
+        return raw.index[train_idx], raw.index[test_idx]
+
+    @staticmethod
+    def _normalize_table_format(
+        value: Optional[str],
+        *,
+        context: str,
+        allow_auto: bool = False,
+    ) -> str:
+        raw = str(value or "").strip().lower()
+        if raw in {"parquet", "pq"}:
+            return "parquet"
+        if raw in {"feather", "ft"}:
+            return "feather"
+        if raw in {"csv"}:
+            return "csv"
+        if allow_auto and raw in {"", "auto"}:
+            return "auto"
+        valid = ["csv", "parquet", "feather"] + (["auto"] if allow_auto else [])
+        raise ValueError(f"{context} must be one of {valid}, got: {value!r}")
+
+    @staticmethod
+    def _format_to_ext(fmt: str) -> str:
+        if fmt == "parquet":
+            return "parquet"
+        if fmt == "feather":
+            return "feather"
+        return "csv"
+
+    @staticmethod
+    def _load_table(path: Path, *, data_format: str = "auto") -> pd.DataFrame:
+        fmt = FTWorkflowHelper._normalize_table_format(
+            data_format,
+            context="data_format",
+            allow_auto=True,
+        )
+        if fmt == "auto":
+            suffix = path.suffix.lower()
+            if suffix in {".csv"}:
+                fmt = "csv"
+            elif suffix in {".parquet", ".pq"}:
+                fmt = "parquet"
+            elif suffix in {".feather", ".ft"}:
+                fmt = "feather"
+            else:
+                for candidate_fmt in ("parquet", "feather", "csv"):
+                    try:
+                        return FTWorkflowHelper._load_table(path, data_format=candidate_fmt)
+                    except Exception:
+                        continue
+                raise ValueError(f"Unable to infer table format for file: {path}")
+        if fmt == "csv":
+            return pd.read_csv(path, low_memory=False)
+        if fmt == "parquet":
+            return pd.read_parquet(path)
+        if fmt == "feather":
+            return pd.read_feather(path)
+        raise ValueError(f"Unsupported read data format: {fmt!r}")
+
+    @staticmethod
+    def _write_table(df: pd.DataFrame, path: Path, *, data_format: str) -> None:
+        if data_format == "csv":
+            df.to_csv(path, index=False)
+            return
+        if data_format == "parquet":
+            df.to_parquet(path, index=False)
+            return
+        if data_format == "feather":
+            df.reset_index(drop=True).to_feather(path)
+            return
+        raise ValueError(f"Unsupported write data format: {data_format!r}")
+
+    @staticmethod
+    def _resolve_input_data_path(
+        *,
+        data_dir: Path,
+        model_name: str,
+        data_format: str,
+        data_path_template: Optional[str],
+        label: str,
+    ) -> Path:
+        fmt = FTWorkflowHelper._normalize_table_format(
+            data_format,
+            context="data_format",
+            allow_auto=True,
+        )
+        template = str(data_path_template or "").strip()
+
+        def _build_path(target_fmt: str) -> Path:
+            ext = FTWorkflowHelper._format_to_ext(target_fmt)
+            if template:
+                filename = template.format(model_name=model_name, ext=ext)
+            else:
+                filename = f"{model_name}.{ext}"
+            return (data_dir / filename).resolve()
+
+        if fmt == "auto":
+            for candidate_fmt in ("csv", "parquet", "feather"):
+                candidate = _build_path(candidate_fmt)
+                if candidate.exists():
+                    return candidate
+            raise FileNotFoundError(f"{label} file not found under {data_dir}: {model_name}")
+
+        path = _build_path(fmt)
+        if path.exists():
+            return path
+        for candidate_fmt in ("csv", "parquet", "feather"):
+            candidate = _build_path(candidate_fmt)
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"{label} file not found: {path}")
+
+    @staticmethod
+    def _resolve_output_data_path(
+        *,
+        output_dir: Path,
+        model_name: str,
+        data_format: str,
+        data_path_template: str,
+    ) -> Path:
+        try:
+            filename = data_path_template.format(
+                model_name=model_name,
+                ext=FTWorkflowHelper._format_to_ext(data_format),
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Invalid augmented_data_path_template. "
+                "Must support {model_name} and/or {ext} placeholders."
+            ) from exc
+        path = (output_dir / filename).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _resolve_prediction_cache_paths(
+        self,
+        *,
+        pred_dir: Path,
+        model_name: str,
+        pred_prefix: str,
+        prediction_cache_format: str,
+    ) -> Tuple[Path, Path]:
+        fmt = self._normalize_table_format(
+            prediction_cache_format,
+            context="prediction_cache_format",
+            allow_auto=True,
+        )
+
+        all_formats = ["parquet", "feather", "csv"]
+        if fmt == "auto":
+            candidates = list(all_formats)
+        else:
+            candidates = [fmt] + [cand for cand in all_formats if cand != fmt]
+
+        def _find_for_split(split: str) -> Optional[Path]:
+            for cand_fmt in candidates:
+                ext = self._format_to_ext(cand_fmt)
+                path = pred_dir / f"{model_name}_{pred_prefix}_{split}.{ext}"
+                if path.exists():
+                    return path
+            return None
+
+        train_path = _find_for_split("train")
+        test_path = _find_for_split("test")
+        if train_path is None or test_path is None:
+            expected = [
+                str(pred_dir / f"{model_name}_{pred_prefix}_{split}.{self._format_to_ext(cand_fmt)}")
+                for split in ("train", "test")
+                for cand_fmt in candidates
+            ]
+            raise FileNotFoundError(
+                "Embedding files not found. Run Step 1 first.\n"
+                + "Expected one of:\n"
+                + "\n".join(expected)
+            )
+        return train_path, test_path
+
     def generate_step2_configs(
         self,
         step1_config_path: str,
         target_models: List[str] = None,
         augmented_data_dir: str = "./DataFTUnsupervised",
+        augmented_data_format: str = "csv",
+        augmented_data_path_template: str = "{model_name}.{ext}",
         xgb_overrides: Optional[Dict[str, Any]] = None,
         resn_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -166,6 +400,8 @@ class FTWorkflowHelper:
             step1_config_path: Path to the Step 1 config file
             target_models: Models to train in step 2 (e.g., ['xgb', 'resn'])
             augmented_data_dir: Directory to save augmented data with embeddings
+            augmented_data_format: Output format for augmented step-2 data
+            augmented_data_path_template: Path template under augmented_data_dir
             xgb_overrides: Optional overrides merged into generated XGB Step-2 config
             resn_overrides: Optional overrides merged into generated ResN Step-2 config
 
@@ -173,6 +409,14 @@ class FTWorkflowHelper:
             Tuple of (xgb_config, resn_config) - None if not in target_models
         """
         target_models = self._normalize_target_models(target_models)
+        aug_data_format = self._normalize_table_format(
+            augmented_data_format,
+            context="augmented_data_format",
+            allow_auto=False,
+        )
+        aug_data_path_template = str(augmented_data_path_template or "").strip()
+        if not aug_data_path_template:
+            aug_data_path_template = "{model_name}.{ext}"
 
         # Load step 1 config
         cfg_path = Path(step1_config_path)
@@ -182,62 +426,94 @@ class FTWorkflowHelper:
         # Read raw data and split
         model_name = f"{cfg['model_list'][0]}_{cfg['model_categories'][0]}"
         data_dir = (cfg_path.parent / cfg["data_dir"]).resolve()
-        raw_path = data_dir / f"{model_name}.csv"
-
-        if not raw_path.exists():
-            raise FileNotFoundError(f"Data file not found: {raw_path}")
-
-        raw = pd.read_csv(raw_path)
+        raw_data_format = self._normalize_table_format(
+            cfg.get("data_format", "csv"),
+            context="data_format",
+            allow_auto=True,
+        )
+        raw_data_template = cfg.get("data_path_template")
+        raw_path = self._resolve_input_data_path(
+            data_dir=data_dir,
+            model_name=model_name,
+            data_format=raw_data_format,
+            data_path_template=raw_data_template,
+            label="Data",
+        )
+        raw = self._load_table(raw_path, data_format="auto")
 
         # Load cached embeddings
         out_root = (cfg_path.parent / cfg["output_dir"]).resolve()
         pred_prefix = cfg.get("ft_feature_prefix", "ft_emb")
-        pred_dir = out_root / "Results" / "predictions"
+        result_root = out_root / "Results"
+        pred_cache_dir = cfg.get("prediction_cache_dir")
+        if pred_cache_dir:
+            pred_dir = Path(str(pred_cache_dir))
+            if not pred_dir.is_absolute():
+                pred_dir = result_root / pred_dir
+        else:
+            pred_dir = result_root / "predictions"
+        pred_dir = pred_dir.resolve()
 
-        train_pred_path = pred_dir / f"{model_name}_{pred_prefix}_train.csv"
-        test_pred_path = pred_dir / f"{model_name}_{pred_prefix}_test.csv"
-
-        if not train_pred_path.exists() or not test_pred_path.exists():
-            raise FileNotFoundError(
-                f"Embedding files not found. Run Step 1 first.\n"
-                f"Expected: {train_pred_path} and {test_pred_path}"
-            )
-
-        pred_train = pd.read_csv(train_pred_path)
-        pred_test = pd.read_csv(test_pred_path)
-        train_index, test_index = self._resolve_prediction_alignment_indices(
+        train_pred_path, test_pred_path = self._resolve_prediction_cache_paths(
+            pred_dir=pred_dir,
+            model_name=model_name,
+            pred_prefix=pred_prefix,
+            prediction_cache_format=str(cfg.get("prediction_cache_format", "parquet")),
+        )
+        pred_train = self._load_table(train_pred_path, data_format="auto")
+        pred_test = self._load_table(test_pred_path, data_format="auto")
+        split_cache_indices = self._resolve_prediction_alignment_indices_from_split_cache(
             raw,
             cfg,
+            cfg_path=cfg_path,
+            model_name=model_name,
             pred_train_rows=len(pred_train),
             pred_test_rows=len(pred_test),
         )
+        if split_cache_indices is not None:
+            train_index, test_index = split_cache_indices
+        else:
+            train_index, test_index = self._resolve_prediction_alignment_indices(
+                raw,
+                cfg,
+                pred_train_rows=len(pred_train),
+                pred_test_rows=len(pred_test),
+            )
 
-        # Merge embeddings with raw data without duplicating all raw columns first.
-        embed_cols = list(pred_train.columns)
-        emb_full = pd.DataFrame(
-            np.nan,
-            index=raw.index,
-            columns=embed_cols,
-            dtype=np.float32,
-        )
-        emb_full.loc[train_index, embed_cols] = pred_train.to_numpy(
-            dtype=np.float32, copy=False
-        )
-        emb_full.loc[test_index, embed_cols] = pred_test.to_numpy(
-            dtype=np.float32, copy=False
-        )
-        raw_base = raw.drop(columns=embed_cols, errors="ignore")
-        aug = pd.concat(
-            [raw_base.reset_index(drop=True), emb_full.reset_index(drop=True)],
-            axis=1,
-            copy=False,
-        )
+        # Merge embeddings with one preallocated matrix to reduce intermediate copies.
+        embed_cols = [str(col) for col in pred_train.columns]
+        train_values = pred_train.to_numpy(dtype=np.float32, copy=False)
+        test_values = pred_test.to_numpy(dtype=np.float32, copy=False)
+        if train_values.ndim == 1:
+            train_values = train_values.reshape(-1, 1)
+        if test_values.ndim == 1:
+            test_values = test_values.reshape(-1, 1)
+
+        train_pos = raw.index.get_indexer(train_index)
+        test_pos = raw.index.get_indexer(test_index)
+        if np.any(train_pos < 0) or np.any(test_pos < 0):
+            raise ValueError(
+                "Failed to map reconstructed split indices back to raw dataset rows."
+            )
+
+        embed_values = np.full((len(raw), len(embed_cols)), np.nan, dtype=np.float32)
+        embed_values[train_pos, :] = train_values
+        embed_values[test_pos, :] = test_values
+
+        raw_base = raw.drop(columns=embed_cols, errors="ignore").reset_index(drop=True)
+        embed_frame = pd.DataFrame(embed_values, columns=embed_cols, copy=False)
+        aug = pd.concat([raw_base, embed_frame], axis=1, copy=False)
 
         # Save augmented data
         data_out_dir = cfg_path.parent / augmented_data_dir
         data_out_dir.mkdir(parents=True, exist_ok=True)
-        aug_path = data_out_dir / f"{model_name}.csv"
-        aug.to_csv(aug_path, index=False)
+        aug_path = self._resolve_output_data_path(
+            output_dir=data_out_dir,
+            model_name=model_name,
+            data_format=aug_data_format,
+            data_path_template=aug_data_path_template,
+        )
+        self._write_table(aug, aug_path, data_format=aug_data_format)
 
         # Generate configs
         xgb_config = None
@@ -248,6 +524,8 @@ class FTWorkflowHelper:
                 cfg,
                 embed_cols,
                 augmented_data_dir,
+                data_format=aug_data_format,
+                data_path_template=aug_data_path_template,
                 overrides=xgb_overrides,
             )
             self.step2_configs['xgb'] = xgb_config
@@ -257,6 +535,8 @@ class FTWorkflowHelper:
                 cfg,
                 embed_cols,
                 augmented_data_dir,
+                data_format=aug_data_format,
+                data_path_template=aug_data_path_template,
                 overrides=resn_overrides,
             )
             self.step2_configs['resn'] = resn_config
@@ -268,6 +548,8 @@ class FTWorkflowHelper:
         base_cfg: Dict[str, Any],
         embed_cols: List[str],
         data_dir: str,
+        data_format: str,
+        data_path_template: str,
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build XGB config for Step 2."""
@@ -275,6 +557,8 @@ class FTWorkflowHelper:
             base_cfg=base_cfg,
             embed_cols=embed_cols,
             data_dir=data_dir,
+            data_format=data_format,
+            data_path_template=data_path_template,
             model_key="xgb",
             output_dir="./ResultsXGBFromFTUnsupervised",
             study_prefix="pricing_ft_unsup_xgb",
@@ -290,6 +574,8 @@ class FTWorkflowHelper:
         base_cfg: Dict[str, Any],
         embed_cols: List[str],
         data_dir: str,
+        data_format: str,
+        data_path_template: str,
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build ResNet config for Step 2."""
@@ -297,6 +583,8 @@ class FTWorkflowHelper:
             base_cfg=base_cfg,
             embed_cols=embed_cols,
             data_dir=data_dir,
+            data_format=data_format,
+            data_path_template=data_path_template,
             model_key="resn",
             output_dir="./ResultsResNFromFTUnsupervised",
             study_prefix="pricing_ft_unsup_resn_ddp",
@@ -313,6 +601,8 @@ class FTWorkflowHelper:
         base_cfg: Dict[str, Any],
         embed_cols: List[str],
         data_dir: str,
+        data_format: str,
+        data_path_template: str,
         model_key: str,
         output_dir: str,
         study_prefix: str,
@@ -328,6 +618,8 @@ class FTWorkflowHelper:
         )
 
         cfg["data_dir"] = str(data_dir)
+        cfg["data_format"] = str(data_format)
+        cfg["data_path_template"] = str(data_path_template)
         cfg["feature_list"] = feature_list
         cfg["categorical_features"] = categorical_features
         cfg["ft_role"] = "model"
@@ -341,7 +633,6 @@ class FTWorkflowHelper:
         cfg["use_gnn_data_parallel"] = False
 
         cfg["output_dir"] = output_dir
-        cfg["optuna_storage"] = f"{output_dir}/optuna/bayesopt.sqlite3"
         cfg["optuna_study_prefix"] = study_prefix
         cfg["loss_name"] = "mse"
         if build_oht is not None:
@@ -363,7 +654,36 @@ class FTWorkflowHelper:
         if overrides:
             self._deep_update(cfg, overrides)
 
+        # Step-2 should tune the downstream model, not carry Step-1 FT spaces.
+        cfg["ft_search_space"] = {}
+        cfg["ft_unsupervised_search_space"] = {}
+        if model_key == "xgb":
+            cfg["xgb_search_space"] = self._resolve_xgb_search_space(cfg)
+            cfg["resn_search_space"] = {}
+        elif model_key == "resn":
+            cfg["resn_search_space"] = self._resolve_resn_search_space(cfg)
+            cfg["xgb_search_space"] = {}
+
         return cfg
+
+    @staticmethod
+    def _resolve_xgb_search_space(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        search_space = cfg.get("xgb_search_space")
+        if isinstance(search_space, dict) and search_space:
+            return copy.deepcopy(search_space)
+        max_depth_max = int(cfg.get("xgb_max_depth_max", 25))
+        n_estimators_max = int(cfg.get("xgb_n_estimators_max", 500))
+        return ConfigBuilder._default_xgb_search_space(
+            max_depth_max=max_depth_max,
+            n_estimators_max=n_estimators_max,
+        )
+
+    @staticmethod
+    def _resolve_resn_search_space(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        search_space = cfg.get("resn_search_space")
+        if isinstance(search_space, dict) and search_space:
+            return copy.deepcopy(search_space)
+        return ConfigBuilder._default_resn_search_space()
 
     @staticmethod
     def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:

@@ -114,4 +114,6 @@ def detect_leakage(
                 score = float(corr)
         if reason:
             results.append({"feature": col, "reason": reason, "score": score})
+    if not results:
+        return pd.DataFrame(columns=["feature", "reason", "score"])
     return pd.DataFrame(results).sort_values(by="score", ascending=False).reset_index(drop=True)

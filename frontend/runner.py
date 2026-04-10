@@ -263,6 +263,10 @@ class TaskRunner:
         if self.task_thread and self.task_thread.is_alive():
             self.task_thread.join(timeout=5)
 
+    def is_running(self) -> bool:
+        """Return whether a task thread is currently active."""
+        return bool(self.task_thread and self.task_thread.is_alive())
+
 
 def setup_logger(name: str = "task") -> logging.Logger:
     """

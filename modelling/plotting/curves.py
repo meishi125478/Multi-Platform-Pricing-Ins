@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,25 +58,50 @@ def _align_arrays(
     return pred_arr, actual_arr, weight_arr
 
 
-def _bin_by_weight(
-    data: pd.DataFrame,
+def _aggregate_by_weight_bins(
     *,
-    sort_col: str,
-    weight_col: str,
+    sort_key: np.ndarray,
+    weight: np.ndarray,
+    values: Dict[str, np.ndarray],
     n_bins: int,
 ) -> pd.DataFrame:
     n_bins = max(1, int(n_bins))
-    data_sorted = data.sort_values(by=sort_col, ascending=True).copy()
-    weight_sum = float(data_sorted[weight_col].sum())
-    if weight_sum <= EPS:
-        data_sorted["bins"] = 0
+    if sort_key.size == 0:
+        payload: Dict[str, np.ndarray] = {
+            "bins": np.asarray([], dtype=np.int64),
+            "weight": np.asarray([], dtype=float),
+        }
+        for name in values:
+            payload[name] = np.asarray([], dtype=float)
+        return pd.DataFrame(payload)
+
+    order = np.argsort(sort_key, kind="mergesort")
+    weight_sorted = np.asarray(weight[order], dtype=float)
+    total_weight = float(np.sum(weight_sorted))
+    if total_weight <= EPS:
+        bin_idx = np.zeros(weight_sorted.shape[0], dtype=np.int64)
     else:
-        data_sorted["cum_weight"] = data_sorted[weight_col].cumsum()
-        data_sorted["bins"] = np.floor(
-            data_sorted["cum_weight"] * float(n_bins) / weight_sum
-        )
-        data_sorted.loc[data_sorted["bins"] == n_bins, "bins"] = n_bins - 1
-    return data_sorted.groupby(["bins"], observed=True).sum(numeric_only=True)
+        cum_weight = np.cumsum(weight_sorted, dtype=np.float64)
+        bin_idx = np.floor(cum_weight * float(n_bins) / total_weight).astype(np.int64)
+        bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+
+    weight_sums = np.bincount(bin_idx, weights=weight_sorted, minlength=n_bins)
+    used_bins = np.flatnonzero(weight_sums > 0)
+    if used_bins.size == 0:
+        used_bins = np.asarray([0], dtype=np.int64)
+
+    payload = {
+        "bins": used_bins.astype(np.int64, copy=False),
+        "weight": weight_sums[used_bins],
+    }
+    for name, arr in values.items():
+        arr_sorted = np.asarray(arr[order], dtype=float)
+        payload[name] = np.bincount(
+            bin_idx,
+            weights=arr_sorted,
+            minlength=n_bins,
+        )[used_bins]
+    return pd.DataFrame(payload)
 
 
 def lift_table(
@@ -108,21 +133,18 @@ def lift_table(
     else:
         w_act = actual_arr * weight_arr
 
-    lift_df = pd.DataFrame(
-        {
-            "pred_sort": pred_raw,
+    plot_data = _aggregate_by_weight_bins(
+        sort_key=pred_raw,
+        weight=weight_arr,
+        values={
             "w_pred": w_pred,
             "act": w_act,
-            "weight": weight_arr,
-        }
+        },
+        n_bins=n_bins,
     )
-    plot_data = _bin_by_weight(
-        lift_df, sort_col="pred_sort", weight_col="weight", n_bins=n_bins
-    )
-    denom = np.maximum(plot_data["weight"], EPS)
-    plot_data["exp_v"] = plot_data["w_pred"] / denom
-    plot_data["act_v"] = plot_data["act"] / denom
-    plot_data.reset_index(inplace=True)
+    denom = np.maximum(plot_data["weight"].to_numpy(dtype=float, copy=False), EPS)
+    plot_data["exp_v"] = plot_data["w_pred"].to_numpy(dtype=float, copy=False) / denom
+    plot_data["act_v"] = plot_data["act"].to_numpy(dtype=float, copy=False) / denom
     return plot_data
 
 
@@ -232,23 +254,20 @@ def double_lift_table(
     w_pred2 = pred2_raw * weight_arr
     w_act = actual_arr if actual_weighted else actual_arr * weight_arr
 
-    lift_df = pd.DataFrame(
-        {
-            "diff_ly": pred1_raw / np.maximum(pred2_raw, EPS),
+    plot_data = _aggregate_by_weight_bins(
+        sort_key=pred1_raw / np.maximum(pred2_raw, EPS),
+        weight=weight_arr,
+        values={
             "pred1": w_pred1,
             "pred2": w_pred2,
             "act": w_act,
-            "weight": weight_arr,
-        }
+        },
+        n_bins=n_bins,
     )
-    plot_data = _bin_by_weight(
-        lift_df, sort_col="diff_ly", weight_col="weight", n_bins=n_bins
-    )
-    denom = np.maximum(plot_data["act"], EPS)
-    plot_data["exp_v1"] = plot_data["pred1"] / denom
-    plot_data["exp_v2"] = plot_data["pred2"] / denom
-    plot_data["act_v"] = plot_data["act"] / denom
-    plot_data.reset_index(inplace=True)
+    denom = np.maximum(plot_data["act"].to_numpy(dtype=float, copy=False), EPS)
+    plot_data["exp_v1"] = plot_data["pred1"].to_numpy(dtype=float, copy=False) / denom
+    plot_data["exp_v2"] = plot_data["pred2"].to_numpy(dtype=float, copy=False) / denom
+    plot_data["act_v"] = plot_data["act"].to_numpy(dtype=float, copy=False) / denom
     return plot_data
 
 
@@ -529,38 +548,19 @@ def plot_conversion_lift(
     style = style or PlotStyle()
     pred_arr, actual_arr, weight_arr = _align_arrays(pred, actual_binary, weight)
 
-    data = pd.DataFrame(
-        {
-            "pred": pred_arr,
-            "actual": actual_arr,
-            "weight": weight_arr,
-        }
+    weighted_actual = actual_arr * weight_arr
+    lift_agg = _aggregate_by_weight_bins(
+        sort_key=pred_arr,
+        weight=weight_arr,
+        values={"weighted_actual": weighted_actual},
+        n_bins=max(2, int(n_bins)),
     )
-    data = data.sort_values(by="pred", ascending=True).copy()
-    data["cum_weight"] = data["weight"].cumsum()
-    total_weight = float(data["weight"].sum())
-
-    if total_weight > EPS:
-        data["bin"] = pd.cut(
-            data["cum_weight"],
-            bins=max(2, int(n_bins)),
-            labels=False,
-            right=False,
-        )
-    else:
-        data["bin"] = 0
-
-    data["weighted_actual"] = data["actual"] * data["weight"]
-    lift_agg = data.groupby("bin", observed=True).agg(
-        total_weight=("weight", "sum"),
-        weighted_actual=("weighted_actual", "sum"),
+    lift_agg.rename(columns={"weight": "total_weight"}, inplace=True)
+    lift_agg["conversion_rate"] = (
+        lift_agg["weighted_actual"].to_numpy(dtype=float, copy=False)
+        / np.maximum(lift_agg["total_weight"].to_numpy(dtype=float, copy=False), EPS)
     )
-    lift_agg = lift_agg.reset_index()
-    lift_agg["conversion_rate"] = lift_agg["weighted_actual"] / np.maximum(
-        lift_agg["total_weight"], EPS
-    )
-
-    overall_rate = float(lift_agg["weighted_actual"].sum()) / max(total_weight, EPS)
+    overall_rate = float(np.sum(weighted_actual)) / max(float(np.sum(weight_arr)), EPS)
 
     created_fig = ax is None
     if created_fig:
@@ -575,7 +575,7 @@ def plot_conversion_lift(
         label=f"Overall ({overall_rate:.2%})",
     )
     ax.plot(
-        lift_agg["bin"],
+        lift_agg["bins"],
         lift_agg["conversion_rate"],
         marker="o",
         linestyle="-",

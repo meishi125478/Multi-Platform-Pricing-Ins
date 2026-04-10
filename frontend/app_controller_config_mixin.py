@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
@@ -29,9 +30,10 @@ class AppControllerConfigMixin:
     def set_working_dir(self, working_dir: str) -> tuple[str, str]:
         """Set working directory used for relative paths and generated configs."""
         try:
+            scope_root = getattr(self, "user_workspace_root", None)
             raw = str(working_dir or "").strip()
             if not raw:
-                resolved = Path.cwd().resolve()
+                resolved = Path(scope_root).resolve() if scope_root is not None else Path.cwd().resolve()
             else:
                 candidate = Path(raw).expanduser()
                 if not candidate.is_absolute():
@@ -42,6 +44,11 @@ class AppControllerConfigMixin:
                     return f"Working directory does not exist: {candidate}", str(self.working_dir)
                 if not candidate.is_dir():
                     return f"Working directory is not a folder: {candidate}", str(self.working_dir)
+                if scope_root is not None and not self._is_relative_to(candidate, Path(scope_root).resolve()):
+                    return (
+                        f"Working directory must stay inside your workspace: {scope_root}",
+                        str(self.working_dir),
+                    )
                 resolved = candidate
 
             self.working_dir = resolved
@@ -64,6 +71,11 @@ class AppControllerConfigMixin:
                 candidate = (self.working_dir / candidate).resolve()
             else:
                 candidate = candidate.resolve()
+            scope_root = getattr(self, "user_workspace_root", None)
+            if scope_root is not None:
+                scope_root_obj = Path(scope_root).resolve()
+                if not self._is_relative_to(candidate, scope_root_obj):
+                    candidate = scope_root_obj
 
             if not candidate.exists():
                 fallback = str(self.working_dir)
@@ -100,6 +112,138 @@ class AppControllerConfigMixin:
             fallback = str(self.working_dir)
             return f"Error listing folders: {str(e)}", [fallback], fallback
 
+    def _resolve_workdir_path(self, relative_path: Optional[str] = None) -> Path:
+        root = Path(self.working_dir).resolve()
+        raw = str(relative_path or "").strip()
+        if not raw:
+            return root
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if not self._is_relative_to(candidate, root):
+            raise ValueError(f"Path is outside current work_dir: {candidate}")
+        return candidate
+
+    def list_workdir_entries(
+        self,
+        subdir: str = "",
+        *,
+        include_hidden: bool = False,
+        max_items: int = 500,
+    ) -> tuple[str, list[Dict[str, Any]]]:
+        """List files/folders under working directory (optionally under a subdir)."""
+        try:
+            target = self._resolve_workdir_path(subdir)
+            if not target.exists():
+                return f"Path does not exist: {target}", []
+            if not target.is_dir():
+                return f"Path is not a folder: {target}", []
+
+            limit = max(1, int(max_items))
+            rows: list[Dict[str, Any]] = []
+            root = Path(self.working_dir).resolve()
+            children = sorted(
+                target.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+            for item in children:
+                name = item.name
+                if not include_hidden and name.startswith("."):
+                    continue
+                try:
+                    stat = item.stat()
+                    size = int(stat.st_size) if item.is_file() else None
+                    modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                except OSError:
+                    size = None
+                    modified = ""
+                rel = str(item.resolve().relative_to(root))
+                rows.append(
+                    {
+                        "name": name,
+                        "type": "dir" if item.is_dir() else "file",
+                        "size": size,
+                        "modified": modified,
+                        "path": rel.replace("\\", "/"),
+                    }
+                )
+                if len(rows) >= limit:
+                    break
+
+            status = f"Listed {len(rows)} entries under: {target}"
+            if len(rows) >= limit:
+                status += f" (limited to {limit})"
+            return status, rows
+        except Exception as e:
+            return f"Error listing work_dir files: {str(e)}", []
+
+    def save_workdir_upload(
+        self,
+        *,
+        file_name: str,
+        content_bytes: bytes,
+        subdir: str = "",
+        overwrite: bool = True,
+    ) -> str:
+        """Save uploaded file into work_dir/subdir."""
+        if not file_name:
+            return "Upload file name is empty."
+        try:
+            target_dir = self._resolve_workdir_path(subdir)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if not target_dir.is_dir():
+                return f"Upload target is not a folder: {target_dir}"
+            safe_name = Path(str(file_name)).name
+            target_path = (target_dir / safe_name).resolve()
+            root = Path(self.working_dir).resolve()
+            if not self._is_relative_to(target_path, root):
+                return f"Upload path is outside work_dir: {target_path}"
+            if target_path.exists() and not overwrite:
+                return f"File already exists (overwrite disabled): {target_path}"
+            target_path.write_bytes(content_bytes)
+            return f"Uploaded to: {target_path}"
+        except Exception as e:
+            return f"Upload failed: {str(e)}"
+
+    def delete_workdir_entry(self, relative_path: str, *, recursive: bool = True) -> str:
+        """Delete file/folder under current working directory."""
+        try:
+            target = self._resolve_workdir_path(relative_path)
+            root = Path(self.working_dir).resolve()
+            if target == root:
+                return "Refuse to delete current work_dir root."
+            if not target.exists():
+                return f"Path not found: {target}"
+            if target.is_file():
+                target.unlink()
+                return f"Deleted file: {target}"
+            if target.is_dir():
+                if recursive:
+                    shutil.rmtree(target)
+                    return f"Deleted folder recursively: {target}"
+                target.rmdir()
+                return f"Deleted empty folder: {target}"
+            return f"Unsupported file type: {target}"
+        except Exception as e:
+            return f"Delete failed: {str(e)}"
+
+    def create_workdir_folder(self, relative_path: str) -> str:
+        """Create folder (and parents) under current working directory."""
+        raw = str(relative_path or "").strip()
+        if not raw:
+            return "Folder path is empty."
+        try:
+            target = self._resolve_workdir_path(raw)
+            root = Path(self.working_dir).resolve()
+            if not self._is_relative_to(target, root):
+                return f"Folder path is outside work_dir: {target}"
+            target.mkdir(parents=True, exist_ok=True)
+            return f"Folder ready: {target}"
+        except Exception as e:
+            return f"Create folder failed: {str(e)}"
+
     def _resolve_user_path(self, value: str, *, base_dir: Optional[Path] = None) -> Path:
         raw = str(value or "").strip()
         if not raw:
@@ -121,12 +265,14 @@ class AppControllerConfigMixin:
             return False
 
     def _allowed_user_roots(self) -> list[Path]:
+        scope_root = getattr(self, "user_workspace_root", None)
+        if scope_root is not None:
+            return [Path(scope_root).resolve()]
         candidates: list[Optional[Path]] = [
             self.working_dir,
             self.current_config_dir,
             self.current_workflow_config_dir,
             Path.cwd(),
-            Path(tempfile.gettempdir()),
         ]
         roots: list[Path] = []
         seen: set[str] = set()
@@ -819,8 +965,19 @@ class AppControllerConfigMixin:
             output_path = self._resolve_path_value(
                 base_dir, workflow_cfg.get("output_path"), "output_path", required=False
             )
+            train_data_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("train_data_path"), "train_data_path", required=False
+            )
+            test_data_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("test_data_path"), "test_data_path", required=False
+            )
+            split_cache_path = self._resolve_path_value(
+                base_dir, workflow_cfg.get("split_cache_path"), "split_cache_path", required=False
+            )
             return workflows_module.run_double_lift_from_file(
                 data_path=self._resolve_path_value(base_dir, workflow_cfg.get("data_path"), "data_path"),
+                train_data_path=train_data_path,
+                test_data_path=test_data_path,
                 pred_col_1=str(workflow_cfg.get("pred_col_1", workflow_cfg.get("pred_col1", ""))).strip(),
                 pred_col_2=str(workflow_cfg.get("pred_col_2", workflow_cfg.get("pred_col2", ""))).strip(),
                 target_col=str(workflow_cfg.get("target_col", workflow_cfg.get("target", ""))).strip(),
@@ -837,6 +994,8 @@ class AppControllerConfigMixin:
                 split_time_col=str(workflow_cfg.get("split_time_col", "")).strip() or None,
                 split_time_ascending=bool(workflow_cfg.get("split_time_ascending", True)),
                 rand_seed=int(workflow_cfg.get("rand_seed", 13)),
+                split_cache_path=split_cache_path,
+                split_cache_force_rebuild=bool(workflow_cfg.get("split_cache_force_rebuild", False)),
                 output_path=output_path,
             )
 

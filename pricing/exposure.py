@@ -26,7 +26,7 @@ def compute_exposure(
 
     Compatibility behavior:
     - If ``time_unit`` is provided, returns a DataFrame copy with ``exposure`` column.
-    - Otherwise returns a Series (legacy lightweight utility behavior).
+    - Otherwise returns a Series for lightweight utility usage.
     """
 
     if not isinstance(df, pd.DataFrame):

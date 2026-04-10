@@ -34,6 +34,7 @@ class FTTrainer(TrainerBase):
         )
         self._cv_geo_warned = False
         self._param_probe_model: Optional[FTTransformerSklearn] = None
+        self._ft_tweedie_space_warned = False
 
     def _dist_cfg(self):
         return getattr(self.ctx.config, "distributed", self.ctx.config)
@@ -199,12 +200,52 @@ class FTTrainer(TrainerBase):
             self._cv_geo_warned = True
         return geo_train, geo_val
 
+    def _uses_tweedie_power(self) -> bool:
+        loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+        task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+        return task_type == "regression" and loss_name == "tweedie"
+
+    def _drop_tw_power_if_unused(
+        self,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out = dict(params or {})
+        if "tw_power" not in out:
+            return out
+        if self._uses_tweedie_power():
+            return out
+        out.pop("tw_power", None)
+        return out
+
+    def _filter_search_space_for_distribution(
+        self,
+        search_space: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        filtered = dict(search_space or {})
+        if "tw_power" not in filtered:
+            return filtered
+        if self._uses_tweedie_power():
+            return filtered
+
+        filtered.pop("tw_power", None)
+        if not self._ft_tweedie_space_warned:
+            loss_name = str(getattr(self.ctx, "loss_name", "tweedie") or "tweedie").strip().lower()
+            task_type = str(getattr(self.ctx, "task_type", "") or "").strip().lower()
+            _log(
+                "[FTTransformer] Ignoring ft_search_space.tw_power "
+                f"because resolved loss_name='{loss_name}' (task_type='{task_type}').",
+                flush=True,
+            )
+            self._ft_tweedie_space_warned = True
+        return filtered
+
     def _sanitize_best_params(
         self,
         params: Dict[str, Any],
         *,
         context: str = "best_params",
     ) -> Dict[str, Any]:
+        params = self._drop_tw_power_if_unused(params)
         probe = self._param_probe_model
         if probe is None:
             probe = self._create_ft_model(
@@ -330,7 +371,9 @@ class FTTrainer(TrainerBase):
         #   - Shrink search space to avoid oversized models.
         #   - Release GPU memory after each fold so the next trial can run.
         # Slightly shrink hyperparameter space to avoid oversized models.
-        search_space = self._get_search_space_config("ft_search_space")
+        search_space = self._filter_search_space_for_distribution(
+            self._get_search_space_config("ft_search_space")
+        )
         param_space: Dict[str, Callable[[optuna.trial.Trial], Any]] = {}
         loss_name = getattr(self.ctx, "loss_name", "tweedie")
         geo_enabled = bool(
@@ -456,7 +499,10 @@ class FTTrainer(TrainerBase):
             raise RuntimeError(
                 "Run tune() first to obtain best FT-Transformer parameters.")
         resolved_params = self._apply_adaptive_heads(
-            dict(self.best_params),
+            self._sanitize_best_params(
+                dict(self.best_params),
+                context="FT final train params",
+            ),
             default_d_model=64,
             log_adjustment=True,
         )
@@ -548,7 +594,10 @@ class FTTrainer(TrainerBase):
         geo_train_full = self.ctx.train_geo_tokens
         geo_test_full = self.ctx.test_geo_tokens
 
-        resolved_params = dict(self.best_params)
+        resolved_params = self._sanitize_best_params(
+            dict(self.best_params),
+            context="FT ensemble params",
+        )
         default_d_model = getattr(self.model, "d_model", 64)
         resolved_params = self._apply_adaptive_heads(
             resolved_params,
@@ -756,7 +805,10 @@ class FTTrainer(TrainerBase):
         if not self.best_params:
             raise RuntimeError(
                 "Run tune() first to obtain best FT-Transformer parameters.")
-        resolved_params = dict(self.best_params)
+        resolved_params = self._sanitize_best_params(
+            dict(self.best_params),
+            context="FT feature params",
+        )
         if feature_mode not in ("prediction", "embedding"):
             raise ValueError(
                 f"Unsupported feature_mode='{feature_mode}', expected 'prediction' or 'embedding'.")
@@ -823,7 +875,10 @@ class FTTrainer(TrainerBase):
         resolved_params = dict(params or {})
         # Reuse supervised tuning structure params unless explicitly overridden.
         if not resolved_params and self.best_params:
-            resolved_params = dict(self.best_params)
+            resolved_params = self._sanitize_best_params(
+                dict(self.best_params),
+                context="FT unsupervised feature params",
+            )
 
         # If params include masked reconstruction fields, they take precedence.
         mask_prob_num = float(resolved_params.pop(

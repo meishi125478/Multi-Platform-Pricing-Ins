@@ -288,8 +288,12 @@ def test_resolve_split_and_runtime_config_expose_new_fields():
         },
         output_dir=None,
         reuse_best_params=False,
+        preprocess_bundle_include_raw=False,
+        keep_unscaled_oht=False,
     )
     assert isinstance(payload["ft_search_space"], dict)
     assert isinstance(payload["ft_unsupervised_search_space"], dict)
     assert isinstance(payload["resn_search_space"], dict)
     assert isinstance(payload["xgb_search_space"], dict)
+    assert payload["preprocess_bundle_include_raw"] is False
+    assert payload["keep_unscaled_oht"] is False

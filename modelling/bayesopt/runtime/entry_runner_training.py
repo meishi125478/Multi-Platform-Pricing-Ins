@@ -22,6 +22,13 @@ from ins_pricing.modelling.bayesopt.utils.distributed_utils import (
     DistributedUtils,
     TrainingUtils,
 )
+from ins_pricing.split_cache import (
+    load_split_cache,
+    resolve_model_scoped_path,
+    validate_split_cache_metadata,
+    validate_split_indices,
+    write_split_cache,
+)
 
 
 @dataclass(frozen=True)
@@ -76,7 +83,7 @@ def _create_ddp_barrier(dist_ctx: Any):
         if not done.wait(timeout=max(1, int(timeout_seconds))):
             raise TimeoutError(
                 f"DDP barrier timed out after {timeout_seconds}s during {reason} "
-                "(legacy wait() without timeout support)."
+                "(wait() without timeout support)."
             )
         if holder["exc"] is not None:
             raise holder["exc"]
@@ -285,101 +292,6 @@ def _resolve_required_columns(
     return _dedupe_columns(cols)
 
 
-def _resolve_model_scoped_path(
-    value: Any,
-    *,
-    model_name: str,
-    base_dir: Path,
-    resolve_path: Callable[..., Optional[Path]],
-) -> Optional[Path]:
-    if value is None:
-        return None
-    candidate = value
-    if isinstance(value, dict):
-        candidate = value.get(model_name)
-        if candidate is None:
-            candidate = value.get("*")
-    if candidate is None:
-        return None
-    candidate_str = str(candidate).strip()
-    if not candidate_str:
-        return None
-    try:
-        candidate_str = candidate_str.format(model_name=model_name)
-    except Exception:
-        pass
-    return resolve_path(candidate_str, base_dir)
-
-
-def _write_split_cache(
-    path: Path,
-    *,
-    train_idx: np.ndarray,
-    test_idx: np.ndarray,
-    row_count: int,
-    meta: Optional[Dict[str, Any]] = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    payload_meta = json.dumps(meta or {}, ensure_ascii=True, sort_keys=True)
-    with tmp_path.open("wb") as f:
-        np.savez_compressed(
-            f,
-            train_idx=np.asarray(train_idx, dtype=np.int64),
-            test_idx=np.asarray(test_idx, dtype=np.int64),
-            row_count=np.asarray([int(row_count)], dtype=np.int64),
-            meta_json=np.asarray([payload_meta]),
-        )
-    tmp_path.replace(path)
-
-
-def _load_split_cache(path: Path) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
-    with np.load(path, allow_pickle=False) as payload:
-        if "train_idx" not in payload or "test_idx" not in payload:
-            raise ValueError(
-                f"split cache missing required arrays train_idx/test_idx: {path}"
-            )
-        train_idx = np.asarray(payload["train_idx"], dtype=np.int64).reshape(-1)
-        test_idx = np.asarray(payload["test_idx"], dtype=np.int64).reshape(-1)
-        row_count = -1
-        if "row_count" in payload:
-            row_count_arr = np.asarray(payload["row_count"], dtype=np.int64).reshape(-1)
-            if row_count_arr.size > 0:
-                row_count = int(row_count_arr[0])
-        meta: Dict[str, Any] = {}
-        if "meta_json" in payload:
-            try:
-                meta_arr = np.asarray(payload["meta_json"]).reshape(-1)
-                if meta_arr.size > 0:
-                    raw_json = str(meta_arr[0]).strip()
-                    if raw_json:
-                        meta = json.loads(raw_json)
-            except Exception:
-                meta = {}
-    return train_idx, test_idx, row_count, meta
-
-
-def _validate_split_indices(
-    *,
-    train_idx: np.ndarray,
-    test_idx: np.ndarray,
-    row_count: int,
-    cache_path: Path,
-) -> None:
-    if row_count <= 0:
-        raise ValueError(f"Invalid row_count={row_count} for split cache: {cache_path}")
-    if train_idx.size == 0 or test_idx.size == 0:
-        raise ValueError(f"split cache has empty train/test indices: {cache_path}")
-    if np.any(train_idx < 0) or np.any(test_idx < 0):
-        raise ValueError(f"split cache contains negative row indices: {cache_path}")
-    if np.any(train_idx >= row_count) or np.any(test_idx >= row_count):
-        raise ValueError(
-            f"split cache row indices exceed dataset bounds row_count={row_count}: {cache_path}"
-        )
-    if np.intersect1d(train_idx, test_idx).size > 0:
-        raise ValueError(f"split cache contains overlapping train/test rows: {cache_path}")
-
-
 def _load_and_split_dataset(
     *,
     deps: BayesOptRunnerDeps,
@@ -462,36 +374,18 @@ def _load_and_split_dataset(
         and split_cache_path.exists()
         and not bool(split_cache_force_rebuild)
     ):
-        train_idx, test_idx, cached_row_count, cache_meta = _load_split_cache(split_cache_path)
-        if cached_row_count > 0 and cached_row_count != dataset_rows:
-            raise ValueError(
-                f"split cache row_count mismatch for {split_cache_path}: "
-                f"cached={cached_row_count}, current={dataset_rows}. "
-                "Set split_cache_force_rebuild=true to regenerate."
-            )
-        cache_strategy = cache_meta.get("split_strategy")
-        cache_holdout = cache_meta.get("holdout_ratio")
-        cache_seed = cache_meta.get("rand_seed")
-        if cache_strategy is not None and str(cache_strategy).strip().lower() != strategy_norm:
-            raise ValueError(
-                f"split cache strategy mismatch for {split_cache_path}: "
-                f"cached={cache_strategy}, current={strategy_norm}. "
-                "Set split_cache_force_rebuild=true to regenerate."
-            )
-        if cache_holdout is not None:
-            if not np.isclose(float(cache_holdout), float(holdout_ratio)):
-                raise ValueError(
-                    f"split cache holdout_ratio mismatch for {split_cache_path}: "
-                    f"cached={cache_holdout}, current={holdout_ratio}. "
-                    "Set split_cache_force_rebuild=true to regenerate."
-                )
-        if cache_seed is not None and cache_seed != rand_seed:
-            raise ValueError(
-                f"split cache rand_seed mismatch for {split_cache_path}: "
-                f"cached={cache_seed}, current={rand_seed}. "
-                "Set split_cache_force_rebuild=true to regenerate."
-            )
-        _validate_split_indices(
+        train_idx, test_idx, cached_row_count, cache_meta = load_split_cache(split_cache_path)
+        validate_split_cache_metadata(
+            cache_path=split_cache_path,
+            cached_row_count=cached_row_count,
+            current_row_count=dataset_rows,
+            cache_meta=cache_meta,
+            split_strategy=strategy_norm,
+            holdout_ratio=float(holdout_ratio),
+            rand_seed=rand_seed,
+            rebuild_hint=True,
+        )
+        validate_split_indices(
             train_idx=train_idx,
             test_idx=test_idx,
             row_count=dataset_rows,
@@ -515,13 +409,13 @@ def _load_and_split_dataset(
         if split_cache_path is not None:
             train_idx = np.asarray(train_df.index.to_numpy(), dtype=np.int64).reshape(-1)
             test_idx = np.asarray(test_df.index.to_numpy(), dtype=np.int64).reshape(-1)
-            _validate_split_indices(
+            validate_split_indices(
                 train_idx=train_idx,
                 test_idx=test_idx,
                 row_count=dataset_rows,
                 cache_path=split_cache_path,
             )
-            _write_split_cache(
+            write_split_cache(
                 split_cache_path,
                 train_idx=train_idx,
                 test_idx=test_idx,
@@ -852,7 +746,12 @@ def _build_runtime_override_payload(
     parallel_flags: Dict[str, Any],
     output_dir: Optional[str],
     reuse_best_params: bool,
+    preprocess_bundle_include_raw: bool,
+    keep_unscaled_oht: bool,
 ) -> Dict[str, Any]:
+    plot_cfg = cfg.get("plot")
+    if not isinstance(plot_cfg, dict):
+        plot_cfg = {}
     return {
         "use_gpu": parallel_flags["use_gpu"],
         "use_resn_data_parallel": parallel_flags["use_resn_dp"],
@@ -898,6 +797,12 @@ def _build_runtime_override_payload(
         "prediction_cache_format": runtime_cfg["prediction_cache_format"],
         "save_preprocess": runtime_cfg["save_preprocess"],
         "preprocess_artifact_path": runtime_cfg["preprocess_artifact_path"],
+        "preprocess_bundle_include_raw": bool(preprocess_bundle_include_raw),
+        "keep_unscaled_oht": bool(keep_unscaled_oht),
+        "plot_max_rows": plot_cfg.get("max_rows", cfg.get("plot_max_rows")),
+        "plot_oneway_max_rows": plot_cfg.get("oneway_max_rows", cfg.get("plot_oneway_max_rows")),
+        "plot_curve_max_rows": plot_cfg.get("curve_max_rows", cfg.get("plot_curve_max_rows")),
+        "plot_sampling_seed": plot_cfg.get("sampling_seed", cfg.get("plot_sampling_seed")),
     }
 
 
@@ -1087,19 +992,19 @@ def run_bayesopt_entry_training(
                 f"[Data] projected column loading enabled: {len(required_columns)} columns",
                 flush=True,
             )
-        train_data_path = _resolve_model_scoped_path(
+        train_data_path = resolve_model_scoped_path(
             train_data_path_cfg,
             model_name=model_name,
             base_dir=config_path.parent,
             resolve_path=deps.resolve_path,
         )
-        test_data_path = _resolve_model_scoped_path(
+        test_data_path = resolve_model_scoped_path(
             test_data_path_cfg,
             model_name=model_name,
             base_dir=config_path.parent,
             resolve_path=deps.resolve_path,
         )
-        split_cache_path = _resolve_model_scoped_path(
+        split_cache_path = resolve_model_scoped_path(
             split_cache_path_cfg,
             model_name=model_name,
             base_dir=config_path.parent,
@@ -1240,6 +1145,29 @@ def run_bayesopt_entry_training(
 
         model_overrides = _resolve_model_override_fields(args=args, cfg=cfg)
         ft_role = model_overrides["ft_role"]
+        requested_keys = _resolve_requested_model_keys(
+            args_model_keys=args.model_keys,
+            args_stack_model_keys=args.stack_model_keys,
+            cfg_stack_model_keys=cfg.get("stack_model_keys"),
+            ft_role=ft_role,
+            dedupe_preserve_order=deps.dedupe_preserve_order,
+        )
+        known_model_keys = {"glm", "xgb", "resn", "ft", "gnn"}
+        invalid_requested = [k for k in requested_keys if k not in known_model_keys]
+        if invalid_requested:
+            raise ValueError(
+                f"Unknown requested model key(s): {invalid_requested}. "
+                f"Valid keys: {sorted(known_model_keys)}"
+            )
+
+        raw_feature_models = {"glm", "xgb", "ft"}
+        preprocess_bundle_include_raw = bool(
+            ft_role != "model"
+            or any(key in raw_feature_models for key in requested_keys)
+        )
+        keep_unscaled_oht = bool(cfg.get("keep_unscaled_oht", False))
+        if use_shared_preprocess and bool(ddp_enabled):
+            keep_unscaled_oht = False
 
         preprocess_bundle_options = _resolve_preprocess_bundle_options(
             use_shared_preprocess=use_shared_preprocess,
@@ -1253,6 +1181,8 @@ def run_bayesopt_entry_training(
             parallel_flags=parallel_flags,
             output_dir=output_dir,
             reuse_best_params=reuse_best_params,
+            preprocess_bundle_include_raw=preprocess_bundle_include_raw,
+            keep_unscaled_oht=keep_unscaled_oht,
         )
         split_override_payload = _build_split_override_payload(split_cfg)
         override_payload = _build_override_payload(
@@ -1275,21 +1205,6 @@ def run_bayesopt_entry_training(
             override_payload=override_payload,
         )
         config = deps.ropt.BayesOptConfig.from_flat_dict(config_payload)
-
-        requested_keys = _resolve_requested_model_keys(
-            args_model_keys=args.model_keys,
-            args_stack_model_keys=args.stack_model_keys,
-            cfg_stack_model_keys=cfg.get("stack_model_keys"),
-            ft_role=ft_role,
-            dedupe_preserve_order=deps.dedupe_preserve_order,
-        )
-        known_model_keys = {"glm", "xgb", "resn", "ft", "gnn"}
-        invalid_requested = [k for k in requested_keys if k not in known_model_keys]
-        if invalid_requested:
-            raise ValueError(
-                f"Unknown requested model key(s): {invalid_requested}. "
-                f"Valid keys: {sorted(known_model_keys)}"
-            )
 
         # In torchrun non-DDP mode, non-main ranks only coordinate barriers and
         # skip all heavy dataset/model construction.

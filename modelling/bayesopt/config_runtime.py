@@ -74,8 +74,8 @@ class VersionManager:
         _log(f"[Version] Saved snapshot: {path}")
         return str(path)
 
-    def load_latest(self, tag: str) -> Optional[Dict[str, Any]]:
-        """Load the latest snapshot for a tag (sorted by timestamp prefix)."""
+    def load(self, tag: str) -> Optional[Dict[str, Any]]:
+        """Load the most recent snapshot for a tag."""
         safe_tag = tag.replace(" ", "_")
         pattern = f"*_{safe_tag}.json"
         candidates = sorted(self.version_dir.glob(pattern))

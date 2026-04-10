@@ -13,6 +13,21 @@ from ins_pricing.modelling.bayesopt.runtime.trainer_optuna import TrainerOptunaM
 from ins_pricing.modelling.bayesopt.runtime.trainer_persistence import (
     TrainerPersistenceMixin,
 )
+from ins_pricing.modelling.bayesopt.runtime.data_registry import DataRegistry
+from ins_pricing.modelling.bayesopt.runtime.dispatcher import (
+    EngineDecision,
+    resolve_engine_decision,
+)
+from ins_pricing.modelling.bayesopt.runtime.objective_service import ObjectiveService
+from ins_pricing.modelling.bayesopt.runtime.trial_executor import (
+    BackendKernel,
+    TrialExecutor,
+)
+from ins_pricing.modelling.bayesopt.runtime.types import (
+    FoldResult,
+    FoldSlice,
+    RowStore,
+)
 
 __all__ = [
     "TrainerCVPredictionMixin",
@@ -20,5 +35,13 @@ __all__ = [
     "BayesOptRunnerHooks",
     "TrainerOptunaMixin",
     "TrainerPersistenceMixin",
+    "DataRegistry",
+    "EngineDecision",
+    "FoldResult",
+    "FoldSlice",
+    "ObjectiveService",
+    "RowStore",
+    "TrialExecutor",
+    "resolve_engine_decision",
     "run_bayesopt_entry_training",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,13 +29,14 @@ class ModelVersion:
 
 
 class ModelRegistry:
-    """Lightweight JSON-based model registry with legacy API compatibility."""
+    """Lightweight JSON-based model registry."""
 
     def __init__(self, registry_path: str | Path):
         self.registry_path = Path(registry_path)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self._io_lock = threading.RLock()
 
-    def _load(self) -> Dict[str, List[dict]]:
+    def _load_unlocked(self) -> Dict[str, List[dict]]:
         if not self.registry_path.exists():
             return {}
         with self.registry_path.open("r", encoding="utf-8") as fh:
@@ -43,9 +45,20 @@ class ModelRegistry:
             return {}
         return {str(k): list(v) for k, v in payload.items()}
 
-    def _save(self, payload: Dict[str, List[dict]]) -> None:
-        with self.registry_path.open("w", encoding="utf-8") as fh:
+    def _load(self) -> Dict[str, List[dict]]:
+        with self._io_lock:
+            return self._load_unlocked()
+
+    def _save_unlocked(self, payload: Dict[str, List[dict]]) -> None:
+        tmp_path = self.registry_path.with_suffix(f"{self.registry_path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, ensure_ascii=True)
+            fh.flush()
+        tmp_path.replace(self.registry_path)
+
+    def _save(self, payload: Dict[str, List[dict]]) -> None:
+        with self._io_lock:
+            self._save_unlocked(payload)
 
     @staticmethod
     def _version_key(version: Any) -> Tuple[int, ...]:
@@ -139,15 +152,16 @@ class ModelRegistry:
                 }
             )
 
-        payload = self._load()
-        model_name = entry["model_name"]
-        versions = payload.setdefault(model_name, [])
-        if any(str(v.get("version")) == str(entry["version"]) for v in versions):
-            raise GovernanceError(
-                f"Model '{model_name}' version '{entry['version']}' already exists."
-            )
-        versions.append(entry)
-        self._save(payload)
+        with self._io_lock:
+            payload = self._load_unlocked()
+            model_name = entry["model_name"]
+            versions = payload.setdefault(model_name, [])
+            if any(str(v.get("version")) == str(entry["version"]) for v in versions):
+                raise GovernanceError(
+                    f"Model '{model_name}' version '{entry['version']}' already exists."
+                )
+            versions.append(entry)
+            self._save_unlocked(payload)
         return self._to_model_version(entry)
 
     def exists(self, name: str) -> bool:
@@ -177,41 +191,43 @@ class ModelRegistry:
         *,
         version: Optional[str] = None,
     ) -> Dict[str, Any]:
-        payload = self._load()
-        if name not in payload or not payload[name]:
-            raise GovernanceError(f"Model '{name}' not found.")
-        entries = payload[name]
+        with self._io_lock:
+            payload = self._load_unlocked()
+            if name not in payload or not payload[name]:
+                raise GovernanceError(f"Model '{name}' not found.")
+            entries = payload[name]
 
-        target_idx = -1
-        if version is None:
-            versions = [self._version_key(v.get("version")) for v in entries]
-            target_idx = int(max(range(len(entries)), key=lambda i: versions[i]))
-        else:
-            for idx, entry in enumerate(entries):
-                if str(entry.get("version")) == str(version):
-                    target_idx = idx
-                    break
-        if target_idx < 0:
-            raise GovernanceError(f"Model '{name}' version '{version}' not found.")
+            target_idx = -1
+            if version is None:
+                versions = [self._version_key(v.get("version")) for v in entries]
+                target_idx = int(max(range(len(entries)), key=lambda i: versions[i]))
+            else:
+                for idx, entry in enumerate(entries):
+                    if str(entry.get("version")) == str(version):
+                        target_idx = idx
+                        break
+            if target_idx < 0:
+                raise GovernanceError(f"Model '{name}' version '{version}' not found.")
 
-        entries[target_idx] = {**entries[target_idx], **dict(updates)}
-        payload[name] = entries
-        self._save(payload)
-        return dict(entries[target_idx])
+            entries[target_idx] = {**entries[target_idx], **dict(updates)}
+            payload[name] = entries
+            self._save_unlocked(payload)
+            return dict(entries[target_idx])
 
     def delete(self, name: str, *, version: Optional[str] = None) -> None:
-        payload = self._load()
-        if name not in payload:
-            return
-        if version is None:
-            payload.pop(name, None)
-        else:
-            kept = [v for v in payload[name] if str(v.get("version")) != str(version)]
-            if kept:
-                payload[name] = kept
-            else:
+        with self._io_lock:
+            payload = self._load_unlocked()
+            if name not in payload:
+                return
+            if version is None:
                 payload.pop(name, None)
-        self._save(payload)
+            else:
+                kept = [v for v in payload[name] if str(v.get("version")) != str(version)]
+                if kept:
+                    payload[name] = kept
+                else:
+                    payload.pop(name, None)
+            self._save_unlocked(payload)
 
     def get_versions(self, name: str) -> List[str]:
         payload = self._load()
@@ -241,16 +257,17 @@ class ModelRegistry:
     def promote(
         self, name: str, version: str, *, new_status: str = "production"
     ) -> None:
-        payload = self._load()
-        if name not in payload:
-            raise GovernanceError("Model not found in registry.")
-        updated = False
-        for entry in payload[name]:
-            if str(entry.get("version")) == str(version):
-                entry["status"] = new_status
-                updated = True
-            elif new_status == "production" and entry.get("status") == "production":
-                entry["status"] = "archived"
-        if not updated:
-            raise GovernanceError("Version not found in registry.")
-        self._save(payload)
+        with self._io_lock:
+            payload = self._load_unlocked()
+            if name not in payload:
+                raise GovernanceError("Model not found in registry.")
+            updated = False
+            for entry in payload[name]:
+                if str(entry.get("version")) == str(version):
+                    entry["status"] = new_status
+                    updated = True
+                elif new_status == "production" and entry.get("status") == "production":
+                    entry["status"] = "archived"
+            if not updated:
+                raise GovernanceError("Version not found in registry.")
+            self._save_unlocked(payload)

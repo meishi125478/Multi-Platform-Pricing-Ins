@@ -62,26 +62,29 @@ def test_best_params_filename_and_model_key_mapping(monkeypatch: pytest.MonkeyPa
     assert artifacts.trainer_label_from_model_key("custom") == "custom"
 
 
-def test_load_best_params_prefers_version_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_load_best_params_ignores_versions_snapshot_and_reads_csv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     artifacts = _load_artifacts_module(monkeypatch)
     result_dir = tmp_path / "Results"
     versions_dir = result_dir / "versions"
     versions_dir.mkdir(parents=True)
 
-    (versions_dir / "20260101_120000_resn_best.json").write_text(
-        json.dumps({"best_params": {"hidden_dim": 32}}),
+    (versions_dir / "20260102_120000_xgb_best.json").write_text(
+        json.dumps({"best_params": {"depth": 6}}),
         encoding="utf-8",
     )
-    (result_dir / "demo_bestparams_resnet.csv").write_text(
-        "hidden_dim,dropout\n64,0.1\n",
+    (result_dir / "demo_bestparams_xgboost.csv").write_text(
+        "depth,learning_rate\n3,0.05\n",
         encoding="utf-8",
     )
 
-    loaded = artifacts.load_best_params(tmp_path, "demo", "resn")
-    assert loaded == {"hidden_dim": 32}
+    loaded = artifacts.load_best_params(tmp_path, "demo", "xgb")
+    assert loaded == {"depth": 3.0, "learning_rate": 0.05}
 
 
-def test_load_best_params_falls_back_to_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_load_best_params_reads_base_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     artifacts = _load_artifacts_module(monkeypatch)
     result_dir = tmp_path / "Results"
     result_dir.mkdir(parents=True)
@@ -92,6 +95,39 @@ def test_load_best_params_falls_back_to_csv(tmp_path: Path, monkeypatch: pytest.
 
     loaded = artifacts.load_best_params(tmp_path, "demo", "resn")
     assert loaded == {"hidden_dim": 64.0, "dropout": 0.2}
+
+
+def test_load_best_params_returns_none_when_no_supported_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    artifacts = _load_artifacts_module(monkeypatch)
+    result_dir = tmp_path / "Results"
+    result_dir.mkdir(parents=True)
+    (result_dir / "demo_bestparams_xgboost_old.csv").write_text(
+        "hidden_dim,dropout\n22,0.22\n",
+        encoding="utf-8",
+    )
+    (result_dir / "demo_bestparams_custom.csv").write_text(
+        "hidden_dim,dropout\n44,0.44\n",
+        encoding="utf-8",
+    )
+
+    loaded = artifacts.load_best_params(tmp_path, "demo", "xgb")
+    assert loaded is None
+
+
+def test_load_best_params_reads_base_csv_for_xgb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    artifacts = _load_artifacts_module(monkeypatch)
+    result_dir = tmp_path / "Results"
+    result_dir.mkdir(parents=True)
+    (result_dir / "demo_bestparams_xgboost.csv").write_text(
+        "hidden_dim,dropout\n11,0.11\n",
+        encoding="utf-8",
+    )
+
+    loaded = artifacts.load_best_params(tmp_path, "demo", "xgb")
+    assert loaded == {"hidden_dim": 11.0, "dropout": 0.11}
 
 
 def test_rebuild_ft_model_from_payload_merges_missing_config(monkeypatch: pytest.MonkeyPatch):
@@ -202,4 +238,3 @@ def test_rebuild_gnn_model_from_payload_requires_dict_payload():
             payload="bad",
             model_builder=lambda params: object(),
         )
-

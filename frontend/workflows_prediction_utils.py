@@ -5,8 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
+from ins_pricing.split_cache import (
+    load_split_cache,
+    resolve_model_scoped_path,
+    validate_split_cache_metadata,
+    validate_split_indices,
+    write_split_cache,
+)
 
 from .workflows_common import (
     _discover_model_file,
@@ -78,24 +86,89 @@ def load_raw_splits(
         raw = _drop_duplicate_columns(raw, "raw").reset_index(drop=True)
         raw.fillna(0, inplace=True)
 
-        holdout_ratio = split_cfg.get("holdout_ratio", split_cfg.get("prop_test", 0.25))
+        holdout_ratio = float(split_cfg.get("holdout_ratio", split_cfg.get("prop_test", 0.25)))
         split_strategy = split_cfg.get("split_strategy", "random")
         split_group_col = split_cfg.get("split_group_col")
         split_time_col = split_cfg.get("split_time_col")
         split_time_ascending = split_cfg.get("split_time_ascending", True)
         rand_seed = split_cfg.get("rand_seed", 13)
-
-        train_raw, test_raw = _split_train_test(
-            raw,
-            holdout_ratio=holdout_ratio,
-            strategy=split_strategy,
-            group_col=split_group_col,
-            time_col=split_time_col,
-            time_ascending=split_time_ascending,
-            rand_seed=rand_seed,
-            reset_index_mode="none",
-            ratio_label="holdout_ratio",
+        split_cache_path = resolve_model_scoped_path(
+            split_cfg.get("split_cache_path"),
+            model_name=model_name,
+            base_dir=data_cfg_path.parent,
         )
+        split_cache_force_rebuild = bool(split_cfg.get("split_cache_force_rebuild", False))
+        strategy_norm = str(split_strategy or "random").strip().lower() or "random"
+
+        def _split_and_optionally_write_cache() -> tuple[pd.DataFrame, pd.DataFrame]:
+            train_local, test_local = _split_train_test(
+                raw,
+                holdout_ratio=holdout_ratio,
+                strategy=split_strategy,
+                group_col=split_group_col,
+                time_col=split_time_col,
+                time_ascending=split_time_ascending,
+                rand_seed=rand_seed,
+                reset_index_mode="none",
+                ratio_label="holdout_ratio",
+            )
+            if split_cache_path is not None:
+                train_idx_local = np.asarray(
+                    train_local.index.to_numpy(), dtype=np.int64
+                ).reshape(-1)
+                test_idx_local = np.asarray(
+                    test_local.index.to_numpy(), dtype=np.int64
+                ).reshape(-1)
+                validate_split_indices(
+                    train_idx=train_idx_local,
+                    test_idx=test_idx_local,
+                    row_count=len(raw),
+                    cache_path=split_cache_path,
+                )
+                write_split_cache(
+                    split_cache_path,
+                    train_idx=train_idx_local,
+                    test_idx=test_idx_local,
+                    row_count=len(raw),
+                    meta={
+                        "split_strategy": strategy_norm,
+                        "holdout_ratio": holdout_ratio,
+                        "rand_seed": rand_seed,
+                        "data_path": str(raw_path),
+                    },
+                )
+                _log(f"[Split] Created split cache: {split_cache_path}")
+            return train_local, test_local
+
+        if (
+            split_cache_path is not None
+            and split_cache_path.exists()
+            and not split_cache_force_rebuild
+        ):
+            train_idx, test_idx, cached_row_count, cache_meta = load_split_cache(split_cache_path)
+            validate_split_cache_metadata(
+                cache_path=split_cache_path,
+                cached_row_count=cached_row_count,
+                current_row_count=len(raw),
+                cache_meta=cache_meta,
+                split_strategy=strategy_norm,
+                holdout_ratio=float(holdout_ratio),
+                rand_seed=rand_seed,
+                data_path=str(raw_path),
+                rebuild_hint=True,
+            )
+            validate_split_indices(
+                train_idx=train_idx,
+                test_idx=test_idx,
+                row_count=len(raw),
+                cache_path=split_cache_path,
+            )
+            train_raw = raw.iloc[train_idx].copy()
+            test_raw = raw.iloc[test_idx].copy()
+            _log(f"[Split] Reused split cache: {split_cache_path}")
+        else:
+            train_raw, test_raw = _split_and_optionally_write_cache()
+
         train_raw = _drop_duplicate_columns(train_raw, "train_raw")
         test_raw = _drop_duplicate_columns(test_raw, "test_raw")
 

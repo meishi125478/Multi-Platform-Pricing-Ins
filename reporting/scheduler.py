@@ -5,6 +5,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
+from ins_pricing.utils import get_logger
+
+_logger = get_logger("ins_pricing.reporting.scheduler")
+
 
 def _next_run(run_time: str, now: Optional[datetime] = None) -> datetime:
     if now is None:
@@ -36,8 +40,8 @@ def schedule_daily(
                 break
             try:
                 job_fn()
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.exception("Scheduled job failed: %s", exc)
             time.sleep(1)
 
     thread = threading.Thread(target=_loop, daemon=True)

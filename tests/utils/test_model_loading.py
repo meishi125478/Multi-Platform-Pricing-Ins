@@ -36,7 +36,7 @@ def test_load_pickle_artifact_blocks_untrusted_global_by_default(tmp_path):
         pickle.dump(Path("abc"), fh, protocol=pickle.HIGHEST_PROTOCOL)
 
     with pytest.raises(ModelLoadError):
-        load_pickle_artifact(path, allow_unsafe=False)
+        load_pickle_artifact(path)
 
 
 def test_load_pickle_artifact_allows_xgb_wrapper_payload(tmp_path):
@@ -58,6 +58,6 @@ def test_load_pickle_artifact_allows_xgb_wrapper_payload(tmp_path):
     with path.open("wb") as fh:
         pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
-    loaded = load_pickle_artifact(path, allow_unsafe=False)
+    loaded = load_pickle_artifact(path)
     assert isinstance(loaded, dict)
     assert isinstance(loaded.get("model"), _XGBDMatrixWrapper)

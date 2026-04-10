@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 
 from ins_pricing.exceptions import ConfigurationError
@@ -6,7 +8,6 @@ from ins_pricing.utils.losses import (
     normalize_distribution_name,
     resolve_effective_loss_name,
 )
-
 
 def test_distribution_overrides_loss_name_for_regression():
     assert (
@@ -218,4 +219,30 @@ def test_config_rejects_invalid_invalid_param_policy():
             factor_nmes=["x1"],
             task_type="regression",
             invalid_param_policy="drop",
+        )
+
+
+def test_config_has_no_version_selector_fields():
+    cfg = BayesOptConfig(
+        model_nme="demo",
+        resp_nme="y",
+        weight_nme="w",
+        factor_nmes=["x1"],
+        task_type="regression",
+    )
+    assert not hasattr(cfg, "engine_by_model")
+    assert not hasattr(cfg, "artifact_compat_mode")
+    assert not hasattr(cfg, "checkpoint_read_mode")
+    assert not hasattr(cfg, "checkpoint_write_mode")
+
+
+def test_config_rejects_removed_version_fields():
+    with pytest.raises(TypeError, match="engine_by_model"):
+        BayesOptConfig(
+            model_nme="demo",
+            resp_nme="y",
+            weight_nme="w",
+            factor_nmes=["x1"],
+            task_type="regression",
+            engine_by_model={"xgb": "x"},
         )

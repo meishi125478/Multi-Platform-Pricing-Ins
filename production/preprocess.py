@@ -81,7 +81,11 @@ def _coerce_categorical(
         extra_categories = [
             value for value in observed_values if value not in base_set
         ]
-        out = pd.Categorical(out, categories=base_categories + extra_categories)
+        out = pd.Series(
+            pd.Categorical(out, categories=base_categories + extra_categories),
+            index=series.index,
+            name=series.name,
+        )
     return out
 
 
@@ -288,15 +292,13 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
     num_features = set(artifacts.get("num_features") or [])
     cat_categories = artifacts.get("cat_categories") or {}
 
-    work = df.copy()
+    prepared_cols: List[pd.Series] = []
+    missing_col = pd.Series(pd.NA, index=df.index)
     for col in factor_nmes:
-        if col not in work.columns:
-            work[col] = pd.NA
-
-    for col in factor_nmes:
+        source_col = df[col] if col in df.columns else missing_col
         if col in num_features:
-            work[col] = _coerce_numeric(
-                work[col],
+            converted = _coerce_numeric(
+                source_col,
                 fill_value=0.0,
                 strict=True,
                 column_name=col,
@@ -304,10 +306,14 @@ def prepare_raw_features(df: pd.DataFrame, artifacts: Dict[str, Any]) -> pd.Data
         else:
             cats = cat_categories.get(col)
             category_list = cats if isinstance(cats, list) and cats else None
-            work[col] = _coerce_categorical(work[col], categories=category_list, fill_value="<NA>")
+            converted = _coerce_categorical(
+                source_col,
+                categories=category_list,
+                fill_value="<NA>",
+            )
+        prepared_cols.append(converted.rename(col))
 
-    if factor_nmes:
-        work = work[factor_nmes]
+    work = pd.concat(prepared_cols, axis=1) if prepared_cols else pd.DataFrame(index=df.index)
     return work
 
 

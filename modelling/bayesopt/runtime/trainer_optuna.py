@@ -26,6 +26,31 @@ def _log(*args, **kwargs) -> None:
 
 
 class TrainerOptunaMixin:
+    @staticmethod
+    def _default_optuna_storage_from_output_dir(output_dir: Any) -> Optional[str]:
+        raw = str(output_dir or "").strip()
+        if not raw:
+            return None
+        return str(Path(raw) / "optuna" / "bayesopt.sqlite3")
+
+    def _resolve_model_key_for_namespace(self) -> str:
+        label = str(getattr(self, "label", "") or "").strip().lower()
+        prefix = str(getattr(self, "model_name_prefix", "") or "").strip().lower()
+        if "xgboost" in label or "xgboost" in prefix:
+            return "xgb"
+        if label == "glm" or prefix == "glm":
+            return "glm"
+        if "resnet" in label or "resnet" in prefix:
+            return "resn"
+        if "fttransformer" in label or "fttransformer" in prefix:
+            return "ft"
+        if "gnn" in label or "gnn" in prefix:
+            return "gnn"
+        return prefix or label or "unknown"
+
+    def _resolve_best_params_label(self) -> str:
+        return str(self.label)
+
     def _sanitize_best_params_payload(
         self,
         params: Optional[Dict[str, Any]],
@@ -136,7 +161,7 @@ class TrainerOptunaMixin:
         if not done.wait(timeout=max(1, int(timeout_seconds))):
             raise TimeoutError(
                 f"[DDP][{self.label}] barrier timed out after {timeout_seconds}s "
-                f"during {reason} (legacy wait() without timeout support)."
+                f"during {reason} (wait() without timeout support)."
             )
         if holder["exc"] is not None:
             raise holder["exc"]
@@ -208,6 +233,10 @@ class TrainerOptunaMixin:
     def _resolve_optuna_storage_url(self) -> Optional[str]:
         storage = getattr(self.config, "optuna_storage", None)
         if not storage:
+            storage = self._default_optuna_storage_from_output_dir(
+                getattr(self.config, "output_dir", None)
+            )
+        if not storage:
             return None
         storage_str = str(storage).strip()
         if not storage_str:
@@ -233,7 +262,7 @@ class TrainerOptunaMixin:
         path = best_params_csv_path(
             self.output.result_dir,
             self.ctx.model_nme,
-            self.label,
+            self._resolve_best_params_label(),
         )
         ensure_parent_dir(str(path))
         return str(path)
@@ -538,31 +567,11 @@ class TrainerOptunaMixin:
                     self._clean_gpu(synchronize=self._optuna_cleanup_sync())
                     self._dist_barrier("worker_end")
 
-    def _fallback_to_single_process(
-        self,
-        max_evals: int,
-        objective_fn: Callable[[optuna.trial.Trial], float],
-        reason: str,
-    ) -> None:
-        _log(
-            f"[Optuna][{self.label}] {reason}. Fallback to single-process.",
-            flush=True,
-        )
-        prev = self.enable_distributed_optuna
-        self.enable_distributed_optuna = False
-        try:
-            self.tune(max_evals, objective_fn)
-        finally:
-            self.enable_distributed_optuna = prev
-
     def _distributed_tune(self, max_evals: int, objective_fn: Callable[[optuna.trial.Trial], float]) -> None:
         if dist is None:
-            self._fallback_to_single_process(
-                max_evals,
-                objective_fn,
-                "torch.distributed unavailable",
+            raise RuntimeError(
+                f"[Optuna][{self.label}] distributed mode requires torch.distributed."
             )
-            return
         DistributedUtils.setup_ddp()
         if not dist.is_initialized():
             rank_env = os.environ.get("RANK", "0")
@@ -572,12 +581,9 @@ class TrainerOptunaMixin:
                     flush=True,
                 )
                 return
-            self._fallback_to_single_process(
-                max_evals,
-                objective_fn,
-                "DDP init failed",
+            raise RuntimeError(
+                f"[Optuna][{self.label}] distributed mode requested but DDP init failed."
             )
-            return
         if not self._distributed_is_main():
             self._distributed_worker_loop(objective_fn)
             return
