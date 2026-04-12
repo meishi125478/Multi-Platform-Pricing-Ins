@@ -53,6 +53,7 @@ DEFAULT_CONFIG_COMMENTS = {
   "env.OMP_NUM_THREADS": "OMP_NUM_THREADS value (controls OpenMP CPU threads).",
   "env.OPENBLAS_NUM_THREADS": "OPENBLAS_NUM_THREADS value (controls OpenBLAS CPU threads).",
   "env.PYTORCH_ENABLE_MPS_FALLBACK": "Enable CPU fallback for unsupported MPS ops. Allowed: 0/1.",
+  "env.INS_PRICING_ALLOW_LEGACY_TORCH_LOAD": "Allow trusted torch1.x fallback when weights_only load is unavailable. Allowed: 0/1.",
   "env.TORCHDYNAMO_DISABLE": "Disable TorchDynamo. Allowed: 0/1.",
   "env.TORCHDYNAMO_SUPPRESS_ERRORS": "Suppress TorchDynamo errors and fallback to eager mode. Allowed: 0/1.",
   "env.TORCHINDUCTOR_DISABLE": "Disable TorchInductor backend. Allowed: 0/1.",

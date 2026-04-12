@@ -475,7 +475,13 @@ class TrainerCVPredictionMixin:
         vals = history.get("val") or []
         if not vals:
             return max(1, int(default_epochs))
-        best_idx = int(np.nanargmin(vals))
+        vals_arr = np.asarray(vals, dtype=float).reshape(-1)
+        finite_mask = np.isfinite(vals_arr)
+        if not finite_mask.any():
+            return max(1, int(default_epochs))
+        finite_idx = np.flatnonzero(finite_mask)
+        best_local = int(np.argmin(vals_arr[finite_mask]))
+        best_idx = int(finite_idx[best_local])
         return max(1, best_idx + 1)
 
     def _fit_predict_cache(self,

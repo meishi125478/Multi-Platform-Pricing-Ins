@@ -334,8 +334,8 @@ def coerce_dataset_types(raw: pd.DataFrame) -> pd.DataFrame:
             data[col] = s.astype(np.int8, copy=False)
             continue
         if pd.api.types.is_numeric_dtype(s):
-            s_num = pd.to_numeric(s, errors="coerce").fillna(0)
-            data[col] = s_num.astype(np.float32, copy=False)
+            # Preserve NaN and avoid silent precision downcast.
+            data[col] = pd.to_numeric(s, errors="coerce")
             continue
         if pd.api.types.is_object_dtype(s) and s.hasnans:
             # Keep string-like columns as-is, but normalize missing markers.

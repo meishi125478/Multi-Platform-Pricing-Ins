@@ -27,11 +27,15 @@ def _log(*args, **kwargs) -> None:
 
 try:
     from ins_pricing.modelling.plotting import curves as plot_curves
-    from ins_pricing.modelling.plotting import diagnostics as plot_diagnostics
-    from ins_pricing.modelling.plotting.common import PlotStyle, finalize_figure
 except Exception:  # pragma: no cover
     plot_curves = None
+try:
+    from ins_pricing.modelling.plotting import diagnostics as plot_diagnostics
+except Exception:  # pragma: no cover
     plot_diagnostics = None
+try:
+    from ins_pricing.modelling.plotting.common import PlotStyle, finalize_figure
+except Exception:  # pragma: no cover
     PlotStyle = None
     finalize_figure = None
 
@@ -243,6 +247,30 @@ class BayesOptPlottingMixin:
     def _dataset_split_name(label: str) -> str:
         return "train" if "Train" in label else "test"
 
+    @staticmethod
+    def _load_plot_curves_module():
+        global plot_curves
+        if plot_curves is not None:
+            return plot_curves
+        try:
+            from ins_pricing.modelling.plotting import curves as _plot_curves
+        except Exception:
+            return None
+        plot_curves = _plot_curves
+        return plot_curves
+
+    @staticmethod
+    def _load_plot_diagnostics_module():
+        global plot_diagnostics
+        if plot_diagnostics is not None:
+            return plot_diagnostics
+        try:
+            from ins_pricing.modelling.plotting import diagnostics as _plot_diagnostics
+        except Exception:
+            return None
+        plot_diagnostics = _plot_diagnostics
+        return plot_diagnostics
+
     def _resolve_curve_sample_positions(
         self,
         *,
@@ -342,37 +370,68 @@ class BayesOptPlottingMixin:
         title: str,
         save_path: str,
     ) -> None:
-        fig = plt.figure(figsize=(7, 5))
-        if not is_categorical:
-            bins = pd.qcut(
-                pd.to_numeric(plot_source[feature], errors="coerce"),
-                n_bins,
-                duplicates="drop",
+        diagnostics_mod = self._load_plot_diagnostics_module()
+        if diagnostics_mod is not None:
+            diagnostics_mod.plot_oneway(
+                plot_source,
+                feature=feature,
+                weight_col=self.weight_nme,
+                target_col="w_act",
+                target_weighted=True,
+                pred_col=pred_col,
+                pred_weighted=pred_weighted,
+                pred_label=pred_label,
+                n_bins=n_bins,
+                is_categorical=is_categorical,
+                title=title,
+                save_path=save_path,
+                show=False,
             )
-            plot_source = plot_source.assign(**{group_col: bins})
+            return
+
+        fig = plt.figure(figsize=(7, 5))
+        weight_values = pd.to_numeric(plot_source[self.weight_nme], errors="coerce")
+        actual_weighted = pd.to_numeric(plot_source["w_act"], errors="coerce")
+        if is_categorical:
+            group_values = plot_source[feature]
+        else:
+            numeric_feature = pd.to_numeric(plot_source[feature], errors="coerce")
+            try:
+                group_values = pd.qcut(numeric_feature, n_bins, duplicates="drop")
+            except ValueError:
+                group_values = pd.cut(
+                    numeric_feature,
+                    bins=max(1, int(n_bins)),
+                    duplicates="drop",
+                )
+
+        payload = pd.DataFrame(
+            {
+                group_col: group_values,
+                "_weight": weight_values,
+                "_act_w": actual_weighted,
+            }
+        )
         if pred_col is not None and pred_col in plot_source.columns:
             pred_values = pd.to_numeric(plot_source[pred_col], errors="coerce")
-            if pred_weighted:
-                plot_source = plot_source.assign(_pred_w=pred_values)
-            else:
-                plot_source = plot_source.assign(
-                    _pred_w=pred_values
-                    * pd.to_numeric(plot_source[self.weight_nme], errors="coerce")
-                )
-        plot_data = plot_source.groupby([group_col], observed=True).sum(numeric_only=True)
-        plot_data.reset_index(inplace=True)
+            payload["_pred_w"] = pred_values if pred_weighted else pred_values * weight_values
+
+        agg_spec = {"_weight": "sum", "_act_w": "sum"}
+        if "_pred_w" in payload.columns:
+            agg_spec["_pred_w"] = "sum"
+        plot_data = payload.groupby(group_col, observed=True).agg(agg_spec).reset_index()
         plot_data["act_v"] = (
-            pd.to_numeric(plot_data["w_act"], errors="coerce")
+            pd.to_numeric(plot_data["_act_w"], errors="coerce")
             / np.maximum(
-                pd.to_numeric(plot_data[self.weight_nme], errors="coerce"),
+                pd.to_numeric(plot_data["_weight"], errors="coerce"),
                 EPS,
             )
         )
-        if pred_col is not None and "_pred_w" in plot_data.columns:
+        if "_pred_w" in plot_data.columns:
             plot_data["pred_v"] = (
                 pd.to_numeric(plot_data["_pred_w"], errors="coerce")
                 / np.maximum(
-                    pd.to_numeric(plot_data[self.weight_nme], errors="coerce"),
+                    pd.to_numeric(plot_data["_weight"], errors="coerce"),
                     EPS,
                 )
             )
@@ -393,7 +452,7 @@ class BayesOptPlottingMixin:
         ax2 = ax.twinx()
         ax2.bar(
             plot_data.index,
-            plot_data[self.weight_nme],
+            plot_data["_weight"],
             alpha=0.5,
             color="seagreen",
         )
@@ -416,37 +475,54 @@ class BayesOptPlottingMixin:
         title: str,
         n_bins: int,
     ) -> None:
-        weighted_binary = binary_vals * weight_vals
-        plot_data = pd.DataFrame(
-            {
-                model_pred_col: pred_vals,
-                self.weight_nme: weight_vals,
-                "w_binary_act": weighted_binary,
-            }
-        )
-        plot_data = plot_data.sort_values(by=model_pred_col).copy()
-        plot_data["cum_weight"] = plot_data[self.weight_nme].cumsum()
-        total_weight = plot_data[self.weight_nme].sum()
-        if total_weight > EPS:
-            plot_data["bin"] = pd.cut(
-                plot_data["cum_weight"],
-                bins=n_bins,
-                labels=False,
-                right=False,
+        curves_mod = self._load_plot_curves_module()
+        if curves_mod is not None:
+            curves_mod.plot_conversion_lift(
+                pred_vals,
+                binary_vals,
+                weight_vals,
+                n_bins=n_bins,
+                title=title,
+                ax=ax,
+                show=False,
             )
+            return
+
+        pred_arr = np.asarray(pred_vals, dtype=float)
+        binary_arr = np.asarray(binary_vals, dtype=float)
+        weight_arr = np.asarray(weight_vals, dtype=float)
+        mask = np.isfinite(pred_arr) & np.isfinite(binary_arr) & np.isfinite(weight_arr)
+        pred_arr = pred_arr[mask]
+        binary_arr = binary_arr[mask]
+        weight_arr = weight_arr[mask]
+
+        weighted_binary = binary_arr * weight_arr
+        if pred_arr.size == 0:
+            bins = np.asarray([], dtype=np.int64)
+            total_weight_per_bin = np.asarray([], dtype=float)
+            conversion_per_bin = np.asarray([], dtype=float)
+            overall_conversion_rate = 0.0
         else:
-            plot_data["bin"] = 0
-        lift_agg = plot_data.groupby("bin").agg(
-            total_weight=(self.weight_nme, "sum"),
-            weighted_conversions=("w_binary_act", "sum"),
-        ).reset_index()
-        lift_agg["conversion_rate"] = (
-            lift_agg["weighted_conversions"] / lift_agg["total_weight"]
-        )
-        overall_conversion_rate = float(plot_data["w_binary_act"].sum()) / max(
-            float(plot_data[self.weight_nme].sum()),
-            EPS,
-        )
+            n_bins_eff = max(2, int(n_bins))
+            order = np.argsort(pred_arr, kind="mergesort")
+            w_sorted = weight_arr[order]
+            wb_sorted = weighted_binary[order]
+            total_weight = float(np.sum(w_sorted))
+            if total_weight <= EPS:
+                bin_idx = np.zeros(w_sorted.shape[0], dtype=np.int64)
+            else:
+                cum_left = np.cumsum(w_sorted, dtype=np.float64) - w_sorted
+                bin_idx = np.floor(cum_left * float(n_bins_eff) / total_weight).astype(np.int64)
+                bin_idx = np.clip(bin_idx, 0, n_bins_eff - 1)
+            total_weight_per_bin = np.bincount(bin_idx, weights=w_sorted, minlength=n_bins_eff)
+            weighted_binary_per_bin = np.bincount(bin_idx, weights=wb_sorted, minlength=n_bins_eff)
+            bins = np.flatnonzero(total_weight_per_bin > 0)
+            if bins.size == 0:
+                bins = np.asarray([0], dtype=np.int64)
+            total_weight_per_bin = total_weight_per_bin[bins]
+            conversion_per_bin = weighted_binary_per_bin[bins] / np.maximum(total_weight_per_bin, EPS)
+            overall_conversion_rate = float(np.sum(weighted_binary)) / max(float(np.sum(weight_arr)), EPS)
+
         ax.axhline(
             y=overall_conversion_rate,
             color="gray",
@@ -454,8 +530,8 @@ class BayesOptPlottingMixin:
             label=f"Overall Avg Rate ({overall_conversion_rate:.2%})",
         )
         ax.plot(
-            lift_agg["bin"],
-            lift_agg["conversion_rate"],
+            bins,
+            conversion_per_bin,
             marker="o",
             linestyle="-",
             label="Actual Conversion Rate",
@@ -474,7 +550,7 @@ class BayesOptPlottingMixin:
         pred_weighted: Optional[bool] = None,
         plot_subdir: Optional[str] = None,
     ):
-        if plt is None and plot_diagnostics is None:
+        if plt is None:
             _plot_skip("oneway plot")
             return
         pred_col = self.resolve_plot_prediction_column(pred_col)
@@ -517,34 +593,17 @@ class BayesOptPlottingMixin:
                 pred_col=pred_col,
                 sample_positions=sample_positions,
             )
-            if plot_diagnostics is None:
-                self._plot_oneway_fallback(
-                    plot_source=plot_source,
-                    feature=c,
-                    group_col=group_col,
-                    is_categorical=is_cat,
-                    n_bins=n_bins,
-                    pred_col=pred_col,
-                    pred_label=pred_label,
-                    pred_weighted=pred_weighted,
-                    title=title,
-                    save_path=save_path,
-                )
-                continue
-            plot_diagnostics.plot_oneway(
-                plot_source,
+            self._plot_oneway_fallback(
+                plot_source=plot_source,
                 feature=c,
-                weight_col=self.weight_nme,
-                target_col="w_act",
-                target_weighted=True,
-                pred_col=pred_col,
-                pred_weighted=pred_weighted,
-                pred_label=pred_label,
-                n_bins=n_bins,
+                group_col=group_col,
                 is_categorical=is_cat,
+                n_bins=n_bins,
+                pred_col=pred_col,
+                pred_label=pred_label,
+                pred_weighted=pred_weighted,
                 title=title,
                 save_path=save_path,
-                show=False,
             )
 
 
@@ -589,7 +648,8 @@ class BayesOptPlottingMixin:
         if not datasets:
             return
 
-        if plot_curves is None:
+        curves_mod = self._load_plot_curves_module()
+        if curves_mod is None:
             _plot_skip("lift plot")
             return
 
@@ -626,7 +686,7 @@ class BayesOptPlottingMixin:
                 )
                 continue
 
-            plot_curves.plot_lift_curve(
+            curves_mod.plot_lift_curve(
                 pred_vals,
                 actual_vals,
                 weight_vals,
@@ -682,7 +742,8 @@ class BayesOptPlottingMixin:
         if not datasets:
             return
 
-        if plot_curves is None:
+        curves_mod = self._load_plot_curves_module()
+        if curves_mod is None:
             _plot_skip("double lift plot")
             return
 
@@ -733,7 +794,7 @@ class BayesOptPlottingMixin:
                     f"{data_name}. Skip plot.")
                 continue
 
-            plot_curves.plot_double_lift_curve(
+            curves_mod.plot_double_lift_curve(
                 pred1,
                 pred2,
                 actual_vals,
@@ -768,13 +829,16 @@ class BayesOptPlottingMixin:
             _log("Error: `binary_resp_nme` not provided at BayesOptModel init; cannot plot conversion lift.")
             return
 
+        resolved_pred_col = self.resolve_plot_prediction_column(model_pred_col) or model_pred_col
+        style = PlotStyle() if PlotStyle else None
         fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
         axes = self._as_axes_list(axes)
         datasets = [("Train Data", self.train_data), ("Test Data", self.test_data)]
+        has_curve = False
 
         for ax, (data_name, data) in zip(axes, datasets):
-            if model_pred_col not in data.columns:
-                _log(f"Warning: missing prediction column '{model_pred_col}' in {data_name}. Skip plot.")
+            if resolved_pred_col not in data.columns:
+                _log(f"Warning: missing prediction column '{resolved_pred_col}' in {data_name}. Skip plot.")
                 continue
             sample_positions = self._resolve_curve_sample_positions(
                 data=data,
@@ -783,7 +847,7 @@ class BayesOptPlottingMixin:
             )
             pred_vals = self._numeric_column_values(
                 data,
-                model_pred_col,
+                resolved_pred_col,
                 sample_positions=sample_positions,
             )
             binary_vals = self._numeric_column_values(
@@ -797,29 +861,30 @@ class BayesOptPlottingMixin:
                 sample_positions=sample_positions,
             )
             title = f"Conversion Rate Lift Chart on {data_name}"
-            if plot_curves is None:
-                self._plot_conversion_lift_fallback(
-                    ax=ax,
-                    pred_vals=pred_vals,
-                    binary_vals=binary_vals,
-                    weight_vals=weight_vals,
-                    model_pred_col=model_pred_col,
-                    title=title,
-                    n_bins=n_bins,
-                )
-                continue
-            plot_curves.plot_conversion_lift(
-                pred_vals,
-                binary_vals,
-                weight_vals,
+            self._plot_conversion_lift_fallback(
+                ax=ax,
+                pred_vals=pred_vals,
+                binary_vals=binary_vals,
+                weight_vals=weight_vals,
+                model_pred_col=resolved_pred_col,
                 n_bins=n_bins,
                 title=title,
-                ax=ax,
-                show=False,
             )
+            has_curve = True
 
+        if not has_curve:
+            plt.close(fig)
+            _log("[Conversion Lift] No eligible dataset; skip plotting.", flush=True)
+            return
         plt.tight_layout()
-        plt.show()
-        plt.close(fig)
+        filename = (
+            f"03_{self.model_nme}_{self._safe_plot_token(resolved_pred_col)}_conversion_lift.png"
+        )
+        self._save_plot_figure(
+            fig=fig,
+            plot_prefix=f"{self.model_nme}/conversion_lift",
+            filename=filename,
+            style=style,
+        )
 
     # ========= Lightweight explainability: Permutation Importance =========

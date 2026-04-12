@@ -9,10 +9,12 @@ import pandas as pd
 import torch
 from sklearn.metrics import log_loss
 
-from ins_pricing.modelling.bayesopt.checkpoints import rebuild_resn_model_from_payload
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import ResNetSklearn
 from ins_pricing.utils.losses import regression_loss
+from ins_pricing.utils.model_rebuild import (
+    rebuild_resn_payload as rebuild_resn_model_from_payload,
+)
 from ins_pricing.utils import get_logger, log_print
 from ins_pricing.utils.torch_compat import torch_load
 

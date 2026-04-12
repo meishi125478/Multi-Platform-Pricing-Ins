@@ -85,9 +85,15 @@ def bootstrap_ci(
     rng = np.random.default_rng(seed)
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = np.asarray(y_pred).reshape(-1)
+    if y_true.shape[0] != y_pred.shape[0]:
+        raise ValueError("y_true and y_pred must have the same length.")
     if weight is not None:
         weight = np.asarray(weight).reshape(-1)
+        if weight.shape[0] != y_true.shape[0]:
+            raise ValueError("weight must have the same length as y_true.")
     n = len(y_true)
+    if n < 1:
+        raise ValueError("bootstrap_ci requires at least one sample.")
     stats = []
     for _ in range(max(1, int(n_samples))):
         idx = rng.integers(0, n, size=n)
@@ -110,8 +116,11 @@ def metrics_report(
     weight: Optional[np.ndarray] = None,
     threshold: float = 0.5,
 ) -> Dict[str, float]:
-    if str(task_type) == "classification":
+    task = str(task_type or "regression").strip().lower()
+    if task in {"classification", "binary", "multiclass"}:
         return classification_metrics(y_true, y_pred, threshold=threshold)
+    if task != "regression":
+        raise ValueError(f"Unsupported task_type: {task_type!r}")
     return _shared_metrics_report(y_true, y_pred, task_type="regression", weight=weight)
 
 

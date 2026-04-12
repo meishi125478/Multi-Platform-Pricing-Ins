@@ -82,6 +82,19 @@ def inference_mod(monkeypatch: pytest.MonkeyPatch):
     fake_model_loading = types.ModuleType("ins_pricing.utils.model_loading")
     fake_model_loading.load_pickle_artifact = lambda *args, **kwargs: None
     fake_model_loading.load_torch_payload = lambda *args, **kwargs: None
+    fake_model_loading.load_model_artifact_payload = lambda *args, **kwargs: None
+    fake_model_rebuild = types.ModuleType("ins_pricing.utils.model_rebuild")
+    fake_model_rebuild.rebuild_ft_payload = lambda *args, **kwargs: (
+        None,
+        None,
+        "raw",
+    )
+    fake_model_rebuild.rebuild_resn_payload = lambda *args, **kwargs: (None, None)
+    fake_model_rebuild.rebuild_gnn_payload = lambda *args, **kwargs: (
+        None,
+        None,
+        None,
+    )
 
     fake_exceptions = types.ModuleType("ins_pricing.exceptions")
 
@@ -122,6 +135,7 @@ def inference_mod(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "ins_pricing.utils.device", fake_device)
     monkeypatch.setitem(sys.modules, "ins_pricing.utils.losses", fake_losses)
     monkeypatch.setitem(sys.modules, "ins_pricing.utils.model_loading", fake_model_loading)
+    monkeypatch.setitem(sys.modules, "ins_pricing.utils.model_rebuild", fake_model_rebuild)
     monkeypatch.setitem(sys.modules, "ins_pricing.exceptions", fake_exceptions)
     monkeypatch.setitem(sys.modules, "ins_pricing.modelling.bayesopt.artifacts", fake_artifacts)
     monkeypatch.setitem(
@@ -249,11 +263,13 @@ def test_load_saved_model_pickle_loader_called_once(tmp_path, monkeypatch, infer
     _touch_xgb_model_file(tmp_path, model_name="demo")
     calls = []
 
-    def _fake_load_pickle(path):
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = map_location, allow_unsafe_pickle_retry
+        assert model_key == "xgb"
         calls.append(Path(path).name)
         return {"model": "loaded-model"}
 
-    monkeypatch.setattr(inference_mod, "load_pickle_artifact", _fake_load_pickle)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
 
     loaded = inference_mod.load_saved_model(
         output_dir=tmp_path,
@@ -275,11 +291,12 @@ def test_load_saved_model_propagates_pickle_error_without_retry(
     _touch_xgb_model_file(tmp_path, model_name="demo")
     calls = []
 
-    def _fake_load_pickle(path):
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = model_key, map_location, allow_unsafe_pickle_retry
         calls.append(Path(path).name)
         raise RuntimeError("secure loader failed")
 
-    monkeypatch.setattr(inference_mod, "load_pickle_artifact", _fake_load_pickle)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
 
     with pytest.raises(RuntimeError, match="secure loader failed"):
         inference_mod.load_saved_model(
@@ -300,11 +317,13 @@ def test_load_saved_model_can_retry_with_allow_unsafe_override(
 ):
     _touch_xgb_model_file(tmp_path, model_name="demo")
 
-    def _fail_secure_load(_path):
-        raise inference_mod.ModelLoadError("secure loader blocked")
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = path, map_location
+        assert model_key == "xgb"
+        assert allow_unsafe_pickle_retry is True
+        return {"model": "unsafe-loaded"}
 
-    monkeypatch.setattr(inference_mod, "load_pickle_artifact", _fail_secure_load)
-    monkeypatch.setattr(inference_mod.pickle, "load", lambda _fh: {"model": "unsafe-loaded"})
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
 
     loaded = inference_mod.load_saved_model(
         output_dir=tmp_path,
@@ -318,6 +337,29 @@ def test_load_saved_model_can_retry_with_allow_unsafe_override(
     assert loaded == "unsafe-loaded"
 
 
+def test_load_saved_model_does_not_retry_unsafe_for_non_restricted_errors(
+    tmp_path,
+    monkeypatch,
+    inference_mod,
+):
+    _touch_xgb_model_file(tmp_path, model_name="demo")
+    def _fail_payload_load(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = path, model_key, map_location, allow_unsafe_pickle_retry
+        raise RuntimeError("Cannot read model artifact: demo.pkl")
+
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fail_payload_load)
+
+    with pytest.raises(RuntimeError, match="Cannot read model artifact"):
+        inference_mod.load_saved_model(
+            output_dir=tmp_path,
+            model_name="demo",
+            model_key="xgb",
+            task_type="regression",
+            input_dim=None,
+            cfg={},
+            allow_unsafe_model_load=True,
+        )
+
 def test_load_saved_model_raises_on_corrupt_checkpoint(
     tmp_path,
     monkeypatch,
@@ -327,13 +369,14 @@ def test_load_saved_model_raises_on_corrupt_checkpoint(
     calls = []
     warnings = []
 
-    def _fake_load_pickle(path):
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = model_key, map_location, allow_unsafe_pickle_retry
         calls.append(Path(path).name)
         if Path(path) == checkpoint:
             raise ValueError("corrupt checkpoint payload")
         return {"model": "loaded-model"}
 
-    monkeypatch.setattr(inference_mod, "load_pickle_artifact", _fake_load_pickle)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
     monkeypatch.setattr(
         inference_mod._logger,
         "warning",
@@ -366,8 +409,9 @@ def test_load_saved_model_resn_uses_primary_checkpoint_and_base_params(
 
     payload_calls = []
 
-    def _fake_load_torch_payload(path, map_location=None, weights_only=None):
-        _ = map_location, weights_only
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = map_location, allow_unsafe_pickle_retry
+        assert model_key == "resn"
         payload_calls.append(Path(path).name)
         if Path(path) == checkpoint:
             raise ValueError("broken checkpoint")
@@ -380,7 +424,7 @@ def test_load_saved_model_resn_uses_primary_checkpoint_and_base_params(
             {},
         )
 
-    monkeypatch.setattr(inference_mod, "load_torch_payload", _fake_load_torch_payload)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
     monkeypatch.setattr(
         inference_mod,
         "rebuild_resn_model_from_payload",
@@ -410,8 +454,9 @@ def test_load_saved_model_resn_uses_fallback_params_when_checkpoint_has_no_best_
     checkpoint = model_dir / "01_demo_ResNet.pth"
     checkpoint.write_bytes(b"checkpoint")
 
-    def _fake_load_torch_payload(path, map_location=None, weights_only=None):
-        _ = path, map_location, weights_only
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = path, map_location, allow_unsafe_pickle_retry
+        assert model_key == "resn"
         return {"state_dict": {"layer": [1, 2, 3]}}
 
     captured = {}
@@ -429,7 +474,7 @@ def test_load_saved_model_resn_uses_fallback_params_when_checkpoint_has_no_best_
         captured["require_params"] = require_params
         return rebuilt_model, dict(params_fallback or {})
 
-    monkeypatch.setattr(inference_mod, "load_torch_payload", _fake_load_torch_payload)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
     monkeypatch.setattr(inference_mod, "load_best_params", lambda *args, **kwargs: {"hidden_dim": 64})
     monkeypatch.setattr(
         inference_mod,
@@ -459,13 +504,14 @@ def test_load_preprocess_from_model_file_uses_primary_checkpoint(
     checkpoint = _touch_xgb_model_file(tmp_path, model_name="demo")
     calls = []
 
-    def _fake_load_pickle(path):
+    def _fake_load_payload(path, *, model_key, map_location="cpu", allow_unsafe_pickle_retry=False):
+        _ = model_key, map_location, allow_unsafe_pickle_retry
         calls.append(Path(path).name)
         if Path(path) == checkpoint:
             raise ValueError("corrupt checkpoint payload")
         return {"preprocess_artifacts": {"token": "loaded"}}
 
-    monkeypatch.setattr(inference_mod, "load_pickle_artifact", _fake_load_pickle)
+    monkeypatch.setattr(inference_mod, "load_model_artifact_payload", _fake_load_payload)
 
     with pytest.raises(ValueError, match="corrupt checkpoint payload"):
         inference_mod._load_preprocess_from_model_file(

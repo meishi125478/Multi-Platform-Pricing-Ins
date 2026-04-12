@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, TYPE_CHECKING
@@ -18,12 +17,6 @@ except Exception as exc:  # pragma: no cover - optional dependency
 from ins_pricing.modelling.bayesopt.artifacts import (
     load_best_params as load_best_params_artifacts,
 )
-from ins_pricing.exceptions import ModelLoadError
-from ins_pricing.modelling.bayesopt.checkpoints import (
-    rebuild_ft_model_from_payload,
-    rebuild_gnn_model_from_payload,
-    rebuild_resn_model_from_payload,
-)
 from ins_pricing.production.preprocess import (
     apply_preprocess_artifacts,
     load_preprocess_artifacts,
@@ -36,8 +29,12 @@ from ins_pricing.utils.losses import (
     resolve_tweedie_power,
 )
 from ins_pricing.utils.model_loading import (
-    load_pickle_artifact,
-    load_torch_payload,
+    load_model_artifact_payload,
+)
+from ins_pricing.utils.model_rebuild import (
+    rebuild_ft_payload as rebuild_ft_model_from_payload,
+    rebuild_gnn_payload as rebuild_gnn_model_from_payload,
+    rebuild_resn_payload as rebuild_resn_model_from_payload,
 )
 from ins_pricing.utils import get_logger, load_dataset
 
@@ -192,26 +189,6 @@ def _allow_unsafe_model_load(
     return _coerce_bool(cfg.get("allow_unsafe_model_load"), default=False)
 
 
-def _load_pickle_with_optional_unsafe_retry(
-    model_path: Path,
-    *,
-    model_key: str,
-    allow_unsafe_retry: bool,
-) -> Any:
-    try:
-        return load_pickle_artifact(model_path)
-    except ModelLoadError:
-        if not allow_unsafe_retry or model_key not in {"xgb", "glm"}:
-            raise
-        _logger.warning(
-            "Retrying %s model load with unsafe pickle enabled for trusted artifact: %s",
-            model_key,
-            model_path,
-        )
-        with model_path.open("rb") as fh:
-            return pickle.load(fh)
-
-
 def _model_file_path(output_dir: Path, model_name: str, model_key: str) -> Path:
     prefix = MODEL_PREFIX.get(model_key)
     if prefix is None:
@@ -267,18 +244,12 @@ def _load_preprocess_from_model_file(
     model_path = _resolve_model_file_path(output_dir, model_name, model_key)
     if not model_path.exists():
         return None
-    if model_key in {"xgb", "glm"}:
-        loader = lambda model_path: _load_pickle_with_optional_unsafe_retry(
-            model_path,
-            model_key=model_key,
-            allow_unsafe_retry=allow_unsafe,
-        )
-    else:
-        loader = lambda model_path: load_torch_payload(
-            model_path,
-            map_location="cpu",
-            weights_only=True,
-        )
+    loader = lambda path: load_model_artifact_payload(
+        path,
+        model_key=model_key,
+        map_location="cpu",
+        allow_unsafe_pickle_retry=allow_unsafe,
+    )
     try:
         payload = _load_from_path(
             model_path,
@@ -440,10 +411,11 @@ def load_saved_model(
             model_key=model_key,
             model_name=model_name,
             description="model artifact",
-            loader=lambda model_path: _load_pickle_with_optional_unsafe_retry(
-                model_path,
+            loader=lambda path: load_model_artifact_payload(
+                path,
                 model_key=model_key,
-                allow_unsafe_retry=allow_unsafe_retry,
+                map_location="cpu",
+                allow_unsafe_pickle_retry=allow_unsafe_retry,
             ),
         )
         if isinstance(payload, dict) and "model" in payload:
@@ -456,10 +428,10 @@ def load_saved_model(
             model_key=model_key,
             model_name=model_name,
             description="model artifact",
-            loader=lambda model_path: load_torch_payload(
-                model_path,
+            loader=lambda path: load_model_artifact_payload(
+                path,
+                model_key=model_key,
                 map_location="cpu",
-                weights_only=True,
             ),
         )
         return _load_ft_model_from_payload(
@@ -477,10 +449,10 @@ def load_saved_model(
         params_fallback = load_best_params(output_dir, model_name, model_key)
 
         def _load_resn(model_path: Path) -> Any:
-            payload = load_torch_payload(
+            payload = load_model_artifact_payload(
                 model_path,
+                model_key=model_key,
                 map_location="cpu",
-                weights_only=True,
             )
             model, _resolved_params = rebuild_resn_model_from_payload(
                 payload=payload,
@@ -514,10 +486,10 @@ def load_saved_model(
         loss_name = _resolve_loss_name(cfg, model_name, task_type)
 
         def _load_gnn(model_path: Path) -> Any:
-            payload = load_torch_payload(
+            payload = load_model_artifact_payload(
                 model_path,
+                model_key=model_key,
                 map_location="cpu",
-                weights_only=True,
             )
             try:
                 model, _params, _warning = rebuild_gnn_model_from_payload(

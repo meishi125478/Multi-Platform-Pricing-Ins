@@ -754,6 +754,7 @@ class FTTrainer(TrainerBase):
             return None
 
         preds_train = None
+        covered = np.zeros(len(X_all), dtype=bool)
         for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(X_all, y_all, groups=groups), start=1):
             X_train = X_all.iloc[train_idx]
             y_train = y_all.iloc[train_idx]
@@ -788,13 +789,24 @@ class FTTrainer(TrainerBase):
             fold_pred = model.predict(X_val, **predict_kwargs)
             fold_pred = np.asarray(fold_pred)
             if preds_train is None:
-                preds_train = np.empty(
-                    (len(X_all),) + fold_pred.shape[1:], dtype=fold_pred.dtype)
-            preds_train[val_idx] = fold_pred
+                pred_dtype = (
+                    fold_pred.dtype
+                    if np.issubdtype(fold_pred.dtype, np.floating)
+                    else np.float64
+                )
+                preds_train = np.full(
+                    (len(X_all),) + fold_pred.shape[1:],
+                    np.nan,
+                    dtype=pred_dtype,
+                )
+            preds_train[val_idx] = fold_pred.astype(preds_train.dtype, copy=False)
+            covered[val_idx] = True
 
             self._maybe_cleanup_gpu(model)
 
         if preds_train is None:
+            return None
+        if not bool(np.all(covered)):
             return None
         if oof_folds < 2:
             return None

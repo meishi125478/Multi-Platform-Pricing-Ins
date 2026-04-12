@@ -86,13 +86,24 @@ class ApprovalStore:
     ) -> ApprovalRequest:
         with self._io_lock:
             payload = self._load_unlocked()
+            matches = [
+                entry
+                for entry in payload
+                if entry.get("model_name") == model_name
+                and entry.get("model_version") == model_version
+            ]
+            pending = [entry for entry in matches if str(entry.get("status", "")).lower() == "pending"]
+            target_pool = pending if pending else matches
             found = None
-            for entry in payload:
-                if entry["model_name"] == model_name and entry["model_version"] == model_version:
-                    found = entry
-                    break
+            if target_pool:
+                found = max(
+                    target_pool,
+                    key=lambda entry: str(entry.get("requested_at", "")),
+                )
             if found is None:
                 raise ValueError("Approval request not found.")
+            if str(found.get("status", "")).lower() in {"approved", "rejected"}:
+                raise ValueError("Approval request already finalized.")
             action = ApprovalAction(
                 actor=actor,
                 decision=decision,

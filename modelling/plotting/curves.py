@@ -58,6 +58,17 @@ def _align_arrays(
     return pred_arr, actual_arr, weight_arr
 
 
+def _safe_ratio_for_sort(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+) -> np.ndarray:
+    """Stable ratio used for ordering while preserving denominator sign near zero."""
+    denom_arr = np.asarray(denominator, dtype=float)
+    sign_or_one = np.where(denom_arr < 0.0, -1.0, 1.0)
+    safe_denom = np.where(np.abs(denom_arr) > EPS, denom_arr, sign_or_one * EPS)
+    return np.asarray(numerator, dtype=float) / safe_denom
+
+
 def _aggregate_by_weight_bins(
     *,
     sort_key: np.ndarray,
@@ -81,8 +92,9 @@ def _aggregate_by_weight_bins(
     if total_weight <= EPS:
         bin_idx = np.zeros(weight_sorted.shape[0], dtype=np.int64)
     else:
-        cum_weight = np.cumsum(weight_sorted, dtype=np.float64)
-        bin_idx = np.floor(cum_weight * float(n_bins) / total_weight).astype(np.int64)
+        # Use left cumulative weight so the first populated bucket is always bin 0.
+        cum_weight_left = np.cumsum(weight_sorted, dtype=np.float64) - weight_sorted
+        bin_idx = np.floor(cum_weight_left * float(n_bins) / total_weight).astype(np.int64)
         bin_idx = np.clip(bin_idx, 0, n_bins - 1)
 
     weight_sums = np.bincount(bin_idx, weights=weight_sorted, minlength=n_bins)
@@ -255,7 +267,7 @@ def double_lift_table(
     w_act = actual_arr if actual_weighted else actual_arr * weight_arr
 
     plot_data = _aggregate_by_weight_bins(
-        sort_key=pred1_raw / np.maximum(pred2_raw, EPS),
+        sort_key=_safe_ratio_for_sort(pred1_raw, pred2_raw),
         weight=weight_arr,
         values={
             "pred1": w_pred1,

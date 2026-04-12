@@ -335,9 +335,19 @@ class TestBatchMonitoring:
                 mock_load.return_value = pd.DataFrame()
                 mock_monitor.return_value = {'status': 'ok'}
 
-                result = run_scheduled_monitoring(config={'schedule': 'daily'})
+                result = run_scheduled_monitoring(
+                    config={'schedule': 'daily', 'reference_data': pd.DataFrame()}
+                )
 
                 assert result['status'] == 'ok'
+
+    def test_scheduled_monitoring_requires_reference_data(self):
+        from ins_pricing.production.monitoring import run_scheduled_monitoring
+
+        with patch('ins_pricing.production.monitoring.load_production_data') as mock_load:
+            mock_load.return_value = pd.DataFrame()
+            with pytest.raises(DataValidationError, match="reference_data"):
+                run_scheduled_monitoring(config={'schedule': 'daily'})
 
 
 @pytest.mark.integration

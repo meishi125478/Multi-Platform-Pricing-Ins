@@ -379,8 +379,10 @@ def apply_preprocess_artifacts(df: pd.DataFrame, artifacts: Dict[str, Any]) -> p
     num_features = list(artifacts.get("num_features") or [])
     ohe_feature_names = list(artifacts.get("ohe_feature_names") or [])
     var_nmes = list(artifacts.get("var_nmes") or [])
-    if not var_nmes and ohe_feature_names:
-        var_nmes = list(num_features) + list(ohe_feature_names)
+    if not var_nmes:
+        raise KeyError(
+            "Preprocess artifacts missing required 'var_nmes'; regenerate artifacts from training pipeline."
+        )
     numeric_scalers = artifacts.get("numeric_scalers") or {}
     cat_categories = artifacts.get("cat_categories") or {}
     drop_first = bool(artifacts.get("drop_first", True))

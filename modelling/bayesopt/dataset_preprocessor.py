@@ -86,19 +86,6 @@ class DatasetPreprocessor:
         if cfg.binary_resp_nme and cfg.binary_resp_nme not in self.test_data.columns:
             self.test_data[cfg.binary_resp_nme] = np.nan
 
-        # Precompute weighted actuals for plots and validation checks.
-        # Direct assignment is more efficient than .loc[:, col]
-        self.train_data['w_act'] = self.train_data[cfg.resp_nme] * \
-            self.train_data[cfg.weight_nme]
-        if test_has_resp:
-            self.test_data['w_act'] = self.test_data[cfg.resp_nme] * \
-                self.test_data[cfg.weight_nme]
-        if cfg.binary_resp_nme:
-            self.train_data['w_binary_act'] = self.train_data[cfg.binary_resp_nme] * \
-                self.train_data[cfg.weight_nme]
-            if test_has_binary:
-                self.test_data['w_binary_act'] = self.test_data[cfg.binary_resp_nme] * \
-                    self.test_data[cfg.weight_nme]
         clip_enabled = bool(getattr(cfg, "target_clip_enabled", True))
         clip_quantile = getattr(cfg, "target_clip_quantile", 0.999)
         if clip_enabled and clip_quantile is not None:
@@ -120,6 +107,23 @@ class DatasetPreprocessor:
                 )
         else:
             _log("[Preprocess] target clipping disabled by config.", flush=True)
+
+        # Precompute weighted actuals for plots and validation checks after clipping.
+        self.train_data['w_act'] = (
+            self.train_data[cfg.resp_nme] * self.train_data[cfg.weight_nme]
+        )
+        if test_has_resp:
+            self.test_data['w_act'] = (
+                self.test_data[cfg.resp_nme] * self.test_data[cfg.weight_nme]
+            )
+        if cfg.binary_resp_nme:
+            self.train_data['w_binary_act'] = (
+                self.train_data[cfg.binary_resp_nme] * self.train_data[cfg.weight_nme]
+            )
+            if test_has_binary:
+                self.test_data['w_binary_act'] = (
+                    self.test_data[cfg.binary_resp_nme] * self.test_data[cfg.weight_nme]
+                )
         cate_list = list(cfg.cate_list or [])
         if cate_list:
             for cate in cate_list:

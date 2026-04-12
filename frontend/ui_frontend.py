@@ -18,6 +18,7 @@ from nicegui import ui
 from ins_pricing.frontend.access_control import AuthorizationError
 from ins_pricing.frontend.app_controller import PricingApp
 from ins_pricing.frontend.config_comments_default import DEFAULT_CONFIG_COMMENTS
+from ins_pricing.frontend.image_catalog import build_generated_image_choices
 
 
 # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?#  Helpers
@@ -87,13 +88,35 @@ class _StreamRunner:
 
     def _show_images(self, paths):
         self._gallery.clear()
+        items = build_generated_image_choices(paths)
         with self._gallery:
-            with ui.row().classes("flex-wrap gap-2 p-2"):
-                for p in paths:
-                    if Path(p).exists():
-                        ui.image(Path(p)).classes(
-                            "max-w-[260px] max-h-[220px] object-contain rounded shadow"
-                        )
+            if not items:
+                ui.label("No generated images found.").classes("text-xs text-gray-500 px-2 py-2")
+                return
+
+            option_map = {item["path"]: item["option_label"] for item in items}
+
+            def _update_preview(path_value: str) -> None:
+                selected = next((item for item in items if item["path"] == path_value), items[0])
+                title_el.text = selected["title"]
+                meta_el.text = f"{selected['category']} · {selected['filename']}"
+                image_el.set_source(selected["path"])
+
+            with ui.column().classes("w-full gap-2 rounded-[12px] border border-[var(--line)] bg-white/70 p-3"):
+                ui.label("Generated Images").classes("text-[12px] font-semibold tracking-[0.08em] uppercase text-[var(--accent)]")
+                image_sel = ui.select(
+                    option_map,
+                    label="Select Image",
+                    value=items[0]["path"],
+                ).classes("w-full soft-select").props("dense options-dense")
+                title_el = ui.label(items[0]["title"]).classes("text-sm font-semibold text-[var(--ink)]")
+                meta_el = ui.label(
+                    f"{items[0]['category']} · {items[0]['filename']}"
+                ).classes("text-xs text-[var(--muted)]")
+                image_el = ui.image(items[0]["path"]).classes(
+                    "w-full max-h-[520px] object-contain rounded-[10px] border border-[var(--line)] bg-white"
+                )
+                image_sel.on_value_change(lambda e: _update_preview(str(e.value or items[0]["path"])))
 
 
 # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?#  Main Frontend
@@ -447,6 +470,64 @@ class PricingFrontend:
         return ui.textarea(label, value=str(value), **kw).classes(
             self._join_classes(classes, mono_classes, "soft-textarea")
         ).props("dense")
+
+    @staticmethod
+    def _show_image_catalog(gallery_el: Any, paths: List[str]) -> None:
+        gallery_el.clear()
+        items = build_generated_image_choices(paths)
+        with gallery_el:
+            if not items:
+                ui.label("No images found for the current inputs.").classes(
+                    "text-xs text-[var(--muted)] px-1 py-2"
+                )
+                return
+            option_map = {item["path"]: item["option_label"] for item in items}
+            title_el = None
+            meta_el = None
+            image_el = None
+
+            def _apply(path_value: str) -> None:
+                selected = next((item for item in items if item["path"] == path_value), items[0])
+                if title_el is not None:
+                    title_el.text = selected["title"]
+                if meta_el is not None:
+                    meta_el.text = f"{selected['category']} · {selected['filename']}"
+                if image_el is not None:
+                    image_el.set_source(selected["path"])
+
+            with ui.column().classes("w-full gap-2 rounded-[12px] border border-[var(--line)] bg-white/70 p-3"):
+                ui.label("Generated Images").classes(
+                    "text-[12px] font-semibold tracking-[0.08em] uppercase text-[var(--accent)]"
+                )
+                selector = ui.select(
+                    option_map,
+                    label="Select Image",
+                    value=items[0]["path"],
+                ).classes("w-full soft-select").props("dense options-dense")
+                title_el = ui.label(items[0]["title"]).classes("text-sm font-semibold text-[var(--ink)]")
+                meta_el = ui.label(
+                    f"{items[0]['category']} · {items[0]['filename']}"
+                ).classes("text-xs text-[var(--muted)]")
+                image_el = ui.image(items[0]["path"]).classes(
+                    "w-full max-h-[520px] object-contain rounded-[10px] border border-[var(--line)] bg-white"
+                )
+                selector.on_value_change(lambda e: _apply(str(e.value or items[0]["path"])))
+
+    def _load_existing_images(self, *, gallery_el: Any, status_el: Any, path_loader, empty_text: str):
+        def _load() -> None:
+            try:
+                paths = list(path_loader() or [])
+                if not paths:
+                    status_el.text = empty_text
+                    self._show_image_catalog(gallery_el, [])
+                    return
+                status_el.text = f"Loaded {len(paths)} generated image(s)."
+                self._show_image_catalog(gallery_el, paths)
+            except Exception as exc:
+                status_el.text = f"Image loading error: {exc}"
+                self._show_image_catalog(gallery_el, [])
+
+        return _load
 
     def _collect(self) -> Dict[str, Any]:
         """Collect all config component values into a dict matching build_config_from_ui params."""
@@ -2334,8 +2415,26 @@ class PricingFrontend:
                 actor=self._actor_for_runtime(),
             )
 
-        run_pre_btn = ui.button("Run Pre Oneway", icon="play_arrow", on_click=_run_pre_oneway).props("color=primary")
+        with ui.row().classes("w-full items-center gap-2"):
+            run_pre_btn = ui.button("Run Pre Oneway", icon="play_arrow", on_click=_run_pre_oneway).props("color=primary")
+            load_pre_btn = ui.button(
+                "Load Existing Images",
+                icon="image_search",
+                on_click=self._load_existing_images(
+                    gallery_el=pre_gallery,
+                    status_el=pre_status,
+                    path_loader=lambda: self.app.list_pre_oneway_images_ui(
+                        data_path=pre_data.value,
+                        train_data_path=pre_train.value,
+                        test_data_path=pre_test.value,
+                        model_name=pre_model.value,
+                        output_dir=pre_out.value,
+                    ),
+                    empty_text="No generated pre-oneway images found.",
+                ),
+            ).props("flat")
         self._register_permission_control(run_pre_btn, "task:run")
+        self._register_permission_control(load_pre_btn, "task:run")
 
     def _subtab_direct_plot(self):
         self._info(
@@ -2370,8 +2469,24 @@ class PricingFrontend:
                 actor=self._actor_for_runtime(),
             )
 
-        run_direct_btn = ui.button("Run Direct Plot", icon="play_arrow", on_click=_run_direct_plot).props("color=primary")
+        with ui.row().classes("w-full items-center gap-2"):
+            run_direct_btn = ui.button("Run Direct Plot", icon="play_arrow", on_click=_run_direct_plot).props("color=primary")
+            load_direct_btn = ui.button(
+                "Load Existing Images",
+                icon="image_search",
+                on_click=self._load_existing_images(
+                    gallery_el=d_gallery,
+                    status_el=d_status,
+                    path_loader=lambda: self.app.list_prediction_plot_images_ui(
+                        cfg_path=d_cfg.value,
+                        xgb_cfg_path=d_xgb.value,
+                        resn_cfg_path=d_resn.value,
+                    ),
+                    empty_text="No generated direct-plot images found.",
+                ),
+            ).props("flat")
         self._register_permission_control(run_direct_btn, "task:run")
+        self._register_permission_control(load_direct_btn, "task:run")
 
     def _subtab_embed_plot(self):
         self._info(
@@ -2411,8 +2526,24 @@ class PricingFrontend:
                 actor=self._actor_for_runtime(),
             )
 
-        run_embed_btn = ui.button("Run Embed Plot", icon="play_arrow", on_click=_run_embed_plot).props("color=primary")
+        with ui.row().classes("w-full items-center gap-2"):
+            run_embed_btn = ui.button("Run Embed Plot", icon="play_arrow", on_click=_run_embed_plot).props("color=primary")
+            load_embed_btn = ui.button(
+                "Load Existing Images",
+                icon="image_search",
+                on_click=self._load_existing_images(
+                    gallery_el=e_gallery,
+                    status_el=e_status,
+                    path_loader=lambda: self.app.list_prediction_plot_images_ui(
+                        cfg_path=e_cfg.value,
+                        xgb_cfg_path=e_xgb.value,
+                        resn_cfg_path=e_resn.value,
+                    ),
+                    empty_text="No generated embed-plot images found.",
+                ),
+            ).props("flat")
         self._register_permission_control(run_embed_btn, "task:run")
+        self._register_permission_control(load_embed_btn, "task:run")
 
     def _subtab_double_lift(self):
         self._info(
@@ -2472,8 +2603,25 @@ class PricingFrontend:
                 actor=self._actor_for_runtime(),
             )
 
-        run_double_lift_btn = ui.button("Run Double Lift", icon="play_arrow", on_click=_run_double_lift).props("color=primary")
+        with ui.row().classes("w-full items-center gap-2"):
+            run_double_lift_btn = ui.button("Run Double Lift", icon="play_arrow", on_click=_run_double_lift).props("color=primary")
+            load_double_lift_btn = ui.button(
+                "Load Existing Images",
+                icon="image_search",
+                on_click=self._load_existing_images(
+                    gallery_el=dl_gallery,
+                    status_el=dl_status,
+                    path_loader=lambda: self.app.list_double_lift_images_ui(
+                        data_path=dl_data.value,
+                        train_data_path=dl_train.value,
+                        test_data_path=dl_test.value,
+                        output_path=dl_out.value,
+                    ),
+                    empty_text="No generated double-lift images found.",
+                ),
+            ).props("flat")
         self._register_permission_control(run_double_lift_btn, "task:run")
+        self._register_permission_control(load_double_lift_btn, "task:run")
 
     def _subtab_compare(self):
         self._info(
@@ -2539,12 +2687,26 @@ class PricingFrontend:
                 actor=self._actor_for_runtime(),
             )
 
-        run_compare_btn = ui.button(
-            "Run FT-Embed Compare",
-            icon="play_arrow",
-            on_click=_run_compare,
-        ).props("color=primary")
+        with ui.row().classes("w-full items-center gap-2"):
+            run_compare_btn = ui.button(
+                "Run FT-Embed Compare",
+                icon="play_arrow",
+                on_click=_run_compare,
+            ).props("color=primary")
+            load_compare_btn = ui.button(
+                "Load Existing Images",
+                icon="image_search",
+                on_click=self._load_existing_images(
+                    gallery_el=c_gallery,
+                    status_el=c_status,
+                    path_loader=lambda: self.app.list_compare_images_ui(
+                        direct_cfg_path=c_direct.value,
+                    ),
+                    empty_text="No generated compare images found.",
+                ),
+            ).props("flat")
         self._register_permission_control(run_compare_btn, "task:run")
+        self._register_permission_control(load_compare_btn, "task:run")
 
     def _tab_prediction(self):
         self._guide("Prediction Workflow", [

@@ -7,12 +7,14 @@ import optuna
 import torch
 from sklearn.metrics import log_loss
 
-from ins_pricing.modelling.bayesopt.checkpoints import rebuild_gnn_model_from_payload
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.modelling.bayesopt.models import GraphNeuralNetSklearn
 from ins_pricing.utils import EPS, get_logger, log_print
 from ins_pricing.utils.losses import regression_loss
 from ins_pricing.utils.model_loading import load_torch_payload
+from ins_pricing.utils.model_rebuild import (
+    rebuild_gnn_payload as rebuild_gnn_model_from_payload,
+)
 
 _logger = get_logger("ins_pricing.trainer.gnn")
 

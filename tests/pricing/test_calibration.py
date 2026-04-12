@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ins_pricing.exceptions import DataValidationError
+
 
 @pytest.fixture
 def sample_model_predictions():
@@ -50,6 +52,15 @@ class TestGlobalCalibration:
         assert isinstance(calibrated, np.ndarray)
         assert calibrated.shape[0] == sample_model_predictions.shape[0]
 
+    def test_fit_calibration_factor_rejects_non_positive_prediction_sum(self):
+        from ins_pricing.pricing.calibration import fit_calibration_factor
+
+        pred = np.array([0.0, 0.0, 0.0])
+        actual = np.array([1.0, 2.0, 3.0])
+
+        with pytest.raises(DataValidationError, match="positive weighted prediction sum"):
+            fit_calibration_factor(pred=pred, actual=actual)
+
 
 class TestSegmentCalibration:
     """Test segment-specific calibration."""
@@ -75,3 +86,27 @@ class TestSegmentCalibration:
 
         assert "calibration_factor" in calibrated.columns
         assert len(calibrated["segment"].unique()) == 2
+
+    def test_calibrate_by_segment_marks_fallback_when_pred_sum_non_positive(self):
+        from ins_pricing.pricing.calibration import calibrate_by_segment
+
+        df = pd.DataFrame(
+            {
+                "segment": ["A", "A", "B", "B"],
+                "actual": [10.0, 12.0, 8.0, 9.0],
+                "predicted": [0.0, 0.0, 5.0, 6.0],
+                "exposure": [1.0, 1.0, 1.0, 1.0],
+            }
+        )
+        out = calibrate_by_segment(
+            df,
+            actual_col="actual",
+            pred_col="predicted",
+            segment_col="segment",
+            weight_col="exposure",
+        )
+
+        row_a = out.loc[out["segment"] == "A"].iloc[0]
+        assert row_a["calibration_factor"] == 1.0
+        assert row_a["status"] == "fallback_default"
+        assert isinstance(row_a["error"], str)

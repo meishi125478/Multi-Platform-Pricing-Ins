@@ -8,6 +8,7 @@ from typing import Callable, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from ins_pricing.frontend.logging_utils import get_frontend_logger, log_print
+from ins_pricing.utils.paths import load_dataset
 from ins_pricing.split_cache import (
     load_split_cache,
     resolve_model_scoped_path,
@@ -43,7 +44,7 @@ def _load_split_frame(path_value: str, label: str) -> pd.DataFrame:
     path_obj = Path(path_value).resolve()
     if not path_obj.exists():
         raise FileNotFoundError(f"{label} not found: {path_obj}")
-    frame = pd.read_csv(path_obj, low_memory=False)
+    frame = load_dataset(path_obj, data_format="auto", low_memory=False)
     frame = _drop_duplicate_columns(frame, label).reset_index(drop=True)
     frame.fillna(0, inplace=True)
     return frame
@@ -82,7 +83,7 @@ def load_raw_splits(
             )
     else:
         raw_path = data_path_resolver(data_cfg, data_cfg_path, model_name)
-        raw = pd.read_csv(raw_path, low_memory=False)
+        raw = load_dataset(raw_path, data_format="auto", low_memory=False)
         raw = _drop_duplicate_columns(raw, "raw").reset_index(drop=True)
         raw.fillna(0, inplace=True)
 

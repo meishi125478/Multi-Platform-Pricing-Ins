@@ -83,6 +83,20 @@ class TestFeatureEngineering:
 
         assert 'age_squared' in df.columns
 
+    def test_apply_preprocess_artifacts_requires_var_nmes(self):
+        from ins_pricing.production.preprocess import apply_preprocess_artifacts
+
+        raw = pd.DataFrame({"age": [25, 30]})
+        artifacts = {
+            "factor_nmes": ["age"],
+            "num_features": ["age"],
+            "cate_list": [],
+            "numeric_scalers": {"age": {"mean": 20.0, "scale": 5.0}},
+        }
+
+        with pytest.raises(KeyError, match="var_nmes"):
+            apply_preprocess_artifacts(raw, artifacts)
+
 
 class TestDataCleaning:
     """Test data cleaning operations."""

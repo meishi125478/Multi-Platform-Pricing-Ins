@@ -361,7 +361,11 @@ def profile_training_epoch(
     )
 
     # Periodic cleanup
-    if epoch % cleanup_interval == 0:
+    try:
+        interval = int(cleanup_interval)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval > 0 and epoch % interval == 0:
         if logger:
             logger.info(f"Epoch {epoch}: Performing periodic memory cleanup")
         cleanup_memory(logger)

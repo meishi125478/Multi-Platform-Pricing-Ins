@@ -3,6 +3,7 @@ Configuration Builder for Insurance Pricing Models
 Generates complete configuration dictionaries from UI parameters.
 """
 
+import copy
 from typing import List, Optional, Dict, Any
 
 
@@ -352,7 +353,7 @@ class ConfigBuilder:
         if env is None:
             env = {}
 
-        config = self.default_config.copy()
+        config = copy.deepcopy(self.default_config)
 
         # Update with user-provided values
         merged_env: Dict[str, Any] = dict(config.get("env", {}))
@@ -489,7 +490,7 @@ class ConfigBuilder:
         Returns:
             Configuration with explain settings
         """
-        config = base_config.copy()
+        config = copy.deepcopy(base_config)
 
         if model_keys is None:
             model_keys = ["xgb"]
@@ -571,5 +572,19 @@ class ConfigBuilder:
         if not cat_features.issubset(features):
             invalid = cat_features - features
             return False, f"Categorical features not in feature_list: {invalid}"
+
+        split_strategy = str(config.get("split_strategy", "random")).strip().lower()
+        has_explicit_split = bool(config.get("train_data_path") or config.get("test_data_path"))
+        if not has_explicit_split:
+            if split_strategy in {"group", "grouped"} and not config.get("split_group_col"):
+                return False, "split_group_col is required when split_strategy is 'group'"
+            if split_strategy in {"time", "timeseries", "temporal"} and not config.get("split_time_col"):
+                return False, "split_time_col is required when split_strategy is 'time'"
+
+        prediction_cache_format = str(
+            config.get("prediction_cache_format", "parquet")
+        ).strip().lower()
+        if prediction_cache_format not in {"parquet", "csv"}:
+            return False, "prediction_cache_format must be either 'parquet' or 'csv'"
 
         return True, "Configuration is valid"

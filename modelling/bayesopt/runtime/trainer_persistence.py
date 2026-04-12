@@ -7,11 +7,13 @@ import joblib
 import torch
 
 from ins_pricing.modelling.bayesopt.checkpoints import (
-    rebuild_ft_model_from_payload,
-    rebuild_resn_model_from_payload,
     serialize_ft_model_config,
 )
-from ins_pricing.utils.model_loading import load_torch_payload
+from ins_pricing.utils.model_loading import load_model_artifact_payload
+from ins_pricing.utils.model_rebuild import (
+    rebuild_ft_payload as rebuild_ft_model_from_payload,
+    rebuild_resn_payload as rebuild_resn_model_from_payload,
+)
 from ins_pricing.utils import DeviceManager, get_logger, log_print
 
 _logger = get_logger("ins_pricing.trainer")
@@ -139,7 +141,11 @@ class TrainerPersistenceMixin:
             return
 
         if self.label == 'ResNet' or self.label == 'ResNetClassifier':
-            payload = load_torch_payload(primary_path, map_location='cpu', weights_only=True)
+            payload = load_model_artifact_payload(
+                primary_path,
+                model_key="resn",
+                map_location="cpu",
+            )
             model_builder = getattr(self, "_build_model", None)
             if not callable(model_builder):
                 _log(
@@ -156,7 +162,11 @@ class TrainerPersistenceMixin:
             self.model = resn_loaded
             return
 
-        loaded = load_torch_payload(primary_path, map_location='cpu', weights_only=True)
+        loaded = load_model_artifact_payload(
+            primary_path,
+            model_key="ft",
+            map_location="cpu",
+        )
         if isinstance(loaded, dict):
             self._load_ft_checkpoint_payload(loaded, primary_path)
         else:

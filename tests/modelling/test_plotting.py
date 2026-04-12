@@ -28,10 +28,16 @@ def test_plotting_outputs(tmp_path, monkeypatch):
         {
             "x1": rng.normal(size=30),
             "y": rng.normal(size=30),
+            "y_bin": rng.integers(0, 2, size=30),
             "w": rng.uniform(0.5, 1.5, size=30),
         }
     )
-    test = pd.DataFrame({"x1": rng.normal(size=20)})
+    test = pd.DataFrame(
+        {
+            "x1": rng.normal(size=20),
+            "y_bin": rng.integers(0, 2, size=20),
+        }
+    )
 
     config = BayesOptConfig(
         model_nme="demo",
@@ -43,6 +49,7 @@ def test_plotting_outputs(tmp_path, monkeypatch):
         output_dir=str(tmp_path),
     )
     model = BayesOptModel(train, test, config=config)
+    model.binary_resp_nme = "y_bin"
 
     for df in (model.train_data, model.test_data):
         df["pred_xgb"] = rng.normal(size=len(df))
@@ -52,12 +59,17 @@ def test_plotting_outputs(tmp_path, monkeypatch):
 
     model.plot_lift("Xgboost", "pred_xgb", n_bins=5)
     model.plot_dlift(["xgb", "resn"], n_bins=5)
+    model.plot_conversion_lift("pred_xgb", n_bins=5)
 
     lift_path = tmp_path / "plot" / "demo" / "lift" / "01_demo_Xgboost_lift.png"
     dlift_path = tmp_path / "plot" / "demo" / "double_lift" / "02_demo_dlift_xgb_vs_resn.png"
+    conversion_lift_path = (
+        tmp_path / "plot" / "demo" / "conversion_lift" / "03_demo_pred_xgb_conversion_lift.png"
+    )
 
     assert lift_path.exists()
     assert dlift_path.exists()
+    assert conversion_lift_path.exists()
 
 
 def test_use_gpu_enables_mps_backend(tmp_path, monkeypatch):

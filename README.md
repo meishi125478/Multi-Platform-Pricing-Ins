@@ -61,3 +61,18 @@ Use canonical paths:
 
 `ins_pricing` and `ins_pricing.modelling` keep imports lazy so pricing/production/governance
 can be imported without pulling heavy modelling dependencies.
+
+## Torch 1.x Compatibility Check
+
+Torch checkpoints are loaded with secure `weights_only` mode when available. On torch 1.x,
+the package can fall back to trusted legacy loading through
+`INS_PRICING_ALLOW_LEGACY_TORCH_LOAD=1` (default).
+
+To validate torch 1.x runtime behavior in a torch 1.x environment:
+
+```bash
+./scripts/run_torch1_compat_smoke.sh
+# or run the pytest commands directly:
+python -m pytest tests/utils/test_model_loading.py -q
+python -m pytest tests/production/test_inference.py tests/modelling/test_ft_checkpoints.py -q
+```

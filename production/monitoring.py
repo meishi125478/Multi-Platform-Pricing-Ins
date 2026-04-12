@@ -5,6 +5,7 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from ins_pricing.exceptions import DataValidationError
 from ins_pricing.production.scoring import (
     weighted_mae,
     accuracy,
@@ -285,7 +286,9 @@ def run_scheduled_monitoring(config: Dict[str, object]) -> dict:
     production_data = load_production_data(config)
     reference_data = config.get("reference_data")
     if not isinstance(reference_data, pd.DataFrame):
-        reference_data = production_data.copy()
+        raise DataValidationError(
+            "run_scheduled_monitoring requires 'reference_data' DataFrame in config."
+        )
     features = config.get("features")
     if not isinstance(features, (list, tuple)):
         features = [c for c in production_data.columns if c in reference_data.columns]

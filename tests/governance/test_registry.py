@@ -85,6 +85,18 @@ class TestModelRegistry:
         updated = registry.get(sample_model_metadata["model_name"])
         assert updated["metrics"]["mse"] == 95.0
 
+    def test_update_rejects_immutable_fields(self, tmp_path, sample_model_metadata):
+        from ins_pricing.governance.registry import ModelRegistry
+
+        registry = ModelRegistry(registry_path=tmp_path / "registry.json")
+        registry.register(sample_model_metadata)
+
+        with pytest.raises(GovernanceError, match="immutable fields"):
+            registry.update(
+                sample_model_metadata["model_name"],
+                {"version": "9.9.9"},
+            )
+
     def test_delete_model(self, tmp_path, sample_model_metadata):
         """Test deleting a model from registry."""
         from ins_pricing.governance.registry import ModelRegistry

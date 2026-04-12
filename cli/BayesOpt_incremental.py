@@ -406,8 +406,8 @@ class IncrementalUpdateRunner:
         )
         self.runtime_cfg = runtime_cfg
         self.prop_test = args.prop_test if args.prop_test is not None else split_cfg["prop_test"]
-        self.rand_seed = args.rand_seed if args.rand_seed is not None else self.cfg.get("rand_seed", 13)
-        self.epochs = args.epochs if args.epochs is not None else self.cfg.get("epochs", 50)
+        self.rand_seed = args.rand_seed if args.rand_seed is not None else int(runtime_cfg["rand_seed"])
+        self.epochs = args.epochs if args.epochs is not None else int(runtime_cfg["epochs"])
         self.split_strategy = split_cfg["split_strategy"]
         self.split_group_col = split_cfg["split_group_col"]
         self.split_time_col = split_cfg["split_time_col"]
