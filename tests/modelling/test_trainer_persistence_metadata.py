@@ -31,10 +31,6 @@ def _load_trainer_persistence_module(monkeypatch: pytest.MonkeyPatch):
 
     fake_model_loading = types.ModuleType("ins_pricing.utils.model_loading")
     fake_model_loading.load_torch_payload = lambda *_args, **_kwargs: None
-    fake_model_loading.load_model_artifact_payload = lambda *_args, **_kwargs: None
-    fake_model_rebuild = types.ModuleType("ins_pricing.utils.model_rebuild")
-    fake_model_rebuild.rebuild_ft_payload = lambda *args, **kwargs: (None, None, "raw")
-    fake_model_rebuild.rebuild_resn_payload = lambda *args, **kwargs: (None, None)
 
     fake_checkpoints = types.ModuleType("ins_pricing.modelling.bayesopt.checkpoints")
     fake_checkpoints.rebuild_ft_model_from_payload = lambda *args, **kwargs: (None, None, "raw")
@@ -50,7 +46,6 @@ def _load_trainer_persistence_module(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "ins_pricing.modelling.bayesopt", fake_bayesopt)
     monkeypatch.setitem(sys.modules, "ins_pricing.utils", fake_utils)
     monkeypatch.setitem(sys.modules, "ins_pricing.utils.model_loading", fake_model_loading)
-    monkeypatch.setitem(sys.modules, "ins_pricing.utils.model_rebuild", fake_model_rebuild)
     monkeypatch.setitem(
         sys.modules,
         "ins_pricing.modelling.bayesopt.checkpoints",

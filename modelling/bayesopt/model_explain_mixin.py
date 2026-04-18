@@ -4,16 +4,8 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-
-try:
-    import torch
-except Exception:  # pragma: no cover
-    torch = None
-
-try:
-    import statsmodels.api as sm
-except Exception:  # pragma: no cover
-    sm = None
+import torch
+import statsmodels.api as sm
 
 try:
     from ins_pricing.modelling.explain import gradients as explain_gradients
@@ -196,8 +188,6 @@ class BayesOptExplainMixin:
 
 
     def _build_glm_design(self, data: pd.DataFrame) -> pd.DataFrame:
-        if sm is None:
-            raise RuntimeError("statsmodels is required for GLM explainability.")
         X = data[self.var_nmes]
         return sm.add_constant(X, has_constant='add')
 
@@ -258,8 +248,6 @@ class BayesOptExplainMixin:
     # ========= ResNet SHAP explainability =========
 
     def _resn_predict_wrapper(self, X_np):
-        if torch is None:
-            raise RuntimeError("torch is required for ResNet SHAP explainability.")
         model = self.resn_best.resnet.to("cpu")
         with torch.no_grad():
             X_tensor = torch.tensor(X_np, dtype=torch.float32)

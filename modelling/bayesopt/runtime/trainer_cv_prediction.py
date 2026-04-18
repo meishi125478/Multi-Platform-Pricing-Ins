@@ -444,16 +444,25 @@ class TrainerCVPredictionMixin:
         else:
             target_dir = Path(self.output.result_dir) / "predictions"
         target_dir.mkdir(parents=True, exist_ok=True)
+        split_key_col = str(getattr(cfg, "split_cache_key_col", "") or "").strip()
+        if not split_key_col:
+            split_key_col = "_row_id"
 
-        def _build_frame(preds) -> pd.DataFrame:
+        def _build_frame(preds, *, split_label: str) -> pd.DataFrame:
             arr = np.asarray(preds)
             if arr.ndim <= 1:
-                return pd.DataFrame({f"pred_{pred_prefix}": arr.reshape(-1)})
-            cols = [f"pred_{pred_prefix}_{i}" for i in range(arr.shape[1])]
-            return pd.DataFrame(arr, columns=cols)
+                frame = pd.DataFrame({f"pred_{pred_prefix}": arr.reshape(-1)})
+            else:
+                cols = [f"pred_{pred_prefix}_{i}" for i in range(arr.shape[1])]
+                frame = pd.DataFrame(arr, columns=cols)
+
+            split_df = self.ctx.train_data if split_label == "train" else self.ctx.test_data
+            if split_key_col and split_key_col in split_df.columns and len(split_df) == len(frame):
+                frame.insert(0, split_key_col, split_df[split_key_col].to_numpy(copy=False))
+            return frame
 
         for split_label, preds in [("train", preds_train), ("test", preds_test)]:
-            frame = _build_frame(preds)
+            frame = _build_frame(preds, split_label=split_label)
             filename = f"{self.ctx.model_nme}_{pred_prefix}_{split_label}.{ 'csv' if fmt == 'csv' else 'parquet' }"
             path = target_dir / filename
             try:
@@ -475,13 +484,7 @@ class TrainerCVPredictionMixin:
         vals = history.get("val") or []
         if not vals:
             return max(1, int(default_epochs))
-        vals_arr = np.asarray(vals, dtype=float).reshape(-1)
-        finite_mask = np.isfinite(vals_arr)
-        if not finite_mask.any():
-            return max(1, int(default_epochs))
-        finite_idx = np.flatnonzero(finite_mask)
-        best_local = int(np.argmin(vals_arr[finite_mask]))
-        best_idx = int(finite_idx[best_local])
+        best_idx = int(np.nanargmin(vals))
         return max(1, best_idx + 1)
 
     def _fit_predict_cache(self,

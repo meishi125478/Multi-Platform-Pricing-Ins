@@ -58,11 +58,7 @@ class IOUtils:
             return IOUtils._sanitize_params_dict(dict(payload))
 
         if suffix in (".csv", ".tsv"):
-            df = pd.read_csv(
-                file_path,
-                sep="\t" if suffix == ".tsv" else ",",
-                nrows=1,
-            )
+            df = pd.read_csv(file_path, sep="\t" if suffix == ".tsv" else ",")
             if df.empty:
                 raise ValueError(f"Empty params file: {file_path}")
             params = df.iloc[0].to_dict()

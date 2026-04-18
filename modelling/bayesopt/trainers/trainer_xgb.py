@@ -7,13 +7,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
+import torch
 import xgboost as xgb
 from sklearn.metrics import log_loss
-
-try:
-    import torch
-except Exception:  # pragma: no cover
-    torch = None
 
 from ins_pricing.modelling.bayesopt.trainers.trainer_base import TrainerBase
 from ins_pricing.utils import EPS, get_logger, log_print
@@ -408,7 +404,7 @@ def _xgb_cuda_available() -> bool:
     if _XGB_CUDA_CHECKED:
         return _XGB_HAS_CUDA
     _XGB_CUDA_CHECKED = True
-    if torch is None or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         _XGB_HAS_CUDA = False
         return False
     try:

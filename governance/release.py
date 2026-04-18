@@ -326,23 +326,9 @@ class ReleaseManager:
             )
 
     def rollback_to(self, release_id: str) -> None:
-        payload_before = self._load_release_manifest()
-        payload = copy.deepcopy(payload_before)
+        payload = self._load_release_manifest()
         target = self._set_production_release(payload, release_id=release_id)
         self._save_release_manifest(payload)
-
-        if self.registry is not None:
-            try:
-                self.registry.promote(
-                    str(target["model_name"]),
-                    str(target["version"]),
-                    new_status="production",
-                )
-            except Exception as exc:
-                self._save_release_manifest(payload_before)
-                raise GovernanceError(
-                    f"Registry promote failed for rollback '{release_id}'; manifest reverted."
-                ) from exc
 
         if self.audit_logger is not None:
             self.audit_logger.log(

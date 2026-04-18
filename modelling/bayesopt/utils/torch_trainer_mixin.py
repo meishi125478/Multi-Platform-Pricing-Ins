@@ -247,6 +247,8 @@ class TorchTrainerMixin:
 
     def _resolve_num_workers(self, max_workers: int, profile: Optional[str] = None) -> int:
         """Determine number of DataLoader workers."""
+        if os.name == 'nt':
+            return 0
         override = getattr(self, "dataloader_workers", None)
         if override is None:
             override = os.environ.get("BAYESOPT_DATALOADER_WORKERS")
@@ -259,9 +261,6 @@ class TorchTrainerMixin:
         if profile == "memory_saving":
             return 0
         worker_cap = min(int(max_workers), os.cpu_count() or 1)
-        if os.name == "nt":
-            # Windows multiprocessing is spawn-only; keep auto workers conservative.
-            worker_cap = min(worker_cap, 2)
         if getattr(self, "is_ddp_enabled", False):
             world_size = getattr(self, "world_size", None)
             if not world_size:
@@ -391,8 +390,6 @@ class TorchTrainerMixin:
         profile = self._resolve_resource_profile()
         self._log_resource_summary_once(profile)
         data_size = int(N) if N is not None else len(dataset)
-        if data_size <= 0:
-            raise ValueError("Training dataset is empty; cannot build DataLoader.")
         gpu_large, gpu_mid, gpu_small = base_bs_gpu
         cpu_mid, cpu_small = base_bs_cpu
 

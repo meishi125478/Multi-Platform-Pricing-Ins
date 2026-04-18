@@ -24,6 +24,7 @@ from .workflows_common import (
     _drop_duplicate_columns,
     _infer_categorical_features,
     _parse_csv_list,
+    _resolve_data_path,
     _resolve_double_lift_dir,
     _resolve_output_dir,
     _resolve_plot_path,
@@ -171,6 +172,90 @@ def _warn_if_near_constant_predictions(
         )
 
 
+def _log_numeric_summary(
+    *,
+    values: np.ndarray,
+    model_key: str,
+    split_tag: str,
+    metric: str,
+) -> None:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    n_total = int(arr.size)
+    if n_total == 0:
+        _log(f"[Diag] {model_key} {split_tag} {metric}: empty")
+        return
+    finite = arr[np.isfinite(arr)]
+    n_finite = int(finite.size)
+    n_nonfinite = n_total - n_finite
+    if n_finite == 0:
+        _log(
+            f"[Diag] {model_key} {split_tag} {metric}: n={n_total}, finite=0, "
+            f"non_finite={n_nonfinite}"
+        )
+        return
+    q05, q50, q95 = np.quantile(finite, [0.05, 0.5, 0.95])
+    _log(
+        f"[Diag] {model_key} {split_tag} {metric}: n={n_total}, finite={n_finite}, "
+        f"non_finite={n_nonfinite}, mean={float(np.mean(finite)):.6g}, "
+        f"std={float(np.std(finite)):.6g}, min={float(np.min(finite)):.6g}, "
+        f"q05={float(q05):.6g}, q50={float(q50):.6g}, q95={float(q95):.6g}, "
+        f"max={float(np.max(finite)):.6g}"
+    )
+
+
+def _log_prediction_split_diagnostics(
+    *,
+    model_key: str,
+    split_tag: str,
+    pred_values: np.ndarray,
+    raw_frame: pd.DataFrame,
+    target_col: str,
+    weight_col: str,
+) -> None:
+    pred_arr = np.asarray(pred_values, dtype=float).reshape(-1)
+    _log_numeric_summary(
+        values=pred_arr,
+        model_key=model_key,
+        split_tag=split_tag,
+        metric="pred",
+    )
+
+    if target_col in raw_frame.columns:
+        target_arr = pd.to_numeric(raw_frame[target_col], errors="coerce").to_numpy(dtype=float)
+        _log_numeric_summary(
+            values=target_arr,
+            model_key=model_key,
+            split_tag=split_tag,
+            metric=target_col,
+        )
+        aligned_n = min(len(pred_arr), len(target_arr))
+        if aligned_n > 1:
+            pred_aligned = pred_arr[:aligned_n]
+            target_aligned = target_arr[:aligned_n]
+            finite_mask = np.isfinite(pred_aligned) & np.isfinite(target_aligned)
+            if int(np.sum(finite_mask)) > 1:
+                x = pred_aligned[finite_mask]
+                y = target_aligned[finite_mask]
+                x_std = float(np.std(x))
+                y_std = float(np.std(y))
+                corr = float("nan")
+                if x_std > 0 and y_std > 0:
+                    corr = float(np.corrcoef(x, y)[0, 1])
+                _log(
+                    f"[Diag] {model_key} {split_tag}: corr(pred,{target_col})={corr:.6g}, "
+                    f"n_corr={int(np.sum(finite_mask))}"
+                )
+
+    if weight_col in raw_frame.columns:
+        weight_arr = pd.to_numeric(raw_frame[weight_col], errors="coerce").to_numpy(dtype=float)
+        _log_numeric_summary(
+            values=weight_arr,
+            model_key=model_key,
+            split_tag=split_tag,
+            metric=weight_col,
+        )
+
+
 def run_pre_oneway(
     *,
     data_path: str,
@@ -315,10 +400,10 @@ def _run_prediction_plot_workflow(
     *,
     cfg: dict,
     cfg_path: Path,
-    xgb_cfg: dict,
-    xgb_cfg_path: Path,
-    resn_cfg: dict,
-    resn_cfg_path: Path,
+    xgb_cfg: Optional[dict],
+    xgb_cfg_path: Optional[Path],
+    resn_cfg: Optional[dict],
+    resn_cfg_path: Optional[Path],
     model_name: str,
     train_raw: pd.DataFrame,
     test_raw: pd.DataFrame,
@@ -330,17 +415,46 @@ def _run_prediction_plot_workflow(
     resn_model_path: Optional[str],
     model_search_dir: Optional[str] = None,
 ) -> str:
+    provided_model_cfgs: Dict[str, Tuple[dict, Path]] = {}
+    if xgb_cfg is not None and xgb_cfg_path is not None:
+        provided_model_cfgs["xgb"] = (xgb_cfg, xgb_cfg_path)
+    if resn_cfg is not None and resn_cfg_path is not None:
+        provided_model_cfgs["resn"] = (resn_cfg, resn_cfg_path)
+    if not provided_model_cfgs:
+        raise ValueError("At least one model config is required for plotting.")
+
+    cfg_model_keys = cfg.get("model_keys") or []
+    if isinstance(cfg_model_keys, str):
+        requested_model_keys = _dedupe_list(_parse_csv_list(cfg_model_keys))
+    else:
+        requested_model_keys = _dedupe_list(
+            [str(key).strip() for key in cfg_model_keys if str(key).strip()]
+        )
+    if requested_model_keys:
+        skipped = [key for key in requested_model_keys if key not in provided_model_cfgs]
+        if skipped:
+            _log(
+                "[Warn] Missing model configs for requested model_keys; skipped: "
+                f"{skipped}"
+            )
+        model_keys = [key for key in requested_model_keys if key in provided_model_cfgs]
+    else:
+        model_keys = list(provided_model_cfgs.keys())
+    if not model_keys:
+        available = sorted(provided_model_cfgs.keys())
+        raise ValueError(
+            "No runnable model keys found for plot config. "
+            f"Requested={requested_model_keys}, available={available}."
+        )
+
+    model_cfg_map = {key: provided_model_cfgs[key][1] for key in model_keys}
     output_dir_map = {
-        "xgb": _resolve_output_dir(xgb_cfg, xgb_cfg_path),
-        "resn": _resolve_output_dir(resn_cfg, resn_cfg_path),
+        key: _resolve_output_dir(provided_model_cfgs[key][0], provided_model_cfgs[key][1])
+        for key in model_keys
     }
-    output_dir_path_map = {
-        key: Path(value).resolve()
-        for key, value in output_dir_map.items()
-    }
+    output_dir_path_map = {key: Path(value).resolve() for key, value in output_dir_map.items()}
     plot_path_style_map = {
-        "xgb": _resolve_plot_style(xgb_cfg),
-        "resn": _resolve_plot_style(resn_cfg),
+        key: _resolve_plot_style(provided_model_cfgs[key][0]) for key in model_keys
     }
 
     def _get_plot_config(model_key: str) -> Tuple[str, str]:
@@ -352,13 +466,12 @@ def _run_prediction_plot_workflow(
     search_roots = _build_search_roots(
         model_search_dir,
         cfg_path.parent,
-        xgb_cfg_path.parent,
-        resn_cfg_path.parent,
+        *[model_cfg_path.parent for _, model_cfg_path in provided_model_cfgs.values()],
         Path.cwd(),
     )
     raw_model_paths = {"xgb": xgb_model_path, "resn": resn_model_path}
     model_output_overrides: Dict[str, Optional[Path]] = {}
-    for key in ("xgb", "resn"):
+    for key in model_keys:
         model_output_overrides[key] = resolve_model_output_override(
             model_name=model_name,
             model_key=key,
@@ -375,16 +488,12 @@ def _run_prediction_plot_workflow(
             kwargs["output_dir"] = output_override
         return _load_predictor_from_cfg(model_cfg_path, model_key, **kwargs)
 
-    model_cfg_map = {"xgb": xgb_cfg_path, "resn": resn_cfg_path}
-    model_keys = cfg.get("model_keys") or ["xgb", "resn"]
-    model_keys = [key for key in model_keys if key in model_cfg_map]
-    if not model_keys:
-        raise ValueError("No valid model keys found in plot config.")
-
     default_model_labels = {"xgb": "Xgboost", "resn": "ResNet"}
     labels = cfg.get("model_labels") or {}
     plot_cfg = cfg.get("plot", {}) if isinstance(cfg.get("plot"), dict) else {}
     n_bins = plot_cfg.get("n_bins", 10)
+    weight_col = cfg["weight"]
+    target_col = cfg["target"]
     predict_chunk_rows = _resolve_predict_chunk_rows(cfg, plot_cfg)
     if predict_chunk_rows > 0:
         _log(f"[Plot] Chunked prediction enabled: {predict_chunk_rows} rows/chunk")
@@ -427,6 +536,14 @@ def _run_prediction_plot_workflow(
                 model_key=key,
                 split_tag="train",
             )
+            _log_prediction_split_diagnostics(
+                model_key=key,
+                split_tag="train",
+                pred_values=np.asarray(pred_train[key], dtype=float).reshape(-1),
+                raw_frame=train_raw,
+                target_col=target_col,
+                weight_col=weight_col,
+            )
         else:
             pred_train[key] = []
         if len(test_df) > 0:
@@ -444,6 +561,14 @@ def _run_prediction_plot_workflow(
                 model_key=key,
                 split_tag="valid",
             )
+            _log_prediction_split_diagnostics(
+                model_key=key,
+                split_tag="valid",
+                pred_values=np.asarray(pred_test[key], dtype=float).reshape(-1),
+                raw_frame=test_raw,
+                target_col=target_col,
+                weight_col=weight_col,
+            )
         else:
             pred_test[key] = []
 
@@ -454,9 +579,6 @@ def _run_prediction_plot_workflow(
             plot_train[f"pred_{key}"] = pred_train[key]
         if len(plot_test) > 0:
             plot_test[f"pred_{key}"] = pred_test[key]
-
-    weight_col = cfg["weight"]
-    target_col = cfg["target"]
 
     if weight_col not in plot_train.columns:
         plot_train[weight_col] = 1.0
@@ -649,8 +771,8 @@ def _run_prediction_plot_workflow(
 def run_plot_direct(
     *,
     cfg_path: str,
-    xgb_cfg_path: str,
-    resn_cfg_path: str,
+    xgb_cfg_path: Optional[str] = None,
+    resn_cfg_path: Optional[str] = None,
     train_data_path: Optional[str] = None,
     test_data_path: Optional[str] = None,
     xgb_model_path: Optional[str] = None,
@@ -659,25 +781,81 @@ def run_plot_direct(
     oneway_features: Optional[Any] = None,
 ) -> str:
     cfg_path = Path(cfg_path).resolve()
-    xgb_cfg_path = Path(xgb_cfg_path).resolve()
-    resn_cfg_path = Path(resn_cfg_path).resolve()
-
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    xgb_cfg = json.loads(xgb_cfg_path.read_text(encoding="utf-8"))
-    resn_cfg = json.loads(resn_cfg_path.read_text(encoding="utf-8"))
+    explicit_xgb_cfg_path = str(xgb_cfg_path or "").strip()
+    explicit_resn_cfg_path = str(resn_cfg_path or "").strip()
+    use_cfg_alias_fallback = not explicit_xgb_cfg_path and not explicit_resn_cfg_path
+
+    def _resolve_model_cfg_path(
+        raw_path: Optional[str],
+        *aliases: str,
+    ) -> Optional[Path]:
+        path_value = str(raw_path or "").strip()
+        if not path_value:
+            for alias in aliases:
+                alias_value = str(cfg.get(alias, "") or "").strip()
+                if alias_value:
+                    path_value = alias_value
+                    break
+        if not path_value:
+            return None
+        cfg_file = Path(path_value)
+        if not cfg_file.is_absolute():
+            cfg_file = (cfg_path.parent / cfg_file).resolve()
+        else:
+            cfg_file = cfg_file.resolve()
+        return cfg_file
+
+    if use_cfg_alias_fallback:
+        xgb_cfg_path_obj = _resolve_model_cfg_path(
+            xgb_cfg_path, "xgb_cfg_path", "direct_xgb_cfg_path"
+        )
+        resn_cfg_path_obj = _resolve_model_cfg_path(
+            resn_cfg_path, "resn_cfg_path", "direct_resn_cfg_path"
+        )
+    else:
+        xgb_cfg_path_obj = _resolve_model_cfg_path(xgb_cfg_path)
+        resn_cfg_path_obj = _resolve_model_cfg_path(resn_cfg_path)
+    xgb_cfg = json.loads(xgb_cfg_path_obj.read_text(encoding="utf-8")) if xgb_cfg_path_obj else None
+    resn_cfg = json.loads(resn_cfg_path_obj.read_text(encoding="utf-8")) if resn_cfg_path_obj else None
+
+    available_cfgs: Dict[str, Tuple[dict, Path]] = {}
+    if xgb_cfg is not None and xgb_cfg_path_obj is not None:
+        available_cfgs["xgb"] = (xgb_cfg, xgb_cfg_path_obj)
+    if resn_cfg is not None and resn_cfg_path_obj is not None:
+        available_cfgs["resn"] = (resn_cfg, resn_cfg_path_obj)
+    if not available_cfgs:
+        raise ValueError("run_plot_direct requires at least one of xgb_cfg_path or resn_cfg_path.")
+
+    cfg_model_keys = cfg.get("model_keys") or []
+    if isinstance(cfg_model_keys, str):
+        requested_model_keys = _dedupe_list(_parse_csv_list(cfg_model_keys))
+    else:
+        requested_model_keys = _dedupe_list(
+            [str(key).strip() for key in cfg_model_keys if str(key).strip()]
+        )
+
+    split_source_key: Optional[str] = None
+    for key in requested_model_keys:
+        if key in available_cfgs:
+            split_source_key = key
+            break
+    if split_source_key is None:
+        split_source_key = next(iter(available_cfgs.keys()))
+    split_data_cfg, split_data_cfg_path = available_cfgs[split_source_key]
 
     model_name = f"{cfg['model_list'][0]}_{cfg['model_categories'][0]}"
     cfg_data_dir = str(cfg.get("data_dir", "") or "").strip()
-    xgb_data_dir = str(xgb_cfg.get("data_dir", "") or "").strip()
-    if cfg_data_dir and xgb_data_dir and cfg_data_dir != xgb_data_dir:
+    split_data_dir = str(split_data_cfg.get("data_dir", "") or "").strip()
+    if cfg_data_dir and split_data_dir and cfg_data_dir != split_data_dir:
         _log(
             f"[Info] plot_direct data_dir override: cfg={cfg_data_dir!r} -> "
-            f"xgb_cfg={xgb_data_dir!r}"
+            f"{split_source_key}_cfg={split_data_dir!r}"
         )
     train_raw, test_raw, _raw, _ = load_raw_splits(
         split_cfg=cfg,
-        data_cfg=xgb_cfg,
-        data_cfg_path=xgb_cfg_path,
+        data_cfg=split_data_cfg,
+        data_cfg_path=split_data_cfg_path,
         model_name=model_name,
         train_data_path=train_data_path,
         test_data_path=test_data_path,
@@ -700,9 +878,9 @@ def run_plot_direct(
         cfg=cfg,
         cfg_path=cfg_path,
         xgb_cfg=xgb_cfg,
-        xgb_cfg_path=xgb_cfg_path,
+        xgb_cfg_path=xgb_cfg_path_obj,
         resn_cfg=resn_cfg,
-        resn_cfg_path=resn_cfg_path,
+        resn_cfg_path=resn_cfg_path_obj,
         model_name=model_name,
         train_raw=train_raw,
         test_raw=test_raw,
@@ -753,16 +931,67 @@ def run_plot_embed(
 
     raw_feature_list = _dedupe_list(ft_cfg.get("feature_list") or [])
     raw_categorical_features = _dedupe_list(ft_cfg.get("categorical_features") or [])
+    plot_feature_list = _dedupe_list(cfg.get("feature_list") or [])
+    model_feature_list = _dedupe_list(
+        list(xgb_cfg.get("feature_list") or []) + list(resn_cfg.get("feature_list") or [])
+    )
+
+    split_cfg = ft_cfg
+    split_data_cfg = ft_cfg
+    split_data_cfg_path = ft_cfg_path
+
+    model_cfg_map = {"xgb": (xgb_cfg, xgb_cfg_path), "resn": (resn_cfg, resn_cfg_path)}
+    cfg_model_keys = _dedupe_list(cfg.get("model_keys") or ["xgb", "resn"])
+    candidate_model_keys = [k for k in cfg_model_keys if k in model_cfg_map]
+    if not candidate_model_keys:
+        candidate_model_keys = ["xgb", "resn"]
+    embed_model_key = candidate_model_keys[0]
+    embed_data_cfg, embed_data_cfg_path = model_cfg_map[embed_model_key]
+
+    if not use_runtime_ft_embedding:
+        try:
+            embed_data_path = _resolve_data_path(embed_data_cfg, embed_data_cfg_path, model_name)
+            _log(
+                f"[Plot] Precomputed embed source: model_key={embed_model_key}, "
+                f"cfg={embed_data_cfg_path}, data={embed_data_path}"
+            )
+            for key in candidate_model_keys[1:]:
+                peer_cfg, peer_cfg_path = model_cfg_map[key]
+                peer_data_path = _resolve_data_path(peer_cfg, peer_cfg_path, model_name)
+                if str(peer_data_path) != str(embed_data_path):
+                    _log(
+                        f"[Warn] {key} precomputed data path differs from {embed_model_key}: "
+                        f"{peer_data_path} vs {embed_data_path}. "
+                        f"Using {embed_model_key} data as unified inference frame."
+                    )
+        except Exception:
+            _log(
+                f"[Warn] Failed to resolve precomputed embed path from {embed_data_cfg_path}. "
+                "Proceeding with configured defaults."
+            )
+
+    _log(f"[Plot] Split source cfg: {split_data_cfg_path}")
+    required_raw_columns = _dedupe_list(
+        [
+            str(cfg.get("target", "") or "").strip(),
+            str(cfg.get("weight", "") or "").strip(),
+            *raw_feature_list,
+            *plot_feature_list,
+        ]
+    )
+    if required_raw_columns:
+        _log(f"[Plot] Loading required raw columns only: {len(required_raw_columns)} columns")
 
     if ft_cfg.get("geo_feature_nmes"):
         raise ValueError("FT inference with geo tokens is not supported in this workflow.")
     train_raw, test_raw, raw, use_explicit_split = load_raw_splits(
-        split_cfg=cfg,
-        data_cfg=ft_cfg,
-        data_cfg_path=ft_cfg_path,
+        split_cfg=split_cfg,
+        data_cfg=split_data_cfg,
+        data_cfg_path=split_data_cfg_path,
         model_name=model_name,
         train_data_path=train_data_path,
         test_data_path=test_data_path,
+        required_columns=required_raw_columns,
     )
 
     train_df, test_df = build_ft_embedding_frames(
@@ -776,8 +1005,10 @@ def run_plot_embed(
         ft_cfg_path=ft_cfg_path,
         search_roots=search_roots,
         ft_model_path=ft_model_path,
-        embed_cfg=cfg,
-        embed_cfg_path=cfg_path,
+        required_columns=model_feature_list,
+        embed_cfg=embed_data_cfg,
+        embed_cfg_path=embed_data_cfg_path,
+        embed_path_resolver=_resolve_data_path,
     )
 
     feature_list = _dedupe_list(cfg.get("feature_list") or [])

@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import random
 import numpy as np
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None  # type: ignore[assignment]
 
 
 EPS = 1e-8
@@ -35,10 +39,6 @@ def set_global_seed(seed: int) -> None:
     """Set random seed for reproducibility across numpy/python/torch."""
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        import torch  # local import to keep module import torch-optional
-    except Exception:  # pragma: no cover - optional dependency
-        torch = None  # type: ignore[assignment]
     if torch is not None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -60,10 +60,6 @@ def tweedie_loss(
     max_clip: float = 1e6,
 ):
     """Compute Tweedie deviance loss for PyTorch tensors."""
-    try:
-        import torch  # local import to keep module import torch-optional
-    except Exception:  # pragma: no cover - optional dependency
-        torch = None  # type: ignore[assignment]
     if torch is None:
         raise ImportError("tweedie_loss requires torch. Install optional dependency 'torch'.")
     pred_clamped = torch.clamp(pred, min=eps)

@@ -388,6 +388,12 @@ class IncrementalUpdateRunner:
                 "categorical_features",
             ],
         )
+        split_cache_key_col = str(self.cfg.get("split_cache_key_col", "") or "").strip()
+        feature_list_cfg = list(self.cfg.get("feature_list") or [])
+        if split_cache_key_col and split_cache_key_col in feature_list_cfg:
+            raise ValueError(
+                f"split_cache_key_col={split_cache_key_col!r} must not be included in feature_list."
+            )
         data_dir, data_format, data_path_template, dtype_map = resolve_data_config(
             self.cfg,
             self.config_path,
@@ -406,8 +412,8 @@ class IncrementalUpdateRunner:
         )
         self.runtime_cfg = runtime_cfg
         self.prop_test = args.prop_test if args.prop_test is not None else split_cfg["prop_test"]
-        self.rand_seed = args.rand_seed if args.rand_seed is not None else int(runtime_cfg["rand_seed"])
-        self.epochs = args.epochs if args.epochs is not None else int(runtime_cfg["epochs"])
+        self.rand_seed = args.rand_seed if args.rand_seed is not None else self.cfg.get("rand_seed", 13)
+        self.epochs = args.epochs if args.epochs is not None else self.cfg.get("epochs", 50)
         self.split_strategy = split_cfg["split_strategy"]
         self.split_group_col = split_cfg["split_group_col"]
         self.split_time_col = split_cfg["split_time_col"]
@@ -545,6 +551,7 @@ class IncrementalUpdateRunner:
             self.cv_group_col,
             self.cv_time_col,
             self.timestamp_col,
+            self.cfg.get("split_cache_key_col"),
         ]:
             if isinstance(col, str):
                 cols.append(col)

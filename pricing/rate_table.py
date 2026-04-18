@@ -55,55 +55,10 @@ def apply_factor_tables(
     for factor, table in factor_tables.items():
         if factor not in df.columns:
             raise ValueError(f"Missing factor column: {factor}")
-        if "relativity" not in table.columns:
-            raise ValueError("Factor table must include 'relativity'.")
-
-        level_col = "level"
-        if level_col not in table.columns:
-            level_candidates = [c for c in table.columns if c != "relativity"]
-            if len(level_candidates) != 1:
-                raise ValueError(
-                    "Factor table must include 'level' or exactly one non-'relativity' level column."
-                )
-            level_col = level_candidates[0]
-
-        level_values = table[level_col]
-        if level_values.duplicated().any():
-            raise ValueError(
-                f"Factor table for '{factor}' has duplicated levels in column '{level_col}'."
-            )
-
-        rel_raw = table["relativity"]
-        rel_values = pd.to_numeric(rel_raw, errors="coerce")
-        invalid_relativity = rel_values.isna()
-        if invalid_relativity.any():
-            bad_rows = table.loc[invalid_relativity, [level_col, "relativity"]]
-            raise ValueError(
-                f"Factor table for '{factor}' contains invalid relativity values: "
-                f"{bad_rows.to_dict(orient='records')[:5]}"
-            )
-        mapping = pd.Series(rel_values.to_numpy(dtype=float), index=level_values)
-        rel = df[factor].map(mapping)
-
-        # Support interval-level factor tables against raw numeric factor columns.
-        if rel.isna().any() and pd.api.types.is_interval_dtype(level_values):
-            raw_values = pd.to_numeric(df[factor], errors="coerce")
-            interval_index = pd.IntervalIndex(level_values)
-            try:
-                interval_pos = interval_index.get_indexer(raw_values.to_numpy(dtype=float))
-            except Exception as exc:
-                raise ValueError(
-                    f"Failed interval mapping for factor '{factor}' using column '{level_col}': {exc}"
-                ) from exc
-            missing_mask = rel.isna().to_numpy()
-            hit_mask = interval_pos >= 0
-            fill_mask = missing_mask & hit_mask
-            if fill_mask.any():
-                rel_arr = rel.to_numpy(dtype=float, copy=True)
-                rel_arr[fill_mask] = rel_values.to_numpy(dtype=float)[interval_pos[fill_mask]]
-                rel = pd.Series(rel_arr, index=df.index)
-
-        rel = rel.fillna(default_relativity).to_numpy(dtype=float)
+        if "level" not in table.columns or "relativity" not in table.columns:
+            raise ValueError("Factor table must include 'level' and 'relativity'.")
+        mapping = table.set_index("level")["relativity"]
+        rel = df[factor].map(mapping).fillna(default_relativity).to_numpy(dtype=float)
         multiplier *= rel
     return multiplier
 

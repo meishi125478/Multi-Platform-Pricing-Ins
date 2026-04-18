@@ -78,7 +78,7 @@ def test_generate_step2_configs_applies_overrides_and_saves_augmented_data(tmp_p
     xgb_cfg, resn_cfg = helper.generate_step2_configs(
         step1_config_path=str(cfg_path),
         target_models=["xgb", "resn"],
-        augmented_data_dir="./DataFTUnsupervised",
+        augmented_data_dir="./DataFTEmbed",
         xgb_overrides={
             "output_dir": "./ResultsXGBFromFTEmbed",
             "runner": {"nproc_per_node": 3},
@@ -112,11 +112,54 @@ def test_generate_step2_configs_applies_overrides_and_saves_augmented_data(tmp_p
     assert xgb_cfg["feature_list"] == ["pred_ft_emb_0"]
     assert xgb_cfg["categorical_features"] == []
 
-    aug_path = tmp_path / "DataFTUnsupervised" / "od_bc.csv"
+    aug_path = tmp_path / "DataFTEmbed" / "od_bc.csv"
     assert aug_path.exists()
     aug = pd.read_csv(aug_path)
     assert len(aug) == 5
     assert "pred_ft_emb_0" in aug.columns
+
+
+def test_prepare_step1_config_defaults_to_embedding_role():
+    helper = FTWorkflowHelper()
+    cfg = helper.prepare_step1_config(
+        base_config={"runner": {}, "plot": {}},
+    )
+    assert cfg["ft_role"] == "embedding"
+    assert cfg["output_dir"] == "./ResultsFTEmbedDDP"
+    assert cfg["build_oht"] is False
+    assert cfg["oht_sparse_csr"] is False
+    assert cfg["keep_unscaled_oht"] is False
+    assert cfg["optuna_study_prefix"] == "pricing_ft_embed"
+
+
+def test_prepare_step1_config_accepts_unsupervised_embedding_alias():
+    helper = FTWorkflowHelper()
+    cfg = helper.prepare_step1_config(
+        base_config={"runner": {}, "plot": {}},
+        ft_role="unsupervised_embedding",
+    )
+    assert cfg["ft_role"] == "unsupervised_embedding"
+    assert cfg["optuna_study_prefix"] == "pricing_ft_unsup"
+
+
+def test_save_configs_uses_embed_primary_names_and_writes_legacy_aliases(tmp_path):
+    helper = FTWorkflowHelper()
+    helper.step1_config = {"ft_role": "embedding", "runner": {"model_keys": ["ft"]}}
+    helper.step2_configs = {
+        "xgb": {"stack_model_keys": ["xgb"]},
+        "resn": {"stack_model_keys": ["resn"]},
+    }
+    saved = helper.save_configs(str(tmp_path))
+    assert (tmp_path / "config_ft_step1_embed.json").exists()
+    assert (tmp_path / "config_xgb_from_ft_embed.json").exists()
+    assert (tmp_path / "config_resn_from_ft_embed.json").exists()
+    assert (tmp_path / "config_ft_step1_unsupervised.json").exists()
+    assert (tmp_path / "config_xgb_from_ft_unsupervised.json").exists()
+    assert (tmp_path / "config_resn_from_ft_unsupervised.json").exists()
+    assert (tmp_path / "config_xgb_from_ft_step2.json").exists()
+    assert (tmp_path / "config_resn_from_ft_step2.json").exists()
+    assert saved["xgb_step2"].endswith("config_xgb_from_ft_embed.json")
+    assert saved["resn_step2"].endswith("config_resn_from_ft_embed.json")
 
 
 def test_generate_step2_configs_respects_embedding_source_subset(tmp_path, monkeypatch):

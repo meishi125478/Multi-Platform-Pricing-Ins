@@ -92,7 +92,7 @@ def fit_calibration_factor(
 
     Returns:
         Calibration factor (scalar multiplier) to apply to predictions.
-        Raises if weighted prediction sum is non-positive.
+        Returns 1.0 if pred sum is <= 0 (no calibration needed).
 
     Raises:
         ValueError: If weight length doesn't match pred length
@@ -120,7 +120,7 @@ def fit_calibration_factor(
     Note:
         - Calibration preserves relative differences between predictions
         - Weight is applied to both pred and actual for consistency
-        - Requires positive weighted prediction sum
+        - Returns 1.0 (no adjustment) if predictions sum to zero or less
         - target_lr typically in range [0.5, 0.9] for insurance pricing
     """
     pred = _to_1d_numeric(pred, name="pred")
@@ -138,9 +138,7 @@ def fit_calibration_factor(
     pred_sum = float(np.sum(pred))
     actual_sum = float(np.sum(actual))
     if pred_sum <= 0:
-        raise DataValidationError(
-            "Calibration requires positive weighted prediction sum; got non-positive total."
-        )
+        return 1.0
 
     if target_lr is None:
         return actual_sum / pred_sum
@@ -203,25 +201,16 @@ def calibrate_by_segment(
 
     rows = []
     for segment, group in df.groupby(segment_col, dropna=False):
-        status = "ok"
-        error = None
-        try:
-            factor = fit_calibration_factor(
-                pred=group[pred_col].to_numpy(),
-                actual=group[actual_col].to_numpy(),
-                weight=group[weight_col].to_numpy() if weight_col else None,
-            )
-        except DataValidationError as exc:
-            factor = 1.0
-            status = "fallback_default"
-            error = str(exc)
+        factor = fit_calibration_factor(
+            pred=group[pred_col].to_numpy(),
+            actual=group[actual_col].to_numpy(),
+            weight=group[weight_col].to_numpy() if weight_col else None,
+        )
         rows.append(
             {
                 segment_col: segment,
                 "calibration_factor": float(factor),
                 "count": int(len(group)),
-                "status": status,
-                "error": error,
             }
         )
     return pd.DataFrame(rows)

@@ -257,19 +257,7 @@ class DeviceManager:
         if not bool(use_gpu):
             return torch.device("cpu")
         if bool(is_ddp_enabled):
-            if torch.cuda.is_available():
-                device_count = torch.cuda.device_count()
-                if device_count < 1:
-                    return torch.device("cpu")
-                rank = int(local_rank)
-                if rank < 0 or rank >= device_count:
-                    cls._logger.warning(
-                        f"Invalid DDP local_rank={rank}; falling back to cuda:0 "
-                        f"(device_count={device_count})."
-                    )
-                    rank = 0
-                return torch.device(f"cuda:{rank}")
-            return torch.device("cpu")
+            return torch.device(f"cuda:{int(local_rank)}")
         return cls.get_best_device(prefer_cuda=True)
 
     @classmethod

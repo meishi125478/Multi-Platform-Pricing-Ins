@@ -174,8 +174,6 @@ def psi_report(
         )
         rows.append({"feature": feat, "psi": psi})
 
-    if not rows:
-        return pd.DataFrame(columns=["feature", "psi"])
     return pd.DataFrame(rows).sort_values(by="psi", ascending=False).reset_index(drop=True)
 
 

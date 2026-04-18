@@ -23,7 +23,7 @@ class FTWorkflowHelper:
     """
     Helper for FT-Transformer two-step workflow.
 
-    Step 1: Train FT as unsupervised embedding generator
+    Step 1: Train FT as embedding generator
     Step 2: Merge embeddings with raw data and train XGB/ResN
     """
 
@@ -35,18 +35,22 @@ class FTWorkflowHelper:
     def prepare_step1_config(
         self,
         base_config: Dict[str, Any],
-        output_dir: str = "./ResultsFTUnsupervisedDDP",
+        output_dir: str = "./ResultsFTEmbedDDP",
         ft_feature_prefix: str = "ft_emb",
+        ft_role: str = "embedding",
         use_ddp: bool = True,
         nproc_per_node: int = 2,
     ) -> Dict[str, Any]:
         """
-        Prepare configuration for Step 1: FT unsupervised embedding.
+        Prepare configuration for Step 1: FT embedding.
 
         Args:
             base_config: Base configuration dictionary
             output_dir: Output directory for FT embeddings
             ft_feature_prefix: Prefix for embedding column names
+            ft_role: FT role for step-1 embeddings.
+                Primary value is ``embedding``; ``unsupervised_embedding`` is
+                accepted for backward compatibility.
             use_ddp: Whether to use DDP for FT training
             nproc_per_node: Number of processes for DDP
 
@@ -55,12 +59,24 @@ class FTWorkflowHelper:
         """
         config = copy.deepcopy(base_config)
 
-        # Set FT role to unsupervised embedding
-        config['ft_role'] = 'unsupervised_embedding'
+        role = str(ft_role or "embedding").strip().lower()
+        valid_roles = {"embedding", "unsupervised_embedding"}
+        if role not in valid_roles:
+            raise ValueError(
+                f"Invalid ft_role for Step 1: {ft_role!r}. "
+                f"Expected one of {sorted(valid_roles)}."
+            )
+
+        # Set FT role for embedding generation.
+        config['ft_role'] = role
         config['ft_feature_prefix'] = ft_feature_prefix
         config['output_dir'] = output_dir
         config['cache_predictions'] = True
         config['prediction_cache_format'] = 'csv'
+        # Step-1 embedding flow does not require OHT build.
+        config['build_oht'] = False
+        config['oht_sparse_csr'] = False
+        config['keep_unscaled_oht'] = False
 
         # Disable other models in step 1
         config['stack_model_keys'] = []
@@ -72,7 +88,11 @@ class FTWorkflowHelper:
         config['use_resn_data_parallel'] = False
         config['use_gnn_data_parallel'] = False
 
-        config['optuna_study_prefix'] = 'pricing_ft_unsup'
+        config['optuna_study_prefix'] = (
+            'pricing_ft_embed'
+            if role == "embedding"
+            else 'pricing_ft_unsup'
+        )
 
         # Runner config
         runner = config.get('runner', {})
@@ -338,6 +358,16 @@ class FTWorkflowHelper:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    @staticmethod
+    def _to_config_relative_path(path: Path, *, base_dir: Path) -> str:
+        resolved = path.resolve()
+        base_resolved = base_dir.resolve()
+        try:
+            rel = resolved.relative_to(base_resolved)
+            return f"./{rel.as_posix()}"
+        except Exception:
+            return str(resolved)
+
     def _resolve_prediction_cache_paths(
         self,
         *,
@@ -385,9 +415,11 @@ class FTWorkflowHelper:
         self,
         step1_config_path: str,
         target_models: List[str] = None,
-        augmented_data_dir: str = "./DataFTUnsupervised",
+        augmented_data_dir: str = "./DataFTEmbed",
         augmented_data_format: str = "csv",
         augmented_data_path_template: str = "{model_name}.{ext}",
+        use_prediction_cache_splits: bool = False,
+        split_data_path_template: str = "{model_name}_{split}.{ext}",
         xgb_overrides: Optional[Dict[str, Any]] = None,
         resn_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -402,6 +434,12 @@ class FTWorkflowHelper:
             augmented_data_dir: Directory to save augmented data with embeddings
             augmented_data_format: Output format for augmented step-2 data
             augmented_data_path_template: Path template under augmented_data_dir
+            use_prediction_cache_splits: If True, write compact train/test files
+                (with row key + target/weight + required features + embeddings)
+                instead of one full augmented dataset copy.
+            split_data_path_template: Filename template used when
+                use_prediction_cache_splits=True. Supports placeholders:
+                {model_name}, {split}, {ext}.
             xgb_overrides: Optional overrides merged into generated XGB Step-2 config
             resn_overrides: Optional overrides merged into generated ResN Step-2 config
 
@@ -480,40 +518,125 @@ class FTWorkflowHelper:
                 pred_test_rows=len(pred_test),
             )
 
-        # Merge embeddings with one preallocated matrix to reduce intermediate copies.
-        embed_cols = [str(col) for col in pred_train.columns]
-        train_values = pred_train.to_numpy(dtype=np.float32, copy=False)
-        test_values = pred_test.to_numpy(dtype=np.float32, copy=False)
-        if train_values.ndim == 1:
-            train_values = train_values.reshape(-1, 1)
-        if test_values.ndim == 1:
-            test_values = test_values.reshape(-1, 1)
-
-        train_pos = raw.index.get_indexer(train_index)
-        test_pos = raw.index.get_indexer(test_index)
-        if np.any(train_pos < 0) or np.any(test_pos < 0):
-            raise ValueError(
-                "Failed to map reconstructed split indices back to raw dataset rows."
-            )
-
-        embed_values = np.full((len(raw), len(embed_cols)), np.nan, dtype=np.float32)
-        embed_values[train_pos, :] = train_values
-        embed_values[test_pos, :] = test_values
-
-        raw_base = raw.drop(columns=embed_cols, errors="ignore").reset_index(drop=True)
-        embed_frame = pd.DataFrame(embed_values, columns=embed_cols, copy=False)
-        aug = pd.concat([raw_base, embed_frame], axis=1, copy=False)
-
-        # Save augmented data
         data_out_dir = cfg_path.parent / augmented_data_dir
         data_out_dir.mkdir(parents=True, exist_ok=True)
-        aug_path = self._resolve_output_data_path(
-            output_dir=data_out_dir,
-            model_name=model_name,
-            data_format=aug_data_format,
-            data_path_template=aug_data_path_template,
-        )
-        self._write_table(aug, aug_path, data_format=aug_data_format)
+        split_key_col = str(cfg.get("split_cache_key_col") or "_row_id").strip() or "_row_id"
+        pred_key_col = None
+        if split_key_col in pred_train.columns and split_key_col in pred_test.columns:
+            pred_key_col = split_key_col
+
+        embed_cols = [str(col) for col in pred_train.columns if str(col) != pred_key_col]
+        if not embed_cols:
+            raise ValueError(
+                "No embedding prediction columns found in cached FT outputs. "
+                f"columns={list(pred_train.columns)}"
+            )
+        if len(embed_cols) != len(pred_test.columns) - (1 if pred_key_col else 0):
+            raise ValueError("Train/test cached embedding column mismatch.")
+
+        step2_train_data_path: Optional[str] = None
+        step2_test_data_path: Optional[str] = None
+
+        if use_prediction_cache_splits:
+            template = str(split_data_path_template or "").strip() or "{model_name}_{split}.{ext}"
+            ext = self._format_to_ext(aug_data_format)
+
+            def _split_path(split: str) -> Path:
+                try:
+                    filename = template.format(model_name=model_name, split=split, ext=ext)
+                except Exception as exc:
+                    raise ValueError(
+                        "Invalid split_data_path_template. Must support {model_name}, "
+                        "{split}, and/or {ext} placeholders."
+                    ) from exc
+                path = (data_out_dir / filename).resolve()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                return path
+
+            required_supervision_cols = self._dedup_preserve_order(
+                [
+                    str(cfg.get("target", "") or "").strip(),
+                    str(cfg.get("weight", "") or "").strip(),
+                    str(cfg.get("binary_target") or cfg.get("binary_resp_nme") or "").strip(),
+                ]
+            )
+            feature_list_step2, _ = self._resolve_step2_feature_space(cfg, embed_cols)
+            raw_required = self._dedup_preserve_order(
+                [split_key_col, *required_supervision_cols, *feature_list_step2]
+            )
+            raw_available = [c for c in raw_required if c in raw.columns]
+            train_raw = raw.loc[train_index, raw_available].copy()
+            test_raw = raw.loc[test_index, raw_available].copy()
+
+            if pred_key_col is not None and split_key_col in train_raw.columns:
+                train_pred_key = pd.Index(pred_train[pred_key_col])
+                test_pred_key = pd.Index(pred_test[pred_key_col])
+                if not train_pred_key.is_unique or not test_pred_key.is_unique:
+                    raise ValueError("Prediction cache key column contains duplicate values.")
+                train_pos = train_pred_key.get_indexer(train_raw[split_key_col])
+                test_pos = test_pred_key.get_indexer(test_raw[split_key_col])
+                if np.any(train_pos < 0) or np.any(test_pos < 0):
+                    raise ValueError(
+                        f"Cannot align prediction cache rows by key column {split_key_col!r}."
+                    )
+                pred_train_embed = pred_train.iloc[train_pos][embed_cols].reset_index(drop=True)
+                pred_test_embed = pred_test.iloc[test_pos][embed_cols].reset_index(drop=True)
+            else:
+                if len(train_raw) != len(pred_train) or len(test_raw) != len(pred_test):
+                    raise ValueError(
+                        "Prediction cache rows do not match split rows; "
+                        "cannot align without key column."
+                    )
+                pred_train_embed = pred_train[embed_cols].reset_index(drop=True)
+                pred_test_embed = pred_test[embed_cols].reset_index(drop=True)
+
+            train_out = train_raw.drop(columns=embed_cols, errors="ignore").reset_index(drop=True)
+            test_out = test_raw.drop(columns=embed_cols, errors="ignore").reset_index(drop=True)
+            train_out = pd.concat([train_out, pred_train_embed], axis=1, copy=False)
+            test_out = pd.concat([test_out, pred_test_embed], axis=1, copy=False)
+
+            train_path = _split_path("train")
+            test_path = _split_path("test")
+            self._write_table(train_out, train_path, data_format=aug_data_format)
+            self._write_table(test_out, test_path, data_format=aug_data_format)
+
+            step2_train_data_path = self._to_config_relative_path(
+                train_path, base_dir=cfg_path.parent
+            )
+            step2_test_data_path = self._to_config_relative_path(
+                test_path, base_dir=cfg_path.parent
+            )
+        else:
+            # Merge embeddings with one preallocated matrix to reduce intermediate copies.
+            train_values = pred_train[embed_cols].to_numpy(dtype=np.float32, copy=False)
+            test_values = pred_test[embed_cols].to_numpy(dtype=np.float32, copy=False)
+            if train_values.ndim == 1:
+                train_values = train_values.reshape(-1, 1)
+            if test_values.ndim == 1:
+                test_values = test_values.reshape(-1, 1)
+
+            train_pos = raw.index.get_indexer(train_index)
+            test_pos = raw.index.get_indexer(test_index)
+            if np.any(train_pos < 0) or np.any(test_pos < 0):
+                raise ValueError(
+                    "Failed to map reconstructed split indices back to raw dataset rows."
+                )
+
+            embed_values = np.full((len(raw), len(embed_cols)), np.nan, dtype=np.float32)
+            embed_values[train_pos, :] = train_values
+            embed_values[test_pos, :] = test_values
+
+            raw_base = raw.drop(columns=embed_cols, errors="ignore").reset_index(drop=True)
+            embed_frame = pd.DataFrame(embed_values, columns=embed_cols, copy=False)
+            aug = pd.concat([raw_base, embed_frame], axis=1, copy=False)
+
+            aug_path = self._resolve_output_data_path(
+                output_dir=data_out_dir,
+                model_name=model_name,
+                data_format=aug_data_format,
+                data_path_template=aug_data_path_template,
+            )
+            self._write_table(aug, aug_path, data_format=aug_data_format)
 
         # Generate configs
         xgb_config = None
@@ -526,6 +649,8 @@ class FTWorkflowHelper:
                 augmented_data_dir,
                 data_format=aug_data_format,
                 data_path_template=aug_data_path_template,
+                train_data_path=step2_train_data_path,
+                test_data_path=step2_test_data_path,
                 overrides=xgb_overrides,
             )
             self.step2_configs['xgb'] = xgb_config
@@ -537,6 +662,8 @@ class FTWorkflowHelper:
                 augmented_data_dir,
                 data_format=aug_data_format,
                 data_path_template=aug_data_path_template,
+                train_data_path=step2_train_data_path,
+                test_data_path=step2_test_data_path,
                 overrides=resn_overrides,
             )
             self.step2_configs['resn'] = resn_config
@@ -550,6 +677,8 @@ class FTWorkflowHelper:
         data_dir: str,
         data_format: str,
         data_path_template: str,
+        train_data_path: Optional[str] = None,
+        test_data_path: Optional[str] = None,
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build XGB config for Step 2."""
@@ -559,13 +688,15 @@ class FTWorkflowHelper:
             data_dir=data_dir,
             data_format=data_format,
             data_path_template=data_path_template,
+            train_data_path=train_data_path,
+            test_data_path=test_data_path,
             model_key="xgb",
-            output_dir="./ResultsXGBFromFTUnsupervised",
-            study_prefix="pricing_ft_unsup_xgb",
+            output_dir="./ResultsXGBFromFTEmbed",
+            study_prefix="pricing_ft_embed_xgb",
             runner_nproc=1,
             use_resn_ddp=False,
             build_oht=False,
-            final_refit=False,
+            final_refit=None,
             overrides=overrides,
         )
 
@@ -576,6 +707,8 @@ class FTWorkflowHelper:
         data_dir: str,
         data_format: str,
         data_path_template: str,
+        train_data_path: Optional[str] = None,
+        test_data_path: Optional[str] = None,
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build ResNet config for Step 2."""
@@ -585,12 +718,14 @@ class FTWorkflowHelper:
             data_dir=data_dir,
             data_format=data_format,
             data_path_template=data_path_template,
+            train_data_path=train_data_path,
+            test_data_path=test_data_path,
             model_key="resn",
-            output_dir="./ResultsResNFromFTUnsupervised",
-            study_prefix="pricing_ft_unsup_resn_ddp",
-            runner_nproc=2,
-            use_resn_ddp=True,
-            build_oht=True,
+            output_dir="./ResultsResNFromFTEmbed",
+            study_prefix="pricing_ft_embed_resn",
+            runner_nproc=1,
+            use_resn_ddp=False,
+            build_oht=False,
             final_refit=None,
             overrides=overrides,
         )
@@ -603,6 +738,8 @@ class FTWorkflowHelper:
         data_dir: str,
         data_format: str,
         data_path_template: str,
+        train_data_path: Optional[str],
+        test_data_path: Optional[str],
         model_key: str,
         output_dir: str,
         study_prefix: str,
@@ -620,11 +757,19 @@ class FTWorkflowHelper:
         cfg["data_dir"] = str(data_dir)
         cfg["data_format"] = str(data_format)
         cfg["data_path_template"] = str(data_path_template)
+        if train_data_path and test_data_path:
+            cfg["train_data_path"] = str(train_data_path)
+            cfg["test_data_path"] = str(test_data_path)
+            cfg["split_cache_path"] = None
+            cfg["split_cache_force_rebuild"] = False
         cfg["feature_list"] = feature_list
         cfg["categorical_features"] = categorical_features
         cfg["ft_role"] = "model"
         cfg["stack_model_keys"] = [model_key]
-        cfg["cache_predictions"] = False
+        cfg["cache_predictions"] = bool(base_cfg.get("cache_predictions", True))
+        cfg["prediction_cache_format"] = str(
+            base_cfg.get("prediction_cache_format", "csv")
+        )
 
         cfg["use_resn_ddp"] = bool(use_resn_ddp)
         cfg["use_ft_ddp"] = False
@@ -639,6 +784,9 @@ class FTWorkflowHelper:
             cfg["build_oht"] = bool(build_oht)
         if final_refit is not None:
             cfg["final_refit"] = bool(final_refit)
+        if model_key == "resn":
+            cfg["resn_use_lazy_dataset"] = bool(cfg.get("resn_use_lazy_dataset", True))
+            cfg["dataloader_workers"] = int(cfg.get("dataloader_workers", 0))
 
         runner_cfg = dict(cfg.get("runner", {}) or {})
         runner_cfg["model_keys"] = [model_key]
@@ -790,22 +938,40 @@ class FTWorkflowHelper:
 
         saved_files = {}
 
+        def _write_config(path: Path, payload: Dict[str, Any]) -> None:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2)
+
         if self.step1_config:
-            step1_path = output_path / "config_ft_step1_unsupervised.json"
-            with open(step1_path, 'w', encoding='utf-8') as f:
-                json.dump(self.step1_config, f, indent=2)
+            step1_path = output_path / "config_ft_step1_embed.json"
+            _write_config(step1_path, self.step1_config)
             saved_files['ft_step1'] = str(step1_path)
+            step1_legacy_path = output_path / "config_ft_step1_unsupervised.json"
+            _write_config(step1_legacy_path, self.step1_config)
+            saved_files['ft_step1_legacy'] = str(step1_legacy_path)
 
         if 'xgb' in self.step2_configs:
-            xgb_path = output_path / "config_xgb_from_ft_step2.json"
-            with open(xgb_path, 'w', encoding='utf-8') as f:
-                json.dump(self.step2_configs['xgb'], f, indent=2)
+            xgb_payload = self.step2_configs['xgb']
+            xgb_path = output_path / "config_xgb_from_ft_embed.json"
+            _write_config(xgb_path, xgb_payload)
             saved_files['xgb_step2'] = str(xgb_path)
+            xgb_legacy_unsup = output_path / "config_xgb_from_ft_unsupervised.json"
+            _write_config(xgb_legacy_unsup, xgb_payload)
+            xgb_legacy_step2 = output_path / "config_xgb_from_ft_step2.json"
+            _write_config(xgb_legacy_step2, xgb_payload)
+            saved_files['xgb_step2_legacy_unsupervised'] = str(xgb_legacy_unsup)
+            saved_files['xgb_step2_legacy_step2'] = str(xgb_legacy_step2)
 
         if 'resn' in self.step2_configs:
-            resn_path = output_path / "config_resn_from_ft_step2.json"
-            with open(resn_path, 'w', encoding='utf-8') as f:
-                json.dump(self.step2_configs['resn'], f, indent=2)
+            resn_payload = self.step2_configs['resn']
+            resn_path = output_path / "config_resn_from_ft_embed.json"
+            _write_config(resn_path, resn_payload)
             saved_files['resn_step2'] = str(resn_path)
+            resn_legacy_unsup = output_path / "config_resn_from_ft_unsupervised.json"
+            _write_config(resn_legacy_unsup, resn_payload)
+            resn_legacy_step2 = output_path / "config_resn_from_ft_step2.json"
+            _write_config(resn_legacy_step2, resn_payload)
+            saved_files['resn_step2_legacy_unsupervised'] = str(resn_legacy_unsup)
+            saved_files['resn_step2_legacy_step2'] = str(resn_legacy_step2)
 
         return saved_files

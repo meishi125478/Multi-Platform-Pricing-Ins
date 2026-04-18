@@ -191,15 +191,6 @@ class ModelRegistry:
         *,
         version: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not isinstance(updates, dict):
-            raise GovernanceError("updates must be a dictionary.")
-        immutable_fields = {"model_name", "name", "version", "created_at"}
-        conflict_fields = immutable_fields.intersection(updates.keys())
-        if conflict_fields:
-            raise GovernanceError(
-                "Registry update cannot modify immutable fields: "
-                + ", ".join(sorted(conflict_fields))
-            )
         with self._io_lock:
             payload = self._load_unlocked()
             if name not in payload or not payload[name]:

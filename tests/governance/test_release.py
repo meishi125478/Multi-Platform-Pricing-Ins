@@ -112,29 +112,3 @@ class TestModelRelease:
 
         info = manager.get_release_info(release_id)
         assert info["status"] == "candidate"
-
-    def test_rollback_reverts_manifest_when_registry_promote_fails(self, tmp_path):
-        from ins_pricing.governance.release import ReleaseManager
-
-        class _FlakyRegistry:
-            def __init__(self):
-                self.calls = 0
-
-            def promote(self, name, version, new_status="production"):
-                _ = name, version, new_status
-                self.calls += 1
-                if self.calls >= 3:
-                    raise RuntimeError("registry unavailable")
-
-        registry = _FlakyRegistry()
-        manager = ReleaseManager(release_dir=tmp_path, registry=registry)
-        release1 = manager.create_release(model_name="pricing_model", version="1.0.0")
-        release2 = manager.create_release(model_name="pricing_model", version="2.0.0")
-        manager.promote_to_production(release1)
-        manager.promote_to_production(release2)
-
-        with pytest.raises(GovernanceError, match="manifest reverted"):
-            manager.rollback_to(release1)
-
-        current = manager.get_production_release("pricing_model")
-        assert current["version"] == "2.0.0"

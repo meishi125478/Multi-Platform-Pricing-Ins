@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from ins_pricing.frontend.workflows_prediction_utils import (
@@ -9,6 +10,7 @@ from ins_pricing.frontend.workflows_prediction_utils import (
     load_raw_splits,
     resolve_model_output_override,
 )
+from ins_pricing.split_cache import write_split_cache
 
 
 def test_load_raw_splits_with_explicit_files(tmp_path: Path) -> None:
@@ -80,3 +82,60 @@ def test_resolve_model_output_override_with_explicit_file(tmp_path: Path) -> Non
     )
 
     assert resolved == (tmp_path / "results").resolve()
+
+
+def test_load_raw_splits_can_reuse_cache_when_data_path_validation_disabled(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "config_plot.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+
+    data_new_dir = tmp_path / "DataFTEmbed"
+    data_new_dir.mkdir(parents=True, exist_ok=True)
+    data_new_path = data_new_dir / "demo.csv"
+    pd.DataFrame({"x": [10, 20, 30, 40]}).to_csv(data_new_path, index=False)
+
+    data_old_dir = tmp_path / "Data"
+    data_old_dir.mkdir(parents=True, exist_ok=True)
+    data_old_path = data_old_dir / "demo.csv"
+    pd.DataFrame({"x": [1, 2, 3, 4]}).to_csv(data_old_path, index=False)
+
+    cache_dir = tmp_path / "splits"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "demo_holdout_split.npz"
+    write_split_cache(
+        cache_path,
+        train_idx=np.asarray([0, 2], dtype=np.int64),
+        test_idx=np.asarray([1, 3], dtype=np.int64),
+        row_count=4,
+        meta={
+            "split_strategy": "random",
+            "holdout_ratio": 0.25,
+            "rand_seed": 13,
+            "data_path": str(data_old_path),
+        },
+    )
+
+    train_raw, test_raw, raw, use_explicit = load_raw_splits(
+        split_cfg={
+            "split_strategy": "random",
+            "holdout_ratio": 0.25,
+            "rand_seed": 13,
+            "split_cache_path": "./splits/{model_name}_holdout_split.npz",
+            "split_cache_validate_data_path": False,
+        },
+        data_cfg={
+            "data_dir": "./DataFTEmbed",
+            "data_format": "csv",
+            "data_path_template": "{model_name}.{ext}",
+        },
+        data_cfg_path=cfg_path,
+        model_name="demo",
+        train_data_path=None,
+        test_data_path=None,
+    )
+
+    assert use_explicit is False
+    assert raw is not None and len(raw) == 4
+    assert train_raw.index.tolist() == [0, 2]
+    assert test_raw.index.tolist() == [1, 3]

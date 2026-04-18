@@ -901,8 +901,12 @@ class AppControllerConfigMixin:
             cfg_path = workflow_cfg.get("cfg_path", workflow_cfg.get("plot_cfg_path"))
             return workflows_module.run_plot_direct(
                 cfg_path=self._resolve_path_value(base_dir, cfg_path, "cfg_path"),
-                xgb_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("xgb_cfg_path"), "xgb_cfg_path"),
-                resn_cfg_path=self._resolve_path_value(base_dir, workflow_cfg.get("resn_cfg_path"), "resn_cfg_path"),
+                xgb_cfg_path=self._resolve_path_value(
+                    base_dir, workflow_cfg.get("xgb_cfg_path"), "xgb_cfg_path", required=False
+                ),
+                resn_cfg_path=self._resolve_path_value(
+                    base_dir, workflow_cfg.get("resn_cfg_path"), "resn_cfg_path", required=False
+                ),
                 model_search_dir=str(self.working_dir),
             )
 

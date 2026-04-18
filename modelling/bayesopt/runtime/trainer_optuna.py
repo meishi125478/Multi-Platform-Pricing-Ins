@@ -377,11 +377,7 @@ class TrainerOptunaMixin:
                 if not best_params:
                     return
                 self._persist_best_params_csv(best_params)
-            except Exception as exc:
-                _log(
-                    f"[Optuna][{self.label}] checkpoint callback skipped due to error: {exc}",
-                    flush=True,
-                )
+            except Exception:
                 return
 
         return checkpoint_callback

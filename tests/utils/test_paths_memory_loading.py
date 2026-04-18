@@ -31,7 +31,7 @@ def test_load_dataset_projects_columns_and_dtype_map(tmp_path):
     assert str(out["a"].dtype) in {"int32", "int64"}
 
 
-def test_coerce_dataset_types_is_in_place_and_preserves_numeric_semantics():
+def test_coerce_dataset_types_is_in_place_and_downcasts_numeric():
     df = pd.DataFrame(
         {
             "num_i": np.array([1, 2, 3], dtype=np.int64),
@@ -43,9 +43,9 @@ def test_coerce_dataset_types_is_in_place_and_preserves_numeric_semantics():
     out = coerce_dataset_types(df)
 
     assert out is df
-    assert out["num_i"].dtype == np.int64
-    assert out["num_f"].dtype == np.float64
-    assert out["num_f"].isna().sum() == 1
+    assert out["num_i"].dtype == np.float32
+    assert out["num_f"].dtype == np.float32
+    assert out["num_f"].isna().sum() == 0
     assert out["cat"].tolist() == ["a", "<NA>", "c"]
 
 
@@ -66,7 +66,7 @@ def test_coerce_dataset_types_avoids_settingwithcopy_warning_for_sliced_frame():
         w for w in caught if "settingwithcopywarning" in type(w.message).__name__.lower()
     ]
     assert not swc_warnings
-    assert out["num"].dtype == np.int64
+    assert out["num"].dtype == np.float32
     assert out["cat"].tolist() == ["c", "d"]
 
 

@@ -33,11 +33,6 @@ def _supports_weights_only() -> bool:
     return bool(_SUPPORTS_WEIGHTS_ONLY)
 
 
-def supports_weights_only() -> bool:
-    """Public helper for checking whether torch.load supports weights_only."""
-    return _supports_weights_only()
-
-
 def torch_load(
     path: Any,
     *args: Any,
@@ -51,14 +46,7 @@ def torch_load(
     """
     if not TORCH_AVAILABLE:
         raise RuntimeError("torch is required to load model files.")
-    if weights_only is not None:
-        if not _supports_weights_only():
-            if bool(weights_only):
-                raise RuntimeError(
-                    "Installed torch does not support weights_only=True; secure torch load requires torch>=2.0."
-                )
-            # Compatibility path for trusted internal payload loading on older torch.
-            return torch.load(path, *args, **kwargs)
+    if weights_only is not None and _supports_weights_only():
         return torch.load(path, *args, weights_only=weights_only, **kwargs)
     return torch.load(path, *args, **kwargs)
 

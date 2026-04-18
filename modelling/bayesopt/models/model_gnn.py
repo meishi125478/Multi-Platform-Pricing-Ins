@@ -60,15 +60,6 @@ def _log(*args, **kwargs) -> None:
     log_print(_logger, *args, **kwargs)
 
 
-def _use_distributed_collectives(*, ddp_enabled: bool) -> bool:
-    """Guard collective ops so torchrun non-DDP ranks never hang."""
-    if not bool(ddp_enabled):
-        return False
-    if not getattr(dist, "is_available", lambda: False)():
-        return False
-    return bool(dist.is_initialized())
-
-
 # =============================================================================
 # Simplified GNN implementation.
 # =============================================================================
@@ -887,7 +878,7 @@ class GraphNeuralNetSklearn(TorchTrainerMixin, nn.Module):
                     if trial.should_prune():
                         prune_now = True
 
-                if _use_distributed_collectives(ddp_enabled=self.ddp_enabled):
+                if dist.is_initialized():
                     flag = torch.tensor(
                         [1 if prune_now else 0],
                         device=self.device,

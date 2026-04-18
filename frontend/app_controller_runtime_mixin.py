@@ -420,12 +420,16 @@ class AppControllerRuntimeMixin:
                 xgb_cfg_path.write_text(self._dump_json(xgb_cfg), encoding="utf-8")
                 legacy_xgb_path = save_dir / "config_xgb_from_ft_unsupervised.json"
                 legacy_xgb_path.write_text(self._dump_json(xgb_cfg), encoding="utf-8")
+                legacy_xgb_step2_path = save_dir / "config_xgb_from_ft_step2.json"
+                legacy_xgb_step2_path.write_text(self._dump_json(xgb_cfg), encoding="utf-8")
                 saved_paths["xgb"] = str(xgb_cfg_path)
             if resn_cfg is not None:
                 resn_cfg_path = save_dir / "config_resn_from_ft_embed.json"
                 resn_cfg_path.write_text(self._dump_json(resn_cfg), encoding="utf-8")
                 legacy_resn_path = save_dir / "config_resn_from_ft_unsupervised.json"
                 legacy_resn_path.write_text(self._dump_json(resn_cfg), encoding="utf-8")
+                legacy_resn_step2_path = save_dir / "config_resn_from_ft_step2.json"
+                legacy_resn_step2_path.write_text(self._dump_json(resn_cfg), encoding="utf-8")
                 saved_paths["resn"] = str(resn_cfg_path)
 
             self.current_step2_config_paths = saved_paths
@@ -655,24 +659,6 @@ class AppControllerRuntimeMixin:
             out_dir = (Path.cwd() / "Results" / "plot" / model_name / "oneway" / "pre").resolve()
         return self._collect_png_paths([out_dir], min_mtime=started_at - 1.0)
 
-    def list_pre_oneway_images_ui(
-        self,
-        *,
-        data_path: str,
-        train_data_path: str,
-        test_data_path: str,
-        model_name: str,
-        output_dir: str,
-    ) -> list[str]:
-        return self._collect_pre_oneway_images(
-            data_path=data_path,
-            train_data_path=train_data_path,
-            test_data_path=test_data_path,
-            model_name=model_name,
-            output_dir=output_dir,
-            started_at=0.0,
-        )
-
     def _collect_compare_images(
         self,
         *,
@@ -694,16 +680,6 @@ class AppControllerRuntimeMixin:
             )
 
         return self._collect_png_paths(candidates, min_mtime=started_at - 1.0)
-
-    def list_compare_images_ui(
-        self,
-        *,
-        direct_cfg_path: str,
-    ) -> list[str]:
-        return self._collect_compare_images(
-            direct_cfg_path=direct_cfg_path,
-            started_at=0.0,
-        )
 
     def _collect_double_lift_images(
         self,
@@ -746,36 +722,6 @@ class AppControllerRuntimeMixin:
                 (Path.cwd() / "Results" / "plot").resolve(),
             ]
         return self._collect_png_paths(candidates, min_mtime=started_at - 1.0)
-
-    def list_double_lift_images_ui(
-        self,
-        *,
-        data_path: str,
-        train_data_path: str,
-        test_data_path: str,
-        output_path: str,
-    ) -> list[str]:
-        return self._collect_double_lift_images(
-            data_path=data_path,
-            train_data_path=train_data_path,
-            test_data_path=test_data_path,
-            output_path=output_path,
-            started_at=0.0,
-        )
-
-    def list_prediction_plot_images_ui(
-        self,
-        *,
-        cfg_path: str,
-        xgb_cfg_path: str,
-        resn_cfg_path: str,
-    ) -> list[str]:
-        return self._collect_prediction_plot_images(
-            cfg_path=cfg_path,
-            xgb_cfg_path=xgb_cfg_path,
-            resn_cfg_path=resn_cfg_path,
-            started_at=0.0,
-        )
 
     def run_pre_oneway_ui(
         self,

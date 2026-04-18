@@ -267,6 +267,7 @@ def _resolve_required_columns(
     cv_time_col: Optional[str],
     report_group_cols: Optional[List[str]],
     report_time_col: Optional[str],
+    split_cache_key_col: Optional[str] = None,
 ) -> List[str]:
     cols: List[str] = []
     feature_list = cfg.get("feature_list") or []
@@ -284,6 +285,7 @@ def _resolve_required_columns(
         cv_group_col,
         cv_time_col,
         report_time_col,
+        split_cache_key_col,
     ]:
         if isinstance(col, str):
             cols.append(col)
@@ -644,6 +646,12 @@ def _resolve_model_override_fields(
     args: Any,
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
+    feature_list = list(cfg.get("feature_list") or [])
+    split_cache_key_col = str(cfg.get("split_cache_key_col", "") or "").strip()
+    if split_cache_key_col and split_cache_key_col in feature_list:
+        raise ValueError(
+            f"split_cache_key_col={split_cache_key_col!r} must not be included in feature_list."
+        )
     ft_role = args.ft_role or cfg.get("ft_role", "model")
     if args.ft_as_feature and args.ft_role is None:
         if str(cfg.get("ft_role", "model")) == "model":
@@ -651,7 +659,7 @@ def _resolve_model_override_fields(
     return {
         "binary_target": cfg.get("binary_target") or cfg.get("binary_resp_nme"),
         "task_type": str(cfg.get("task_type", "regression")),
-        "feature_list": cfg.get("feature_list"),
+        "feature_list": feature_list,
         "categorical_features": cfg.get("categorical_features"),
         "region_province_col": cfg.get("region_province_col"),
         "region_city_col": cfg.get("region_city_col"),
@@ -986,6 +994,7 @@ def run_bayesopt_entry_training(
             cv_time_col=cv_time_col,
             report_group_cols=report_group_cols,
             report_time_col=report_time_col,
+            split_cache_key_col=str(cfg.get("split_cache_key_col", "") or "").strip() or None,
         )
         if required_columns:
             print(

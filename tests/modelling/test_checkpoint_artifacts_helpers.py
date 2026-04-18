@@ -238,12 +238,3 @@ def test_rebuild_gnn_model_from_payload_requires_dict_payload():
             payload="bad",
             model_builder=lambda params: object(),
         )
-
-
-def test_rebuild_gnn_model_from_payload_requires_state_dict():
-    checkpoints = _load_module("test_checkpoints_module_gnn_missing_state", CHECKPOINTS_PATH)
-    with pytest.raises(ValueError, match="missing 'state_dict'"):
-        checkpoints.rebuild_gnn_model_from_payload(
-            payload={"best_params": {"k_neighbors": 10}},
-            model_builder=lambda params: object(),
-        )

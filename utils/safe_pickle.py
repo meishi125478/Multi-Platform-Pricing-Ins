@@ -39,12 +39,6 @@ _SAFE_EXACT_GLOBALS: Dict[str, Set[str]] = {
     "pandas.core.internals.managers": {"BlockManager", "SingleBlockManager"},
     "sklearn.preprocessing._data": {"StandardScaler"},
     "sklearn.preprocessing._encoders": {"OneHotEncoder"},
-    "sklearn.preprocessing._label": {"LabelEncoder"},
-    "sklearn.impute._base": {"SimpleImputer"},
-    "sklearn.pipeline": {"Pipeline"},
-    "sklearn.compose._column_transformer": {"ColumnTransformer"},
-    "xgboost.core": {"Booster"},
-    "xgboost.sklearn": {"XGBRegressor", "XGBClassifier"},
     # Legacy XGBoost payloads may include the sklearn-style wrapper object.
     "ins_pricing.modelling.bayesopt.trainers.trainer_xgb": {"_XGBDMatrixWrapper"},
 }
@@ -52,8 +46,8 @@ _SAFE_EXACT_GLOBALS: Dict[str, Set[str]] = {
 _SAFE_PREFIXES: Tuple[str, ...] = (
     "numpy.",
     "pandas.",
-    "sklearn.preprocessing.",
-    "scipy.",
+    "sklearn.",
+    "xgboost.",
     "joblib.numpy_pickle.",
     "joblib._memmapping_reducer.",
     "scipy.sparse.",

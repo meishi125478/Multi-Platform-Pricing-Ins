@@ -141,7 +141,6 @@ def _discover_model_file(
     filename = _model_artifact_filename(model_name, model_key)
     output_candidates: List[Path] = []
     search_candidates: List[Path] = []
-    recursive_candidates: List[Path] = []
     seen: set[str] = set()
 
     def _add_candidate(path_obj: Path, *, from_output_root: bool = False) -> None:
@@ -160,27 +159,12 @@ def _discover_model_file(
         else:
             search_candidates.append(resolved)
 
-    def _latest(paths: Sequence[Path]) -> Optional[Path]:
-        if not paths:
-            return None
-        def _mtime_key(path_obj: Path) -> float:
-            try:
-                return float(path_obj.stat().st_mtime)
-            except OSError:
-                return 0.0
-        ordered = sorted(paths, key=_mtime_key, reverse=True)
-        return ordered[0]
-
     for output_root in output_roots or []:
         try:
             root_obj = Path(output_root).resolve()
         except OSError:
             continue
         _add_candidate(root_obj / "model" / filename, from_output_root=True)
-
-    best_output = _latest(output_candidates)
-    if best_output is not None:
-        return best_output
 
     for root in search_roots:
         try:
@@ -195,69 +179,47 @@ def _discover_model_file(
             continue
         _add_candidate(root_obj / filename, from_output_root=False)
         _add_candidate(root_obj / "model" / filename, from_output_root=False)
-
-    best_search = _latest(search_candidates)
-    if best_search is not None:
-        return best_search
-
-    # Recursive lookup is expensive; only run when direct candidates miss.
-    for root in search_roots:
-        try:
-            root_obj = Path(root).resolve()
-        except OSError:
-            continue
-        if not root_obj.exists() or root_obj.is_file():
-            continue
         try:
             for match in root_obj.glob(f"**/model/{filename}"):
-                try:
-                    resolved = match.resolve()
-                except OSError:
-                    continue
-                key = str(resolved)
-                if key in seen or not resolved.exists() or not resolved.is_file():
-                    continue
-                seen.add(key)
-                recursive_candidates.append(resolved)
+                _add_candidate(match, from_output_root=False)
         except OSError:
-            continue
-
-    if not recursive_candidates:
+            pass
         try:
-            for root in search_roots:
-                root_obj = Path(root).resolve()
-                if not root_obj.exists() or root_obj.is_file():
-                    continue
-                for match in root_obj.glob(f"**/{filename}"):
-                    try:
-                        resolved = match.resolve()
-                    except OSError:
-                        continue
-                    key = str(resolved)
-                    if key in seen or not resolved.exists() or not resolved.is_file():
-                        continue
-                    seen.add(key)
-                    recursive_candidates.append(resolved)
+            for match in root_obj.glob(f"**/{filename}"):
+                _add_candidate(match, from_output_root=False)
         except OSError:
             pass
 
-    best_recursive = _latest(recursive_candidates)
-    if best_recursive is not None:
-        return best_recursive
-    return None
+    def _mtime_key(path_obj: Path) -> float:
+        try:
+            return float(path_obj.stat().st_mtime)
+        except OSError:
+            return 0.0
+
+    # Prefer model artifacts directly under configured output roots.
+    if output_candidates:
+        output_candidates.sort(key=_mtime_key, reverse=True)
+        return output_candidates[0]
+
+    if not search_candidates:
+        return None
+    search_candidates.sort(key=_mtime_key, reverse=True)
+    return search_candidates[0]
 
 
 def _load_ft_embedding_model(model_path: Path) -> Any:
     """Load FT checkpoint for embedding inference using secure defaults."""
-    from ins_pricing.utils.model_loading import load_model_artifact_payload
-    from ins_pricing.utils.model_rebuild import rebuild_ft_payload
-
-    payload = load_model_artifact_payload(
-        model_path,
-        model_key="ft",
-        map_location="cpu",
+    from ins_pricing.modelling.bayesopt.checkpoints import (
+        rebuild_ft_model_from_payload,
     )
-    model, _best_params, kind = rebuild_ft_payload(payload=payload)
+    from ins_pricing.utils.model_loading import load_torch_payload
+
+    payload = load_torch_payload(
+        model_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    model, _best_params, kind = rebuild_ft_model_from_payload(payload=payload)
     if kind == "raw":
         raise ValueError(
             f"Unsupported FT checkpoint format for secure loading: {model_path}"
@@ -266,9 +228,9 @@ def _load_ft_embedding_model(model_path: Path) -> Any:
 
 
 def _load_pickled_model_payload(model_path: Path) -> Any:
-    from ins_pricing.utils.model_loading import load_model_artifact_payload
+    from ins_pricing.utils.model_loading import load_pickle_artifact
 
-    return load_model_artifact_payload(model_path, model_key="xgb")
+    return load_pickle_artifact(model_path)
 
 
 def _infer_categorical_features(

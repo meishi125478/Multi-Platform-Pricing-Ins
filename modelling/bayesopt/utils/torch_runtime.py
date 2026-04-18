@@ -116,17 +116,12 @@ def wrap_model_for_parallel(
     """Wrap model with DDP or DataParallel based on resolved runtime flags."""
     if is_ddp_enabled:
         core = core.to(device)
-        ddp_kwargs = {
-            "find_unused_parameters": bool(ddp_find_unused_parameters),
-        }
-        if device.type == "cuda":
-            ddp_kwargs.update(
-                {
-                    "device_ids": [int(local_rank)],
-                    "output_device": int(local_rank),
-                }
-            )
-        core = DDP(core, **ddp_kwargs)
+        core = DDP(
+            core,
+            device_ids=[int(local_rank)],
+            output_device=int(local_rank),
+            find_unused_parameters=bool(ddp_find_unused_parameters),
+        )
         return core, False, device
 
     should_use_dp = (

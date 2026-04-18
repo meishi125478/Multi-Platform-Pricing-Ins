@@ -215,16 +215,12 @@ def rebuild_gnn_model_from_payload(
     params_raw = payload.get("best_params")
     params = dict(params_raw) if isinstance(params_raw, dict) else {}
     state_dict = payload.get("state_dict")
-    if state_dict is None:
-        raise ValueError("Invalid GNN checkpoint payload: missing 'state_dict'.")
 
     model = model_builder(params)
     if params and hasattr(model, "set_params"):
         model.set_params(dict(params))
 
     base_gnn = getattr(model, "_unwrap_gnn", lambda: None)()
-    if base_gnn is None:
-        raise ValueError("Invalid GNN model builder output: missing unwrap-able GNN module.")
     warning = _load_state_dict_with_policy(
         base_gnn,
         state_dict,
