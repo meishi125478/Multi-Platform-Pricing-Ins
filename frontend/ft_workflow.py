@@ -297,6 +297,128 @@ class FTWorkflowHelper:
         raise ValueError(f"Unsupported write data format: {data_format!r}")
 
     @staticmethod
+    def _rewrite_csv_with_sequential_key(
+        path: Path,
+        *,
+        key_col: str,
+        chunksize: int = 200_000,
+    ) -> int:
+        """Rewrite CSV by injecting a sequential integer key column.
+
+        This avoids loading the full table into memory for large datasets.
+        """
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        row_cursor = 0
+        wrote_any = False
+        for chunk in pd.read_csv(path, low_memory=False, chunksize=max(1, int(chunksize))):
+            if key_col in chunk.columns:
+                chunk = chunk.drop(columns=[key_col])
+            n = int(len(chunk))
+            key_values = np.arange(row_cursor, row_cursor + n, dtype=np.int64)
+            chunk.insert(0, key_col, key_values)
+            chunk.to_csv(
+                temp_path,
+                mode="w" if not wrote_any else "a",
+                index=False,
+                header=not wrote_any,
+            )
+            wrote_any = True
+            row_cursor += n
+
+        if not wrote_any:
+            # Keep schema minimal for empty datasets.
+            pd.DataFrame(columns=[key_col]).to_csv(temp_path, index=False)
+        temp_path.replace(path)
+        return row_cursor
+
+    def _ensure_unique_split_key_in_data_file(
+        self,
+        *,
+        data_path: Path,
+        split_key_col: str,
+    ) -> int:
+        suffix = data_path.suffix.lower()
+        if suffix == ".csv":
+            return self._rewrite_csv_with_sequential_key(
+                data_path,
+                key_col=split_key_col,
+            )
+
+        raw = self._load_table(data_path, data_format="auto")
+        if split_key_col in raw.columns:
+            raw = raw.drop(columns=[split_key_col])
+        raw.insert(0, split_key_col, np.arange(len(raw), dtype=np.int64))
+        write_format = self._normalize_table_format(
+            data_path.suffix.lstrip("."),
+            context="data_format",
+            allow_auto=True,
+        )
+        if write_format == "auto":
+            # Should not happen for a concrete file path, but keep a safe fallback.
+            write_format = "parquet"
+        self._write_table(raw, data_path, data_format=write_format)
+        return int(len(raw))
+
+    def ensure_unique_split_key_for_step1(
+        self,
+        *,
+        step1_config_path: str,
+        split_key_col: str = "_row_uid",
+    ) -> Dict[str, Any]:
+        """Ensure Step-1 data has a unique split key and write config back.
+
+        The method rewrites the Step-1 data file to inject a deterministic
+        sequential key column and updates the config to use this key for split
+        cache remapping and prediction-cache alignment.
+        """
+        cfg_path = Path(step1_config_path).resolve()
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        model_name = f"{cfg['model_list'][0]}_{cfg['model_categories'][0]}"
+
+        split_key_col = str(split_key_col or "_row_uid").strip() or "_row_uid"
+        data_dir = (cfg_path.parent / cfg["data_dir"]).resolve()
+        raw_data_format = self._normalize_table_format(
+            cfg.get("data_format", "csv"),
+            context="data_format",
+            allow_auto=True,
+        )
+        raw_data_template = cfg.get("data_path_template")
+        raw_path = self._resolve_input_data_path(
+            data_dir=data_dir,
+            model_name=model_name,
+            data_format=raw_data_format,
+            data_path_template=raw_data_template,
+            label="Data",
+        )
+
+        row_count = self._ensure_unique_split_key_in_data_file(
+            data_path=raw_path,
+            split_key_col=split_key_col,
+        )
+
+        cfg_changed = False
+        if str(cfg.get("split_cache_key_col") or "").strip() != split_key_col:
+            cfg["split_cache_key_col"] = split_key_col
+            cfg_changed = True
+
+        for list_key in ("feature_list", "categorical_features"):
+            values = cfg.get(list_key)
+            if isinstance(values, list) and split_key_col in values:
+                cfg[list_key] = [col for col in values if col != split_key_col]
+                cfg_changed = True
+
+        if cfg_changed:
+            cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+        return {
+            "config_path": str(cfg_path),
+            "data_path": str(raw_path),
+            "split_key_col": split_key_col,
+            "row_count": int(row_count),
+            "config_updated": bool(cfg_changed),
+        }
+
+    @staticmethod
     def _resolve_input_data_path(
         *,
         data_dir: Path,

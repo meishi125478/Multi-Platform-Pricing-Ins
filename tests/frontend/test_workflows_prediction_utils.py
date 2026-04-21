@@ -4,7 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
+import ins_pricing.frontend.workflows_prediction_utils as workflows_prediction_utils
 from ins_pricing.frontend.workflows_prediction_utils import (
     build_ft_embedding_frames,
     load_raw_splits,
@@ -63,6 +65,58 @@ def test_build_ft_embedding_frames_precomputed_alignment(tmp_path: Path) -> None
 
     assert train_df["pred_ft_emb_0"].tolist() == [0.1, 0.3]
     assert test_df["pred_ft_emb_0"].tolist() == [0.2, 0.4]
+
+
+def test_build_ft_embedding_frames_precomputed_csv_chunk_alignment_preserves_split_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text("{}", encoding="utf-8")
+    embed_dir = tmp_path / "embed"
+    embed_dir.mkdir(parents=True, exist_ok=True)
+
+    embed_df = pd.DataFrame(
+        {
+            "_row_id": [100, 101, 102, 103, 104, 105],
+            "pred_ft_emb_0": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        }
+    )
+    embed_df.to_csv(embed_dir / "demo.csv", index=False)
+
+    raw = pd.DataFrame(
+        {
+            "_row_id": [100, 101, 102, 103, 104, 105],
+            "f1": [10, 20, 30, 40, 50, 60],
+        }
+    )
+    train_raw = raw.iloc[[5, 1, 3]].copy()
+    test_raw = raw.iloc[[4, 2, 0]].copy()
+
+    def _should_not_read_full_frame(*args, **kwargs):
+        raise AssertionError("_read_frame should not be used for single-file CSV embedding alignment.")
+
+    monkeypatch.setattr(workflows_prediction_utils, "_read_frame", _should_not_read_full_frame)
+
+    train_df, test_df = build_ft_embedding_frames(
+        use_runtime_ft_embedding=False,
+        train_raw=train_raw,
+        test_raw=test_raw,
+        raw=raw,
+        use_explicit_split=False,
+        model_name="demo",
+        ft_cfg={"output_dir": "./results", "ft_feature_prefix": "ft_emb"},
+        ft_cfg_path=cfg_path,
+        search_roots=[tmp_path],
+        ft_model_path=None,
+        embed_cfg={"data_dir": "./embed", "data_format": "csv"},
+        embed_cfg_path=cfg_path,
+    )
+
+    assert train_df["_row_id"].tolist() == [105, 101, 103]
+    assert train_df["pred_ft_emb_0"].tolist() == [0.6, 0.2, 0.4]
+    assert test_df["_row_id"].tolist() == [104, 102, 100]
+    assert test_df["pred_ft_emb_0"].tolist() == [0.5, 0.3, 0.1]
 
 
 def test_resolve_model_output_override_with_explicit_file(tmp_path: Path) -> None:

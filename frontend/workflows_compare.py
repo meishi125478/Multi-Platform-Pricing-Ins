@@ -57,6 +57,196 @@ def _split_train_test(*args, **kwargs):
     return split_train_test(*args, **kwargs)
 
 
+def _read_table(path_obj: Path) -> pd.DataFrame:
+    suffix = path_obj.suffix.lower()
+    if suffix in {".csv"}:
+        return pd.read_csv(path_obj, low_memory=False)
+    if suffix in {".parquet", ".pq"}:
+        return pd.read_parquet(path_obj)
+    if suffix in {".feather", ".ft"}:
+        return pd.read_feather(path_obj)
+    raise ValueError(f"Unsupported prediction cache format: {path_obj}")
+
+
+def _resolve_prediction_cache_paths(
+    *,
+    cfg: dict,
+    cfg_path: Path,
+    model_name: str,
+    model_key: str,
+) -> tuple[Optional[Path], Optional[Path]]:
+    if not bool(cfg.get("cache_predictions", False)):
+        return None, None
+
+    output_root = Path(_resolve_output_dir(cfg, cfg_path)).resolve()
+    result_root = output_root / "Results"
+    pred_cache_dir = cfg.get("prediction_cache_dir")
+    if pred_cache_dir:
+        pred_dir = Path(str(pred_cache_dir))
+        if not pred_dir.is_absolute():
+            pred_dir = result_root / pred_dir
+    else:
+        pred_dir = result_root / "predictions"
+    pred_dir = pred_dir.resolve()
+    if not pred_dir.exists():
+        return None, None
+
+    fmt = str(cfg.get("prediction_cache_format", "parquet") or "parquet").strip().lower()
+    preferred_ext = "csv" if fmt == "csv" else "parquet"
+    ext_order = [preferred_ext, "csv", "parquet"]
+    seen_ext = set()
+    ordered_ext = []
+    for ext in ext_order:
+        if ext in seen_ext:
+            continue
+        seen_ext.add(ext)
+        ordered_ext.append(ext)
+
+    def _pick(split_label: str) -> Optional[Path]:
+        for ext in ordered_ext:
+            candidate = pred_dir / f"{model_name}_{model_key}_{split_label}.{ext}"
+            if candidate.exists():
+                return candidate.resolve()
+        return None
+
+    return _pick("train"), _pick("test")
+
+
+def _resolve_prediction_column(frame: pd.DataFrame, *, model_key: str, cache_path: Path) -> str:
+    exact = f"pred_{model_key}"
+    if exact in frame.columns:
+        return exact
+    prefix = f"pred_{model_key}_"
+    matches = [str(col) for col in frame.columns if str(col).startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            "Prediction cache contains multi-column outputs; compare workflow expects "
+            f"a single prediction column. path={cache_path}, columns={matches[:6]}"
+        )
+    raise ValueError(
+        f"Prediction cache missing prediction column for model_key={model_key!r}: {cache_path}"
+    )
+
+
+def _align_cached_predictions(
+    *,
+    frame: pd.DataFrame,
+    split_raw: pd.DataFrame,
+    split_key_col: str,
+    model_key: str,
+    cache_path: Path,
+    split_label: str,
+) -> np.ndarray:
+    pred_col = _resolve_prediction_column(frame, model_key=model_key, cache_path=cache_path)
+    can_fallback_row_order = len(frame) == len(split_raw)
+    if split_key_col in frame.columns and split_key_col in split_raw.columns:
+        key_index = pd.Index(frame[split_key_col])
+        if not key_index.is_unique:
+            if not can_fallback_row_order:
+                raise ValueError(
+                    f"Prediction cache key {split_key_col!r} has duplicate values in {cache_path}"
+                )
+            _log(
+                f"[Warn] Prediction cache key {split_key_col!r} is duplicated in {cache_path}; "
+                "fallback to row-order alignment."
+            )
+            series = frame[pred_col]
+        else:
+            split_pos = key_index.get_indexer(split_raw[split_key_col])
+            if np.any(split_pos < 0):
+                if not can_fallback_row_order:
+                    raise ValueError(
+                        f"Cannot align cached {split_label} predictions by key {split_key_col!r}: {cache_path}"
+                    )
+                _log(
+                    f"[Warn] Cached {split_label} key alignment failed for {cache_path}; "
+                    "fallback to row-order alignment."
+                )
+                series = frame[pred_col]
+            else:
+                series = frame[pred_col].iloc[split_pos]
+    else:
+        if len(frame) != len(split_raw):
+            raise ValueError(
+                f"Cached {split_label} row mismatch: cache={len(frame)}, split={len(split_raw)}, "
+                f"path={cache_path}"
+            )
+        series = frame[pred_col]
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    if np.any(~np.isfinite(values)):
+        raise ValueError(
+            f"Cached {split_label} predictions contain invalid numeric values: {cache_path}"
+        )
+    return values.reshape(-1)
+
+
+def _try_load_cached_predictions(
+    *,
+    cfg: dict,
+    cfg_path: Path,
+    model_name: str,
+    model_key: str,
+    train_raw: pd.DataFrame,
+    test_raw: pd.DataFrame,
+    split_key_col: str,
+    cache_label: str,
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    train_cache_path, test_cache_path = _resolve_prediction_cache_paths(
+        cfg=cfg,
+        cfg_path=cfg_path,
+        model_name=model_name,
+        model_key=model_key,
+    )
+    if train_cache_path is None or test_cache_path is None:
+        return None, None
+
+    try:
+        train_frame = _drop_duplicate_columns(_read_table(train_cache_path), f"{cache_label}_train_cache")
+        test_frame = _drop_duplicate_columns(_read_table(test_cache_path), f"{cache_label}_test_cache")
+        train_pred = _align_cached_predictions(
+            frame=train_frame,
+            split_raw=train_raw,
+            split_key_col=split_key_col,
+            model_key=model_key,
+            cache_path=train_cache_path,
+            split_label="train",
+        )
+        test_pred = _align_cached_predictions(
+            frame=test_frame,
+            split_raw=test_raw,
+            split_key_col=split_key_col,
+            model_key=model_key,
+            cache_path=test_cache_path,
+            split_label="test",
+        )
+        _log(
+            f"[Compare] Reusing cached predictions for {cache_label}: "
+            f"train={train_cache_path.name}, test={test_cache_path.name}"
+        )
+        return train_pred, test_pred
+    except Exception as exc:
+        _log(
+            f"[Warn] Failed to reuse cached predictions for {cache_label}; "
+            f"fallback to model inference. reason={exc}"
+        )
+        return None, None
+
+
+def _has_valid_cached_predictions(
+    *,
+    split_df: pd.DataFrame,
+    pred_values: Optional[np.ndarray],
+) -> bool:
+    if len(split_df) == 0:
+        return True
+    if pred_values is None:
+        return False
+    return int(len(pred_values)) == int(len(split_df))
+
+
 def run_compare_ft_embed(
     *,
     direct_cfg_path: str,
@@ -101,74 +291,139 @@ def run_compare_ft_embed(
         data_path_resolver=_resolve_data_path,
     )
 
-    train_df, test_df = build_ft_embedding_frames(
-        use_runtime_ft_embedding=use_runtime_ft_embedding,
+    split_key_col = str(
+        direct_cfg.get("split_cache_key_col")
+        or ft_embed_cfg.get("split_cache_key_col")
+        or "_row_id"
+    ).strip() or "_row_id"
+    cached_direct_train, cached_direct_test = _try_load_cached_predictions(
+        cfg=direct_cfg,
+        cfg_path=direct_cfg_path,
+        model_name=model_name,
+        model_key=model_key,
         train_raw=train_raw,
         test_raw=test_raw,
-        raw=raw,
-        use_explicit_split=use_explicit_split,
-        model_name=model_name,
-        ft_cfg=ft_cfg,
-        ft_cfg_path=ft_cfg_path,
-        search_roots=search_roots,
-        ft_model_path=ft_model_path,
-        embed_cfg=ft_embed_cfg,
-        embed_cfg_path=ft_embed_cfg_path,
-        embed_path_resolver=_resolve_data_path,
+        split_key_col=split_key_col,
+        cache_label="direct",
     )
+    cached_ft_train, cached_ft_test = _try_load_cached_predictions(
+        cfg=ft_embed_cfg,
+        cfg_path=ft_embed_cfg_path,
+        model_name=model_name,
+        model_key=model_key,
+        train_raw=train_raw,
+        test_raw=test_raw,
+        split_key_col=split_key_col,
+        cache_label="ft_embed",
+    )
+
+    use_cached_direct = _has_valid_cached_predictions(
+        split_df=train_raw, pred_values=cached_direct_train
+    ) and _has_valid_cached_predictions(split_df=test_raw, pred_values=cached_direct_test)
+    use_cached_ft = _has_valid_cached_predictions(
+        split_df=train_raw, pred_values=cached_ft_train
+    ) and _has_valid_cached_predictions(split_df=test_raw, pred_values=cached_ft_test)
+
+    train_df: Optional[pd.DataFrame] = None
+    test_df: Optional[pd.DataFrame] = None
+    if not use_cached_ft:
+        train_df, test_df = build_ft_embedding_frames(
+            use_runtime_ft_embedding=use_runtime_ft_embedding,
+            train_raw=train_raw,
+            test_raw=test_raw,
+            raw=raw,
+            use_explicit_split=use_explicit_split,
+            model_name=model_name,
+            ft_cfg=ft_cfg,
+            ft_cfg_path=ft_cfg_path,
+            search_roots=search_roots,
+            ft_model_path=ft_model_path,
+            embed_cfg=ft_embed_cfg,
+            embed_cfg_path=ft_embed_cfg_path,
+            embed_path_resolver=_resolve_data_path,
+        )
 
     direct_output_root = Path(_resolve_output_dir(direct_cfg, direct_cfg_path)).resolve()
     ft_embed_output_root = Path(_resolve_output_dir(ft_embed_cfg, ft_embed_cfg_path)).resolve()
-    direct_output_override = resolve_model_output_override(
-        model_name=model_name,
-        model_key=model_key,
-        model_path=direct_model_path,
-        search_roots=search_roots,
-        output_root=direct_output_root,
-        label="direct_model_path",
-    )
-    ft_output_override = resolve_model_output_override(
-        model_name=model_name,
-        model_key=model_key,
-        model_path=ft_embed_model_path,
-        search_roots=search_roots,
-        output_root=ft_embed_output_root,
-        label="ft_embed_model_path",
-    )
+    direct_output_override = None
+    ft_output_override = None
+    if not use_cached_direct:
+        direct_output_override = resolve_model_output_override(
+            model_name=model_name,
+            model_key=model_key,
+            model_path=direct_model_path,
+            search_roots=search_roots,
+            output_root=direct_output_root,
+            label="direct_model_path",
+        )
+    if not use_cached_ft:
+        ft_output_override = resolve_model_output_override(
+            model_name=model_name,
+            model_key=model_key,
+            model_path=ft_embed_model_path,
+            search_roots=search_roots,
+            output_root=ft_embed_output_root,
+            label="ft_embed_model_path",
+        )
 
-    direct_predictor = _load_predictor_from_cfg(
-        direct_cfg_path,
-        model_key,
-        model_name=model_name,
-        output_dir=direct_output_override,
-    )
-    ft_predictor = _load_predictor_from_cfg(
-        ft_embed_cfg_path,
-        model_key,
-        model_name=model_name,
-        output_dir=ft_output_override,
-    )
+    direct_predictor = None
+    ft_predictor = None
+    if not use_cached_direct:
+        direct_predictor = _load_predictor_from_cfg(
+            direct_cfg_path,
+            model_key,
+            model_name=model_name,
+            output_dir=direct_output_override,
+        )
+    if not use_cached_ft:
+        ft_predictor = _load_predictor_from_cfg(
+            ft_embed_cfg_path,
+            model_key,
+            model_name=model_name,
+            output_dir=ft_output_override,
+        )
 
     if len(train_raw) > 0:
-        pred_direct_train = direct_predictor.predict(train_raw).reshape(-1)
-        pred_ft_train = ft_predictor.predict(train_df).reshape(-1)
+        if use_cached_direct:
+            pred_direct_train = np.asarray(cached_direct_train, dtype=float).reshape(-1)
+        else:
+            assert direct_predictor is not None
+            pred_direct_train = np.asarray(direct_predictor.predict(train_raw)).reshape(-1)
+        if use_cached_ft:
+            pred_ft_train = np.asarray(cached_ft_train, dtype=float).reshape(-1)
+        else:
+            if ft_predictor is None or train_df is None:
+                raise RuntimeError("FT predictor/train embedding frame is not initialized.")
+            pred_ft_train = np.asarray(ft_predictor.predict(train_df)).reshape(-1)
+
         if len(pred_direct_train) != len(train_raw):
             raise ValueError("Train prediction length mismatch for direct model.")
-        if len(pred_ft_train) != len(train_df):
+        if len(pred_ft_train) != len(train_raw):
             raise ValueError("Train prediction length mismatch for FT-embed model.")
     else:
-        pred_direct_train = []
-        pred_ft_train = []
+        pred_direct_train = np.asarray([], dtype=float)
+        pred_ft_train = np.asarray([], dtype=float)
+
     if len(test_raw) > 0:
-        pred_direct_test = direct_predictor.predict(test_raw).reshape(-1)
-        pred_ft_test = ft_predictor.predict(test_df).reshape(-1)
+        if use_cached_direct:
+            pred_direct_test = np.asarray(cached_direct_test, dtype=float).reshape(-1)
+        else:
+            assert direct_predictor is not None
+            pred_direct_test = np.asarray(direct_predictor.predict(test_raw)).reshape(-1)
+        if use_cached_ft:
+            pred_ft_test = np.asarray(cached_ft_test, dtype=float).reshape(-1)
+        else:
+            if ft_predictor is None or test_df is None:
+                raise RuntimeError("FT predictor/test embedding frame is not initialized.")
+            pred_ft_test = np.asarray(ft_predictor.predict(test_df)).reshape(-1)
+
         if len(pred_direct_test) != len(test_raw):
             raise ValueError("Test prediction length mismatch for direct model.")
-        if len(pred_ft_test) != len(test_df):
+        if len(pred_ft_test) != len(test_raw):
             raise ValueError("Test prediction length mismatch for FT-embed model.")
     else:
-        pred_direct_test = []
-        pred_ft_test = []
+        pred_direct_test = np.asarray([], dtype=float)
+        pred_ft_test = np.asarray([], dtype=float)
 
     plot_train = train_raw.copy()
     plot_test = test_raw.copy()

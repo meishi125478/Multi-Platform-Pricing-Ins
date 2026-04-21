@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -102,6 +102,82 @@ def _read_frame(
         except Exception:
             return pd.read_feather(path_obj)
     raise ValueError(f"Unsupported table format for {path_obj}")
+
+
+def _read_csv_split_rows_by_index(
+    path_obj: Path,
+    *,
+    train_indices: Sequence[int],
+    test_indices: Sequence[int],
+    required_columns: Optional[Sequence[str]] = None,
+    chunksize: int = 200_000,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Read only split rows from a large CSV, preserving requested split order."""
+    usecols = _resolve_read_columns(path_obj, required_columns)
+    train_idx = np.asarray(train_indices, dtype=np.int64).reshape(-1)
+    test_idx = np.asarray(test_indices, dtype=np.int64).reshape(-1)
+    train_pos: Dict[int, int] = {int(idx): pos for pos, idx in enumerate(train_idx.tolist())}
+    test_pos: Dict[int, int] = {int(idx): pos for pos, idx in enumerate(test_idx.tolist())}
+
+    train_chunks = []
+    test_chunks = []
+    total_rows = 0
+
+    for chunk in pd.read_csv(
+        path_obj,
+        usecols=usecols,
+        low_memory=True,
+        chunksize=int(max(1, chunksize)),
+    ):
+        chunk = _drop_duplicate_columns(chunk, "embed_csv_chunk")
+        row_index = np.asarray(chunk.index.to_numpy(), dtype=np.int64)
+        total_rows += int(len(chunk))
+
+        train_slot = np.asarray(
+            [train_pos.get(int(i), -1) for i in row_index],
+            dtype=np.int64,
+        )
+        train_mask = train_slot >= 0
+        if np.any(train_mask):
+            train_piece = chunk.loc[train_mask].copy()
+            train_piece["_slot"] = train_slot[train_mask]
+            train_chunks.append(train_piece)
+
+        test_slot = np.asarray(
+            [test_pos.get(int(i), -1) for i in row_index],
+            dtype=np.int64,
+        )
+        test_mask = test_slot >= 0
+        if np.any(test_mask):
+            test_piece = chunk.loc[test_mask].copy()
+            test_piece["_slot"] = test_slot[test_mask]
+            test_chunks.append(test_piece)
+
+    def _assemble(parts, *, expected_rows: int, split_label: str) -> pd.DataFrame:
+        if expected_rows == 0:
+            return pd.DataFrame()
+        if not parts:
+            raise ValueError(
+                f"Failed to collect any rows for split {split_label!r} from {path_obj}."
+            )
+        merged = pd.concat(parts, axis=0, ignore_index=True)
+        if "_slot" not in merged.columns:
+            raise ValueError(f"Internal error: missing row slot marker for {split_label!r}.")
+        if merged["_slot"].duplicated().any():
+            raise ValueError(
+                f"Duplicate rows detected while collecting split {split_label!r} from {path_obj}."
+            )
+        merged = merged.sort_values("_slot", kind="mergesort").drop(columns=["_slot"])
+        merged = merged.reset_index(drop=True)
+        if len(merged) != int(expected_rows):
+            raise ValueError(
+                f"Split row mismatch for {split_label!r}: expected={expected_rows}, got={len(merged)}"
+            )
+        return merged
+
+    train_df = _assemble(train_chunks, expected_rows=len(train_idx), split_label="train")
+    test_df = _assemble(test_chunks, expected_rows=len(test_idx), split_label="test")
+    return train_df, test_df, total_rows
 
 
 def _remap_split_indices_by_key(
@@ -501,6 +577,26 @@ def build_ft_embedding_frames(
         return train_df, test_df
 
     embed_path = embed_path_resolver(embed_cfg, embed_cfg_path, model_name)
+    if embed_path.suffix.lower() in {".csv"}:
+        if raw is None:
+            raise ValueError("Raw data unavailable for embedding alignment.")
+        train_df, test_df, embed_rows = _read_csv_split_rows_by_index(
+            embed_path,
+            train_indices=train_raw.index.to_numpy(),
+            test_indices=test_raw.index.to_numpy(),
+            required_columns=required_cols_local,
+        )
+        train_df = _drop_duplicate_columns(train_df, "embed_train").reset_index(drop=True)
+        test_df = _drop_duplicate_columns(test_df, "embed_test").reset_index(drop=True)
+        train_df.fillna(0, inplace=True)
+        test_df.fillna(0, inplace=True)
+        if int(embed_rows) != len(raw):
+            raise ValueError(
+                f"Row count mismatch: raw={len(raw)}, embed={embed_rows}. "
+                "Cannot align predictions to raw features."
+            )
+        return train_df, test_df
+
     embed_df = _read_frame(embed_path, required_columns=required_cols_local)
     embed_df = _drop_duplicate_columns(embed_df, "embed").reset_index(drop=True)
     embed_df.fillna(0, inplace=True)

@@ -142,6 +142,90 @@ def test_prepare_step1_config_accepts_unsupervised_embedding_alias():
     assert cfg["optuna_study_prefix"] == "pricing_ft_unsup"
 
 
+def test_ensure_unique_split_key_for_step1_rewrites_csv_and_config(tmp_path: Path):
+    helper = FTWorkflowHelper()
+    model_name = "od_bc"
+    data_dir = tmp_path / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = data_dir / f"{model_name}.csv"
+    pd.DataFrame(
+        {
+            "_row_id": [7, 7, 8],
+            "f1": [1.0, 2.0, 3.0],
+            "target": [0.1, 0.2, 0.3],
+            "weights": [1.0, 1.0, 1.0],
+        }
+    ).to_csv(raw_path, index=False)
+
+    cfg_path = tmp_path / "config_ft.json"
+    cfg = {
+        "data_dir": "./Data",
+        "model_list": ["od"],
+        "model_categories": ["bc"],
+        "feature_list": ["f1", "_row_uid"],
+        "categorical_features": ["_row_uid"],
+        "target": "target",
+        "weight": "weights",
+        "split_cache_key_col": "_row_id",
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    result = helper.ensure_unique_split_key_for_step1(
+        step1_config_path=str(cfg_path),
+        split_key_col="_row_uid",
+    )
+    assert result["split_key_col"] == "_row_uid"
+    assert result["row_count"] == 3
+
+    saved_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved_cfg["split_cache_key_col"] == "_row_uid"
+    assert "_row_uid" not in saved_cfg["feature_list"]
+    assert "_row_uid" not in saved_cfg["categorical_features"]
+
+    updated = pd.read_csv(raw_path)
+    assert updated.columns[0] == "_row_uid"
+    assert updated["_row_uid"].tolist() == [0, 1, 2]
+    assert updated["f1"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_ensure_unique_split_key_for_step1_replaces_existing_key_values(tmp_path: Path):
+    helper = FTWorkflowHelper()
+    model_name = "od_bc"
+    data_dir = tmp_path / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = data_dir / f"{model_name}.csv"
+    pd.DataFrame(
+        {
+            "_row_uid": [100, 100, 200],
+            "f1": [9.0, 8.0, 7.0],
+            "target": [0.9, 0.8, 0.7],
+            "weights": [1.0, 1.0, 1.0],
+        }
+    ).to_csv(raw_path, index=False)
+
+    cfg_path = tmp_path / "config_ft.json"
+    cfg = {
+        "data_dir": "./Data",
+        "model_list": ["od"],
+        "model_categories": ["bc"],
+        "feature_list": ["f1"],
+        "categorical_features": [],
+        "target": "target",
+        "weight": "weights",
+        "split_cache_key_col": "_row_uid",
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    helper.ensure_unique_split_key_for_step1(
+        step1_config_path=str(cfg_path),
+        split_key_col="_row_uid",
+    )
+
+    updated = pd.read_csv(raw_path)
+    assert updated["_row_uid"].tolist() == [0, 1, 2]
+    assert updated["f1"].tolist() == [9.0, 8.0, 7.0]
+
+
 def test_save_configs_uses_embed_primary_names_and_writes_legacy_aliases(tmp_path):
     helper = FTWorkflowHelper()
     helper.step1_config = {"ft_role": "embedding", "runner": {"model_keys": ["ft"]}}
